@@ -83,7 +83,8 @@ class RawModule:
             raise NotImplementedError("jitify / cooperative groups on the Metal backend")
         self.code = code
         self.options = tuple(options)
-        self.module = runtime.Module(code, self.options, cupy_raw_module=True)
+        from .cuda import effective_options
+        self.module = runtime.Module(code, effective_options(code, self.options), cupy_raw_module=True)
         self.name_expressions = name_expressions
 
     def get_function(self, name):

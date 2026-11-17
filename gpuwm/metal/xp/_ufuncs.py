@@ -176,7 +176,7 @@ def _scalar_value(x):
     if isinstance(x, _np_ndarray) and x.ndim == 0 and not is_device(x):
         return x.item(), x.dtype
     if isinstance(x, (bool, np.bool_)):
-        return bool(x), bool
+        return bool(x), np.dtype(np.bool_)
     if isinstance(x, numbers.Integral):
         return int(x), int
     if isinstance(x, numbers.Real):

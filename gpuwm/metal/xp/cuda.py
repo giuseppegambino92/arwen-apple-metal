@@ -245,7 +245,24 @@ def _compile_with_cache_cuda(source, options, arch=None, cache_dir=None, extra_s
     return m
 
 
+class _NVRTCProgram:
+    """Stand-in for CuPy's NVRTC program object.  ``compile`` returns the final
+    option list; gpuwm's option hooks (gpuwm.wrf_exact, gpuwm.cuda_subnormals)
+    wrap it exactly as they wrap CuPy's, and every Metal compile asks it."""
+
+    def __init__(self, src, name="kern.cu", headers=(), include_names=(), name_expressions=None, method="ptx"):
+        self.src, self.name = src, name
+
+    def compile(self, options=(), log_stream=None):
+        return tuple(options)
+
+
+def effective_options(source, options):
+    return tuple(compiler._NVRTCProgram(source).compile(tuple(str(o) for o in options or ())))
+
+
 compiler = types.SimpleNamespace(
+    _NVRTCProgram=_NVRTCProgram,
     compile_using_nvrtc=compile_using_nvrtc,
     _compile_with_cache_cuda=_compile_with_cache_cuda,
     _compile_using_nvrtc_no_warning=compile_using_nvrtc,
@@ -269,7 +286,7 @@ class _Module:
             raise RuntimeError("function.Module.load on Metal needs the source token produced by "
                                "compiler.compile_using_nvrtc (a PTX/cubin image cannot run on Metal)")
         d = json.loads(image[len(_TOKEN):].decode())
-        self._m = _rt_module.Module(d["source"], tuple(d["options"]), cupy_raw_module=False)
+        self._m = _rt_module.Module(d["source"], effective_options(d["source"], d["options"]), cupy_raw_module=False)
         return self
 
     def load_file(self, path):

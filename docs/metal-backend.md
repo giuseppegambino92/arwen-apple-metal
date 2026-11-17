@@ -2,7 +2,7 @@
 
 Status: **in progress**. Milestones 1–2 (environment, CUDA→MSL translator)
 done; Milestone 3 (runtime, `xp` layer, `--backend metal`) working end to end
-up to the first model step; kernel parity and the real run (Milestones 4–7)
+up to the first model step; Milestone 4 (cu6 Tiedtke) bit-exact on the M3 Max; kernel parity and the real run (Milestones 4–7)
 not yet — the first physics step currently produces non-finite RRTMG LW and
 MYNN tendencies.
 
@@ -202,3 +202,25 @@ process — an MTLBinaryArchive cache is pending (Milestone 7).
 * Rust tools built with `cargo build --release --locked --offline -p rw-netcdf
   -p netcdf-writer -p static-fields -p rw-fetch` (crates using cudarc are not
   built; the renderer is therefore unavailable and runs draw no pictures).
+
+## Milestone 4: cu6 (original Tiedtke), bit for bit
+
+`tools/metal/cu6_parity.py` replays the inputs of `tools/tiedtke_wrf461_oracle`
+(generated with the WRF 4.6.1 Fortran on a Linux CPU host, glibc 2.41) through
+the production loader `gpuwm.core.tiedtke.column_step` on Metal and compares
+every output word with `check.compare_words`, against the Fortran and against
+the same CUDA kernel run on the RTX 5090. 4 vertical grids × 3 configurations
+× 72 columns, launched singly and as rows of 12 and 8 columns; all six
+tendencies, RAINCV, PRATEC, CU_ACT_FLAG:
+
+| mode | vs Fortran | vs CUDA (RTX 5090) |
+|---|---|---|
+| default | 0 differing words | 0 |
+| `GPUWM_WRF_EXACT=1`, `GPUWM_WRF_GLIBC=2.41` | 0 | 0 |
+
+(The exact mode's default referee is glibc 2.39, whose `tanf` is not
+correctly rounded; against a 2.41 oracle that gives the documented residual in
+deep convective columns, 6 342 words here — it is the referee choice, not the
+port.) `GPUWM_WRF_EXACT` reaches Metal compiles: every compile asks
+`cupy.cuda.compiler._NVRTCProgram(src).compile(options)`, which gpuwm's
+option hooks wrap exactly as on CUDA.

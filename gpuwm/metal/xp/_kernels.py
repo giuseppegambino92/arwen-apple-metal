@@ -36,7 +36,8 @@ def ctype(dt) -> str:
 @functools.lru_cache(maxsize=None)
 def _module(source: str) -> runtime.Module:
     # CuPy compiles its elementwise/reduction kernels with -ftz=true: so do we
-    return runtime.Module(source, ("-std=c++17",), cupy_raw_module=True)
+    from .cuda import effective_options
+    return runtime.Module(source, effective_options(source, ("-std=c++17",)), cupy_raw_module=True)
 
 
 def kernel(source: str, name: str) -> runtime.Kernel:
