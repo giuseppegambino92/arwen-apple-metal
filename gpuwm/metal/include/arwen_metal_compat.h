@@ -126,27 +126,49 @@ inline __f64 __arwen_f64_acosh(__f64 x) { return __f64{SF_DEFAULT_NAN}; }
 inline bool __arwen_fsub(float x) { uint u = as_type<uint>(x) & 0x7fffffffu; return u != 0u && u < 0x00800000u; }
 inline bool __arwen_flow(float r) { return (as_type<uint>(r) & 0x7f800000u) <= 0x00800000u; }   // |r| < 2^-125 or zero
 inline float __arwen_fneg(float x) { return as_type<float>(as_type<uint>(x) ^ 0x80000000u); }
+// The fast test looks at the RESULT only.  The hardware reads a subnormal
+// operand as zero (Asahi's AGX documentation; measured here), so:
+//  * x*y, x/y: a subnormal operand always yields a hardware result that is
+//    zero, infinite or NaN -- caught by "exponent field <= 1 or all ones";
+//  * x+y, x-y: a subnormal operand changes the IEEE result only when
+//    |result| < 2^-101 (below that it is under half an ulp of the other
+//    operand); caught by "exponent field < 27".
+// Inside the rare branch the exact conditions decide; only a real subnormal
+// case reaches the software routine (sf32_*), so the semantics are unchanged.
+#define ARWEN_EXPF(x) (as_type<uint>(x) & 0x7f800000u)
 inline float __arwen_fadd(float a, float b) {
     float r = a + b;
-    if (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && !(a == __arwen_fneg(b)))) return sf32_add(a, b);
+    if (ARWEN_EXPF(r) < (27u << 23) &&
+        (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && !(a == __arwen_fneg(b)))))
+        return sf32_add(a, b);
     return r;
 }
 inline float __arwen_fsubtract(float a, float b) {
     float r = a - b;
-    if (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && !(a == b))) return sf32_sub(a, b);
+    if (ARWEN_EXPF(r) < (27u << 23) && (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && !(a == b))))
+        return sf32_sub(a, b);
     return r;
+}
+inline bool __arwen_fmulband(float r) {          // exponent field 0 or 1, or all ones
+    return (ARWEN_EXPF(r) - 0x01000000u) >= 0x7e800000u;
 }
 inline float __arwen_fmul(float a, float b) {
     float r = a * b;
-    if (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && a != 0.0f && b != 0.0f)) return sf32_mul(a, b);
+    if (__arwen_fmulband(r) &&
+        (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && a != 0.0f && b != 0.0f)))
+        return sf32_mul(a, b);
     return r;
 }
 inline float __arwen_fdiv(float a, float b) {
     float r = a / b;
-    if (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && a != 0.0f)) return sf32_div(a, b);
+    if (__arwen_fmulband(r) && (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && a != 0.0f)))
+        return sf32_div(a, b);
     return r;
 }
-inline float __arwen_fsqrt(float a) { return __arwen_fsub(a) ? sf32_sqrt(a) : metal::precise::sqrt(a); }
+inline float __arwen_fsqrt(float a) {
+    float r = metal::precise::sqrt(a);       // a subnormal a reads as 0 -> r == 0
+    return (ARWEN_EXPF(r) == 0u && __arwen_fsub(a)) ? sf32_sqrt(a) : r;
+}
 inline float __arwen_ffma(float a, float b, float c) {
     float r = metal::fma(a, b, c);
     if (__arwen_fsub(a) || __arwen_fsub(b) || __arwen_fsub(c) || __arwen_flow(r)) return sf32_fma(a, b, c);
@@ -154,7 +176,7 @@ inline float __arwen_ffma(float a, float b, float c) {
 }
 #define ARWEN_FCMP(name, op, sfexpr)                                                                   \
     inline bool name(float a, float b) {                                                               \
-        if (__arwen_fsub(a) || __arwen_fsub(b)) { ulong x = sf_from_f32(a), y = sf_from_f32(b); return sfexpr; } \
+        if ((ARWEN_EXPF(a) == 0u || ARWEN_EXPF(b) == 0u) && (__arwen_fsub(a) || __arwen_fsub(b))) { ulong x = sf_from_f32(a), y = sf_from_f32(b); return sfexpr; } \
         return a op b;                                                                                 \
     }
 ARWEN_FCMP(__arwen_flt, <, sf_lt(x, y))

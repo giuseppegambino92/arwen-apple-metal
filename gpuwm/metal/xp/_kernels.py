@@ -85,7 +85,21 @@ def collapse(shape, strides_list):
 
 _OFFSETS = """
 __device__ __forceinline__ void lay_offsets(const Lay& L, long long i, long long* off, int nops) {
+    if (L.nd <= 1) {                       // contiguous / collapsed: no division
+        for (int k = 0; k < nops; ++k) off[k] = i * L.st[k][0];
+        return;
+    }
     for (int k = 0; k < nops; ++k) off[k] = 0;
+    if (L.n <= 2147483647LL) {             // 32-bit index arithmetic
+        unsigned int ii = (unsigned int)i;
+        for (int d = L.nd - 1; d >= 0; --d) {
+            unsigned int s = (unsigned int)L.shape[d];
+            unsigned int q = ii / s, r = ii - q * s;
+            ii = q;
+            for (int k = 0; k < nops; ++k) off[k] += (long long)r * L.st[k][d];
+        }
+        return;
+    }
     for (int d = L.nd - 1; d >= 0; --d) {
         long long s = L.shape[d];
         long long q = i / s, r = i - q * s;

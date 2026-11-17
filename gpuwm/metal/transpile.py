@@ -39,6 +39,7 @@ Semantics carried across, and how (see docs/metal-backend.md):
 from __future__ import annotations
 
 import dataclasses
+import os
 import hashlib
 import json
 import re
@@ -924,7 +925,9 @@ class _Module:
                 fty = self.msl_type(t)
                 size, align = ct.get_size(), ct.get_align()
                 kind, code = "struct", f"{size}s"
-                unpack_ty = fty
+                # read in place from the constant argument buffer: a by-value copy of a
+                # large struct lands in thread-private memory
+                unpack_ty = "constant " + fty.replace("const ", "") + "&"
             else:
                 abi = self.scalar_abi(t)
                 if abi is None:
@@ -1042,7 +1045,7 @@ class _Module:
                 self.rw.replace(p.extent.start.offset, p.extent.end.offset, f"{tp} {pname}")
             elif ct.kind in (T.LVALUEREFERENCE, T.RVALUEREFERENCE):
                 pt = t.get_pointee()
-                if pt.is_const_qualified() and ct.kind == T.LVALUEREFERENCE and not self._record_has_pointers(pt):
+                if pt.is_const_qualified() and ct.kind == T.LVALUEREFERENCE and _canon(pt).kind != T.RECORD:
                     ty = self.msl_type(pt).replace("const ", "")
                     self.rw.replace(p.extent.start.offset, p.extent.end.offset, f"{ty} {pname}{self._param_default(p)}")
                     refs[i] = "value"
@@ -1719,6 +1722,9 @@ def translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str 
     if f64_mode not in F64_MODES:
         raise ValueError(f"f64_mode must be one of {F64_MODES}")
     opts = NvrtcOptions.parse(options, cupy_raw_module=cupy_raw_module)
+    if os.environ.get("ARWEN_METAL_FORCE_FTZ") == "1":
+        # diagnostic only: measure what the FP32 gradual-underflow emulation costs
+        opts = dataclasses.replace(opts, ftz=True)
     if opts.unknown:
         raise TranslationError(f"unsupported NVRTC options: {opts.unknown}")
     pp = preprocess(source, opts, filename)
@@ -1734,7 +1740,8 @@ def cache_key(source: str, options, f64_mode: str, cupy_raw_module: bool) -> str
     from pathlib import Path
     inc = Path(__file__).resolve().parent / "include"
     h = hashlib.sha256()
-    for part in (TRANSLATOR_REVISION, f64_mode, json.dumps(list(map(str, options or ()))), str(cupy_raw_module), source):
+    for part in (TRANSLATOR_REVISION, f64_mode, json.dumps(list(map(str, options or ()))), str(cupy_raw_module),
+                 "force_ftz=" + os.environ.get("ARWEN_METAL_FORCE_FTZ", ""), source):
         h.update(part.encode())
         h.update(b"\0")
     for p in sorted(inc.glob("*.h")) + [Path(__file__), Path(__file__).with_name("frontend.py"),

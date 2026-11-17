@@ -12,6 +12,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import struct
 import threading
 from pathlib import Path
@@ -79,6 +80,7 @@ class DeviceMemory:
 
 
 _PROFILE = {}
+_KTAGS = {}        # kernel name -> numeric flags of its module(s), for the profile
 
 
 def _collect_profile():
@@ -101,7 +103,8 @@ def _write_profile():
     with open(path, "w") as f:
         f.write(f"# total GPU seconds {total:.3f} over {sum(v[0] for v in _PROFILE.values())} dispatches\n")
         for name, (n, sec) in rows:
-            f.write(f"{sec:10.4f} s {100*sec/total:6.2f}% {n:8d} calls {1e6*sec/max(n,1):10.1f} us/call  {name}\n")
+            tags = ",".join(sorted(_KTAGS.get(name, ())))
+            f.write(f"{sec:10.4f} s {100*sec/total:6.2f}% {n:8d} calls {1e6*sec/max(n,1):10.1f} us/call  {name}  [{tags}]\n")
 
 
 _pending = False
@@ -150,6 +153,12 @@ class Module:
             os.replace(tmp, meta)
         self.key = key
         self.meta = json.loads(meta.read_text())
+        if _PROFILE is not None and os.environ.get("ARWEN_METAL_PROFILE"):
+            from .frontend import NvrtcOptions
+            o = NvrtcOptions.parse(options, cupy_raw_module=cupy_raw_module)
+            tag = ("ftz" if o.ftz else "denorm") + ("+f64" if re.search(r"\bdouble\b", source) else "")
+            for k in self.meta["kernels"]:
+                _KTAGS.setdefault(k, set()).add(tag)
         self.library = rt().load_library(str(lib))
         self.f64_mode = f64_mode
         self._pipelines = {}
