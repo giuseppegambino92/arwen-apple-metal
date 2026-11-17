@@ -19,6 +19,7 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/pair.h>
+#include <mach/mach_time.h>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -28,6 +29,12 @@
 namespace nb = nanobind;
 
 namespace {
+
+// host seconds in the time base of MTLCommandBuffer GPUStartTime/GPUEndTime
+double host_seconds() {
+    static mach_timebase_info_data_t tb = [] { mach_timebase_info_data_t t; mach_timebase_info(&t); return t; }();
+    return (double)mach_absolute_time() * tb.numer / tb.denom * 1e-9;
+}
 
 struct Runtime;
 
@@ -82,7 +89,8 @@ struct Runtime {
     id<MTLComputeCommandEncoder> enc = nil;
     id<MTLCommandBuffer> last_committed = nil;
     id<MTLBuffer> null_buf = nil;
-    id<MTLSharedEvent> order_event = nil;    // serialises command buffers (resources are untracked)
+    id<MTLEvent> order_event = nil;          // serialises command buffers (resources are untracked)
+    int order_mode = 0;                      // 0: MTLEvent (GPU-only), 1: MTLSharedEvent, 2: none (diagnostic, unsafe)
     uint64_t order_value = 0;
     bool flush_on_alloc = false;
     bool profile = false;                    // one command buffer per dispatch, GPU time per kernel
@@ -97,6 +105,12 @@ struct Runtime {
     // commit after only `eager` dispatches when the GPU has run dry (after a
     // host synchronization, the GPU would otherwise wait for a full batch)
     int eager = 16;
+    // ARWEN_METAL_TIMELINE: GPU [start, end] of every command buffer and the
+    // host intervals spent in synchronize(), one time base (host seconds)
+    bool timeline = false;
+    std::mutex tl_mu;
+    std::vector<double> tl_gpu;      // start, end pairs
+    std::vector<double> tl_sync;     // begin, end pairs
     uint64_t n_eager = 0;
     int in_cb = 0;
     bool residency_dirty = false;
@@ -117,7 +131,7 @@ struct Runtime {
         residency = [dev newResidencySetWithDescriptor:rd error:&err];
         if (!residency) throw std::runtime_error("metal: residency set: " + std::string([[err localizedDescription] UTF8String]));
         [queue addResidencySet:residency];
-        order_event = [dev newSharedEvent];
+        order_event = [dev newEvent];
         null_buf = [dev newBufferWithLength:256 options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
         [residency addAllocation:null_buf];
         [residency commit];
@@ -183,6 +197,11 @@ struct Runtime {
             cb = [queue commandBufferWithUnretainedReferences];
             Runtime* self_ = this;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+                if (self_->timeline) {
+                    std::lock_guard<std::mutex> tg(self_->tl_mu);
+                    self_->tl_gpu.push_back([c GPUStartTime]);
+                    self_->tl_gpu.push_back([c GPUEndTime]);
+                }
                 if ([c status] == MTLCommandBufferStatusError && self_->error_flag.exchange(1) == 0) {
                     NSError* e = [c error];
                     self_->error_msg = e ? std::string([[e description] UTF8String]) : "unknown command buffer error";
@@ -190,7 +209,7 @@ struct Runtime {
             }];
             // wait for the previous command buffer: with untracked resources the
             // GPU would otherwise overlap consecutive command buffers
-            if (order_value) [cb encodeWaitForEvent:order_event value:order_value];
+            if (order_value && order_mode != 2) [cb encodeWaitForEvent:order_event value:order_value];
             enc = [cb computeCommandEncoderWithDispatchType:(concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial)];
             in_cb = 0;
             n_cb++;
@@ -200,7 +219,7 @@ struct Runtime {
     void commit() {
         if (cb == nil) return;
         [enc endEncoding];
-        [cb encodeSignalEvent:order_event value:++order_value];
+        if (order_mode != 2) [cb encodeSignalEvent:order_event value:++order_value];
         if ([deferred count]) {
             NSArray* keep = [deferred copy];
             [deferred removeAllObjects];
@@ -256,6 +275,7 @@ struct Runtime {
     }
 
     void synchronize() {
+        double t0 = timeline ? host_seconds() : 0.0;
         id<MTLCommandBuffer> wait = nil;
         {
             std::lock_guard<std::recursive_mutex> g(mu);
@@ -267,6 +287,11 @@ struct Runtime {
         {
             std::lock_guard<std::recursive_mutex> g(mu);
             reap();
+        }
+        if (timeline) {
+            std::lock_guard<std::mutex> tg(tl_mu);
+            tl_sync.push_back(t0);
+            tl_sync.push_back(host_seconds());
         }
         check_error();
     }
@@ -313,6 +338,14 @@ struct Runtime {
         return out;
     }
 
+    nb::tuple timeline_drain() {
+        std::lock_guard<std::mutex> tg(tl_mu);
+        std::vector<double> g, s;
+        g.swap(tl_gpu);
+        s.swap(tl_sync);
+        return nb::make_tuple(g, s, host_seconds());
+    }
+
     nb::dict stats() {
         nb::dict d;
         d["dispatches"] = n_dispatch;
@@ -352,6 +385,13 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def_prop_ro("name", &Runtime::name)
         .def_rw("batch", &Runtime::batch)
         .def_rw("eager", &Runtime::eager)
+        .def_rw("timeline", &Runtime::timeline)
+        .def("set_order_mode", [](Runtime& r, int m) {
+            r.order_mode = m;
+            r.order_event = (m == 1) ? (id<MTLEvent>)[r.dev newSharedEvent] : [r.dev newEvent];
+            r.order_value = 0;
+        })
+        .def("timeline_drain", &Runtime::timeline_drain)
         .def_rw("barrier_between", &Runtime::barrier_between)
         .def_rw("concurrent", &Runtime::concurrent)
         .def_rw("flush_on_alloc", &Runtime::flush_on_alloc)

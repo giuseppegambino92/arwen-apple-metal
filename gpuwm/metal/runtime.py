@@ -44,6 +44,11 @@ def rt():
                 _RT = native().Runtime()
                 _RT.batch = int(os.environ.get("ARWEN_METAL_BATCH", "256"))
                 _RT.eager = int(os.environ.get("ARWEN_METAL_EAGER", "16"))
+                if os.environ.get("ARWEN_METAL_ORDER"):           # diagnostic: 0 MTLEvent, 1 MTLSharedEvent, 2 none
+                    _RT.set_order_mode(int(os.environ["ARWEN_METAL_ORDER"]))
+                if os.environ.get("ARWEN_METAL_TIMELINE"):
+                    _RT.timeline = True
+                    atexit.register(_write_timeline)
                 if os.environ.get("ARWEN_METAL_STATS"):
                     atexit.register(lambda: print("[arwen-metal] runtime stats:", dict(_RT.stats()), file=sys.stderr))
                 _RT.flush_on_alloc = os.environ.get("ARWEN_METAL_FLUSH_ON_ALLOC", "") == "1"
@@ -109,6 +114,17 @@ def _write_profile():
         for name, (n, sec) in rows:
             tags = ",".join(sorted(_KTAGS.get(name, ())))
             f.write(f"{sec:10.4f} s {100*sec/total:6.2f}% {n:8d} calls {1e6*sec/max(n,1):10.1f} us/call  {name}  [{tags}]\n")
+
+
+def _write_timeline():
+    """ARWEN_METAL_TIMELINE=<file.npz>: command-buffer GPU intervals and host synchronize() intervals."""
+    try:
+        _RT.synchronize()
+    except Exception:
+        pass
+    g, sy, now = _RT.timeline_drain()
+    path = os.environ["ARWEN_METAL_TIMELINE"].replace("{pid}", str(os.getpid()))
+    np.savez(path, gpu=np.asarray(g).reshape(-1, 2), sync=np.asarray(sy).reshape(-1, 2), end=now)
 
 
 _pending = False

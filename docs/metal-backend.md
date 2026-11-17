@@ -299,3 +299,21 @@ the two before it is **bit-identical** to the 1-hour run made before them
 Per-step wall time over the hour: d02 median 1.238 → 0.471 s, d01 0.659 →
 0.311 s; sum of steps 408 → 179 s (second 1-hour run, constant exponents
 included: again 0 differing words of 142.8 M).
+
+## Host/GPU overlap (measured with `ARWEN_METAL_TIMELINE`)
+
+`ARWEN_METAL_TIMELINE=<file{pid}.npz>` records every command buffer's GPU
+start/end and every host synchronize() in one time base.  On the 10-minute run
+it showed ~1100 idle gaps of ~9 ms between command buffers.  A microbenchmark
+isolated the cause: command buffers were ordered by an `MTLSharedEvent` chain
+(needed: resources are untracked and addressed bindlessly, so Metal would let
+consecutive command buffers overlap), and each wait/signal through the shared
+event cost the GPU 0.3–2.6 ms.  A plain `MTLEvent` (GPU-side only) gives the
+same ordering with a 1 µs gap (`tools/metal/ordering_check.py`: dependent
+read-after-write chains, batch 1–256, eager 0–16, 48 configurations exact).
+Commits are also issued after 16 dispatches when the GPU has run dry
+(`ARWEN_METAL_EAGER`), so work after a host synchronization starts at once.
+
+1-hour forecast after this change: 165 s wall in total (first Metal hour:
+436 s), steps d02 median 0.406 s, d01 0.284 s, sum 152 s; 01:00 wrfout again
+bit-identical to the pre-optimization run (142.8 M words).
