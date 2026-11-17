@@ -24,7 +24,11 @@
 // the arithmetic entry points stay out of line: inlining a full soft-float
 // operation at every double/subnormal-capable float operation of a large
 // kernel made Metal's backend compile run for many minutes
+#ifdef ARWEN_SF_INLINE_ALL
+#define SF_OUTLINE inline __attribute__((always_inline))
+#else
 #define SF_OUTLINE __attribute__((noinline))
+#endif
 #define SF_CONSTEXPR constexpr
 typedef ulong sf_u64;
 typedef long sf_i64;

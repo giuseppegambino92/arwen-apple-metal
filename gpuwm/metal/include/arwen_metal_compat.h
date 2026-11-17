@@ -637,3 +637,5 @@ template <typename T> struct __arwen_gptr {
     bool operator==(metal::nullptr_t) const { return !t && !d; }
     bool operator!=(metal::nullptr_t) const { return t || d; }
 };
+
+#include "arwen_fastlibm.h"

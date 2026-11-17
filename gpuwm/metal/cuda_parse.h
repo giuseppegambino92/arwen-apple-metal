@@ -104,3 +104,8 @@ ARWEN_MMX(unsigned int, int, unsigned int) ARWEN_MMX(unsigned int, unsigned int,
 ARWEN_MMX(unsigned long long, long long, unsigned long long) ARWEN_MMX(unsigned long long, unsigned long long, long long)
 ARWEN_MMX(unsigned long, long, unsigned long) ARWEN_MMX(unsigned long, unsigned long, long)
 ARWEN_MMX(double, float, double) ARWEN_MMX(double, double, float)
+
+// ArWen Metal: fast paths of the glibc float libm copies (arwen_fastlibm.h),
+// called only by wrappers gpuwm.metal.fastlibm inserts for verified copies.
+__device__ float __arwen_fast_glibc_logf(float); __device__ float __arwen_fast_glibc_expf(float);
+__device__ float __arwen_fast_glibc_powf(float, float);

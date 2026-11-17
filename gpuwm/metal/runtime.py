@@ -7,6 +7,7 @@ Host access to device data only needs the GPU work queued so far to finish
 """
 from __future__ import annotations
 
+import atexit
 import ctypes
 import functools
 import hashlib
@@ -14,6 +15,7 @@ import json
 import os
 import re
 import struct
+import sys
 import threading
 from pathlib import Path
 
@@ -41,11 +43,13 @@ def rt():
             if _RT is None:
                 _RT = native().Runtime()
                 _RT.batch = int(os.environ.get("ARWEN_METAL_BATCH", "256"))
+                _RT.eager = int(os.environ.get("ARWEN_METAL_EAGER", "16"))
+                if os.environ.get("ARWEN_METAL_STATS"):
+                    atexit.register(lambda: print("[arwen-metal] runtime stats:", dict(_RT.stats()), file=sys.stderr))
                 _RT.flush_on_alloc = os.environ.get("ARWEN_METAL_FLUSH_ON_ALLOC", "") == "1"
                 _RT.concurrent = os.environ.get("ARWEN_METAL_CONCURRENT", "") == "1"
                 if os.environ.get("ARWEN_METAL_PROFILE"):
                     _RT.profile = True
-                    import atexit
                     atexit.register(_write_profile)
     return _RT
 
@@ -110,9 +114,32 @@ def _write_profile():
 _pending = False
 
 
+_SYNC_TRACE = None
+
+
+def _trace_sync():
+    """ARWEN_METAL_SYNC_TRACE=1: count host synchronizations by gpuwm call site (printed at exit)."""
+    global _SYNC_TRACE
+    import collections
+    import traceback
+    if _SYNC_TRACE is None:
+        _SYNC_TRACE = collections.Counter()
+
+        def report():
+            print("[arwen-metal] host synchronizations by call site:", file=sys.stderr)
+            for site, n in _SYNC_TRACE.most_common(25):
+                print(f"  {n:6d}  {site}", file=sys.stderr)
+        atexit.register(report)
+    frames = [f for f in traceback.extract_stack()[:-2] if "/gpuwm/" in f.filename and "/gpuwm/metal/" not in f.filename]
+    site = " <- ".join(f"{f.filename.split('/gpuwm/')[-1]}:{f.lineno}" for f in frames[-3:][::-1]) or "?"
+    _SYNC_TRACE[site] += 1
+
+
 def synchronize():
     """Wait for all queued GPU work."""
     global _pending
+    if _pending and os.environ.get("ARWEN_METAL_SYNC_TRACE") == "1":
+        _trace_sync()
     rt().synchronize()
     _pending = False
     if _PROFILE is not None and getattr(_RT, "profile", False):

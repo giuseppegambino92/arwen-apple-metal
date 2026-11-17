@@ -182,6 +182,20 @@ an exact zero; then the correctly rounded IEEE result is computed in software
 (`tests/metal/sf32_host_check.cpp`). The RRTMG LW/SW and legacy-prep device
 preflights now pass on the M3 Max.
 
+Hardware support was searched for: Apple's Metal feature tables list "FP32
+denormalized numbers" for the Apple11 family only (the M3 Max is Apple9), MSL
+allows flushing with fast math off, there is no compile option or capability
+to turn it off, and the Linux AGX drivers (Mesa/Asahi forks) emulate denormal
+preservation in software too.  The emulation is therefore permanent on this
+GPU; its fast path tests the *result* only: the hardware reads a subnormal
+operand as zero, so a subnormal operand of `*` or `/` always produces a result
+in exponent band 0/1/255, and one of `+`/`-` changes the IEEE result only below
+2^-101.  Only inside those bands do the exact conditions run.  GPU check
+(`tests/metal/ftz_false_gpu_check.py`): `+ - * / sqrt` and the six comparisons
+on 4.2 M subnormal-heavy cases each, 0 differing words vs NumPy.  Cost on a
+dependent FP32 chain: 1.8× the flushing hardware on normal data (was 2.4×);
+3–6× on data that is mostly exact zeros.
+
 `a > b ? a : b` on floats is translated to `fmaxf` (and the three sibling
 forms): NVRTC emits setp/selp, but CUDA's results follow ptxas's FMNMX
 selection (max(+0, −0) = +0), which ArWen's legacy prep preflight checks.
@@ -245,3 +259,38 @@ diagnostic P by up to 0.086 Pa — under investigation. The hour-1 differences
 are the expected growth of rounding-level differences (FMA contraction, libm)
 through moist convection: no bias, correlations ≥ 0.9985, isolated maxima
 (T2 1.4–1.7 K).
+
+## Verified fast paths for the glibc float libm copies (`gpuwm/metal/fastlibm.py`)
+
+ArWen's physics carries per-scheme device copies of glibc's logf/expf/powf
+(`mynn_glibc_*`, `gfk_*`, `rlw_*`, `rsw_*`, `r_*`): table + polynomial in
+binary64, rounded once to binary32.  With binary64 emulated on integers
+(Apple GPU: shifts 4–8 cycles, 32-bit multiply 4, mulhi 8, FP32 FMA 1; measured
+here: binary64 add 21 Gop/s, mul 38, fma 5, against FP32 fma 1011) these copies
+dominated MYNN, Noah, Tiedtke and radiation kernels (a diagnostic build with
+hardware libm cut `mynn_surface_column` from 48× to 7× the RTX 5090 time).
+
+`arwen_fastlibm_{logf,expf,powf}.h` evaluate glibc's own formula (its tables
+and coefficients, `tools/metal/gen_fastlibm_tables.py`) in float-float on the
+FP32 FMA hardware and return a value only when every number within a declared
+error budget of it (2^-36 relative, plus terms for cancellation and |y log2 x|)
+rounds to the same binary32; otherwise — specials, tiny/huge results, values
+near a rounding boundary — the exact original runs.  The translator routes a
+copy only when its fingerprint (the function, every table/helper it reaches,
+the compile options, the fast-path sources) is in `fastlibm_receipt.json`,
+which `tools/metal/verify_fastlibm.py` fills after comparing routed and
+original on **all 2^32 binary32 inputs** on the GPU.  powf is routed per call
+site, only where the exponent is a literal, and each (copy, exponent) pair is
+verified on all 2^32 x; variable-exponent calls stay exact.  Unverified copies
+are recorded under the cache directory for the verifier.
+
+Receipt for the Sicily2KM_ECM run: 47 (copy, options[, exponent]) entries —
+logf, expf, powf in MYNN, Noah/Tiedtke (gfk), RRTMG LW/SW — each 4,294,967,296
+inputs, 0 differing words; fast-path share of all inputs 0.50 (logf),
+0.52 (expf), 0.12–0.50 (powf, by exponent).
+
+End-to-end: the 1-hour forecast with every optimization of this section and
+the two before it is **bit-identical** to the 1-hour run made before them
+(`tools/metal/wrfout_bitwise.py`, 01:00 d01 + d02: 142,775,319 words, 0 differ).
+Per-step wall time over the hour: d02 median 1.238 → 0.557 s, d01 0.659 →
+0.329 s; sum of steps 408 → 191 s.

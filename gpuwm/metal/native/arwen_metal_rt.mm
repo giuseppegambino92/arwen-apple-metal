@@ -94,6 +94,10 @@ struct Runtime {
     std::vector<std::pair<id<MTLCommandBuffer>, id<MTLBuffer>>> zombies;
     std::recursive_mutex mu;
     int batch = 256;
+    // commit after only `eager` dispatches when the GPU has run dry (after a
+    // host synchronization, the GPU would otherwise wait for a full batch)
+    int eager = 16;
+    uint64_t n_eager = 0;
     int in_cb = 0;
     bool residency_dirty = false;
     bool barrier_between = true;
@@ -236,7 +240,14 @@ struct Runtime {
             prof_pending.emplace_back(mine, p->name);
             return;
         }
-        if (++in_cb >= batch) commit();
+        ++in_cb;
+        if (in_cb >= batch) {
+            commit();
+        } else if (eager > 0 && in_cb >= eager &&
+                   (last_committed == nil || [last_committed status] >= MTLCommandBufferStatusCompleted)) {
+            n_eager++;
+            commit();
+        }
     }
 
     void flush() {
@@ -307,6 +318,7 @@ struct Runtime {
         d["dispatches"] = n_dispatch;
         d["command_buffers"] = n_cb;
         d["synchronizations"] = n_sync;
+        d["eager_commits"] = n_eager;
         d["live_bytes"] = live_bytes;
         d["peak_bytes"] = peak_bytes;
         d["recommended_max_working_set"] = (uint64_t)[dev recommendedMaxWorkingSetSize];
@@ -339,6 +351,7 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def(nb::init<>())
         .def_prop_ro("name", &Runtime::name)
         .def_rw("batch", &Runtime::batch)
+        .def_rw("eager", &Runtime::eager)
         .def_rw("barrier_between", &Runtime::barrier_between)
         .def_rw("concurrent", &Runtime::concurrent)
         .def_rw("flush_on_alloc", &Runtime::flush_on_alloc)
