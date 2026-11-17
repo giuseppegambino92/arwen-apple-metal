@@ -40,10 +40,21 @@ def rt():
             if _RT is None:
                 _RT = native().Runtime()
                 _RT.batch = int(os.environ.get("ARWEN_METAL_BATCH", "256"))
+                _RT.flush_on_alloc = os.environ.get("ARWEN_METAL_FLUSH_ON_ALLOC", "") == "1"
+                _RT.concurrent = os.environ.get("ARWEN_METAL_CONCURRENT", "") == "1"
     return _RT
 
 
 # --------------------------------------------------------------------- memory
+import weakref
+
+_LIVE = weakref.WeakSet()
+
+
+def live_memories():
+    return list(_LIVE)
+
+
 class DeviceMemory:
     """An MTLBuffer exporting its bytes through the buffer protocol."""
     __slots__ = ("buf", "cpu", "gpu", "nbytes", "_view", "__weakref__")
@@ -54,6 +65,7 @@ class DeviceMemory:
         self.gpu = self.buf.gpu_address
         self.nbytes = int(nbytes)
         self._view = (ctypes.c_char * max(self.nbytes, 1)).from_address(self.cpu)
+        _LIVE.add(self)
 
     def __buffer__(self, flags):
         return memoryview(self._view).cast("B")
@@ -62,8 +74,20 @@ class DeviceMemory:
         pass
 
 
+_pending = False
+
+
 def synchronize():
+    """Wait for all queued GPU work."""
+    global _pending
     rt().synchronize()
+    _pending = False
+
+
+def host_sync():
+    """Before the CPU touches device memory: wait only if GPU work is queued."""
+    if _pending:
+        synchronize()
 
 
 # --------------------------------------------------------------------- modules
@@ -104,6 +128,8 @@ class Module:
             ctypes.memset(self.globals.cpu, 0, gsize)          # CUDA zero-initialises __device__ data
             if "__arwen_init_globals" in self.library.function_names():
                 p = self.library.pipeline("__arwen_init_globals")
+                global _pending
+                _pending = True
                 rt().dispatch(p, b"", _launch(1, 1, 1, 1, 1, 1, 1), self.globals.buf, 1, 1, 1, 1, 1, 1, 0)
 
     def pipeline(self, name):
@@ -139,8 +165,8 @@ def device_address(a) -> int:
         return 0
     mem = getattr(a, "_gpuwm_mem", None)
     if mem is None:
-        if isinstance(a, int):
-            return a
+        if isinstance(a, (int, np.integer)):
+            return int(a)              # a GPU address carried as an integer (pointer tables)
         raise KernelError(f"kernel argument of type {type(a).__name__} is not a Metal device array")
     return mem.gpu + (a.__array_interface__["data"][0] - mem.cpu)
 
@@ -199,8 +225,44 @@ class Kernel:
                 split += 1
             bx //= split
             gx *= split
+        global _pending
+        check = bool(_NANCHECK)
+        if check:
+            before = _nan_counts(args)
+        _pending = True
         g = self.module.globals.buf if self.module.globals is not None else None
         rt().dispatch(self.pso, self.pack(args), _launch(grid[0], grid[1], grid[2], block[0], block[1], block[2], split),
                       g, gx, gy, gz, bx, by, bz, int(shared_mem))
+        if _SYNC_EACH:
+            synchronize()
+        if check:
+            after = _nan_counts(args)
+            for i, (b0, a0) in enumerate(zip(before, after)):
+                if a0 > b0:
+                    import sys
+                    p = self._layout[i]["name"] if i < len(self._layout) else str(i)
+                    msg = (f"[arwen-metal NANCHECK] kernel {self.name} (module {self.module.key[:12]}) "
+                           f"raised NaN count of argument {i} ({p}) from {b0} to {a0}; grid {grid} block {block}")
+                    print(msg, file=sys.stderr, flush=True)
+                    if _NANCHECK == "raise":
+                        raise FloatingPointError(msg)
 
     __call__ = launch
+
+
+_NANCHECK = os.environ.get("ARWEN_METAL_NANCHECK", "")
+_SYNC_EACH = os.environ.get("ARWEN_METAL_SYNC_EACH", "") == "1"   # debugging: wait for every dispatch
+
+
+def _nan_counts(args):
+    out = []
+    synchronize()
+    for a in args:
+        mem = getattr(a, "_gpuwm_mem", None)
+        if mem is not None and getattr(a, "dtype", None) is not None and a.dtype.kind == "f":
+            # whole underlying buffer: kernels address memory beyond the view's extent
+            whole = np.frombuffer(mem, dtype=a.dtype, count=mem.nbytes // a.dtype.itemsize)
+            out.append(int(np.count_nonzero(np.isnan(whole))))
+        else:
+            out.append(0)
+    return out

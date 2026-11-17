@@ -22,16 +22,58 @@ def is_amd():
     return os.environ.get('GPUWM_BACKEND', 'cuda').strip().lower() in ('amd', 'hip', 'rocm')
 
 
+def is_metal():
+    return os.environ.get('GPUWM_BACKEND', 'cuda').strip().lower() == 'metal'
+
+
 def command():
-    return [sys.executable,str(Path(__file__).resolve())] if is_amd() else ['nvidia-smi']
+    return [sys.executable,str(Path(__file__).resolve())] if (is_amd() or is_metal()) else ['nvidia-smi']
 
 
 def executable():
+    if is_metal():return sys.executable if shutil.which('ioreg') else None
     if is_amd():return sys.executable if shutil.which('rocm-smi') else None
     return shutil.which('nvidia-smi')
 
 
+def _ioreg(*args):
+    return subprocess.run(['ioreg',*args],check=True,capture_output=True,text=True,timeout=20).stdout
+
+
+def metal_inventory():
+    """Apple GPU, measured: Metal's recommended working set is the device memory;
+    free = physical memory the OS reports available (vm_stat), capped at it."""
+    import re,platform
+    from gpuwm.metal import runtime as mrt
+    st=mrt.rt().stats();total=int(st['recommended_max_working_set'])
+    vm=subprocess.run(['vm_stat'],check=True,capture_output=True,text=True,timeout=20).stdout
+    page=int(re.search(r'page size of (\d+) bytes',vm).group(1))
+    pages=lambda k:int(re.search(rf'{k}:\s+(\d+)',vm).group(1))
+    avail=(pages('Pages free')+pages('Pages inactive')+pages('Pages speculative'))*page
+    free=min(total,avail)
+    uuid=re.search(r'"IOPlatformUUID" = "([0-9A-F-]+)"',_ioreg('-rd1','-c','IOPlatformExpertDevice')).group(1)
+    perf=_ioreg('-r','-d','1','-w','0','-c','IOAccelerator')
+    m=re.search(r'"Device Utilization %"=(\d+)',perf)
+    return [{'index':'0','uuid':'GPU-METAL-'+uuid.lower(),'name':mrt.rt().name,'pci.bus_id':'00000000:00:00.0',
+             'memory.total':total//1048576,'memory.used':(total-free)//1048576,'memory.free':free//1048576,
+             'utilization.gpu':int(m.group(1)) if m else 'N/A','driver_version':'macOS '+platform.mac_ver()[0],
+             'compute_cap':'metal'}]
+
+
+def metal_processes(cards):
+    """Processes holding a Metal device client.  Metal contexts are unified
+    graphics+compute (C+G) and macOS reports no per-process GPU memory."""
+    import re
+    rows=[]
+    for pid,name in re.findall(r'"IOUserClientCreator" = "pid (\d+), ([^"]*)"',_ioreg('-l','-w','0','-c','AGXDeviceUserClient')):
+        if pid=='0' or any(r['pid']==pid for r in rows):continue
+        rows.append({'pid':pid,'gpu_uuid':cards[0]['uuid'],'gpu_bus_id':cards[0]['pci.bus_id'],'process_name':name,
+                     'used_memory':'[N/A]','used_gpu_memory':'[N/A]'})
+    return rows
+
+
 def inventory():
+    if is_metal():return metal_inventory()
     p=subprocess.run(['rocm-smi','--json','--showbus','--showproductname',
         '--showuniqueid','--showmeminfo','vram','--showuse','--showdriverversion'],
         check=True,capture_output=True,text=True,timeout=20)
@@ -58,6 +100,7 @@ class ProcessInfo(C.Structure):
 
 
 def processes(cards):
+    if is_metal():return metal_processes(cards)
     root=Path(os.environ.get('ROCM_PATH',os.environ.get('ROCM_HOME','/opt/rocm')))
     path=C.util.find_library('rocm_smi64') or str(root/'lib/librocm_smi64.so')
     lib=C.CDLL(path)
@@ -90,6 +133,7 @@ def processes(cards):
 
 
 def visibility_environment(identifier):
+    if is_metal():return {}
     if not is_amd():return {'CUDA_VISIBLE_DEVICES':str(identifier)}
     rows=inventory()
     matches=[r for r in rows if str(identifier) in (r['uuid'],r['index'],r['pci.bus_id'])]
@@ -99,7 +143,16 @@ def visibility_environment(identifier):
     return {'CUDA_VISIBLE_DEVICES':matches[0]['index'],'HIP_VISIBLE_DEVICES':matches[0]['index']}
 
 
+def _pmon(args):
+    """nvidia-smi pmon -s um rows for Metal clients (type C+G, unmeasured fb)."""
+    cards=inventory()
+    for r in processes(cards):
+        print(f"    0 {r['pid']:>7}   C+G     -     -     -     -     -     -     -     -   {r['process_name'][:32]}")
+    sys.stdout.flush()
+
+
 def _emit(args):
+    if args and args[0]=='pmon':return _pmon(args)
     cards=inventory();query=next((a.split('=',1)[1] for a in args if a.startswith('--query-gpu=')),None)
     apps=next((a.split('=',1)[1] for a in args if a.startswith('--query-compute-apps=')),None)
     if not query and not apps:raise ValueError('GPU inventory adapter requires a supported --query-gpu or --query-compute-apps')
@@ -126,5 +179,5 @@ def main(argv=None):
             if interval is None:return 0
             time.sleep(interval)
     except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as e:
-        print('ROCm telemetry unavailable: '+str(e),file=sys.stderr);return 2
+        print(('Metal' if is_metal() else 'ROCm')+' telemetry unavailable: '+str(e),file=sys.stderr);return 2
 if __name__=='__main__':raise SystemExit(main())

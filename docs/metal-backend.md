@@ -1,7 +1,10 @@
 # Metal backend (Apple Silicon) — design notes and measurements
 
-Status: **in progress**. Milestones 1–2 (environment, CUDA→MSL translator) done;
-runtime, `xp` layer and kernel parity (Milestones 3–7) not yet.
+Status: **in progress**. Milestones 1–2 (environment, CUDA→MSL translator)
+done; Milestone 3 (runtime, `xp` layer, `--backend metal`) working end to end
+up to the first model step; kernel parity and the real run (Milestones 4–7)
+not yet — the first physics step currently produces non-finite RRTMG LW and
+MYNN tendencies.
 
 The CUDA sources stay canonical. `gpuwm/metal/` translates, at build/JIT
 time, exactly the source string gpuwm hands to NVRTC; nothing on the Metal
@@ -136,3 +139,66 @@ reached through GPU addresses), so Metal sees no dependencies:
 
 Cost: 6.5–9 µs per dispatch (Python packing + encoding) with 256 dispatches
 per command buffer; ~300–550 µs with one dispatch per command buffer.
+
+## Array layer and CuPy shim (`gpuwm/metal/xp`, `gpuwm/metal/shim.py`)
+
+`--backend metal` (or `GPUWM_BACKEND=metal`) installs `gpuwm.metal.xp` as
+`cupy` before any gpuwm module imports CuPy (hook at the top of
+`gpuwm/__init__.py`), registers the `metal` backend, forces `GPUWM_AOT=off`
+(CUDA kernel packs cannot run here) and makes `gpu_smi.py` answer the
+supervisor's `nvidia-smi` queries from measured Metal/macOS data (working set,
+`vm_stat` available memory, IOAccelerator utilisation, Metal client processes
+as `C+G` with unmeasured per-process memory).
+
+* `ndarray` is a numpy.ndarray subclass over an MTLBuffer: views/slicing are
+  numpy's (no copies); ufuncs (NumPy 2 type resolution), reductions,
+  `where/clip/concatenate/stack/roll/pad/take/nonzero/...`, ElementwiseKernel,
+  ReductionKernel, RawModule/RawKernel, `cuda.function.Module` + NVRTC tokens
+  are GPU kernels generated as CUDA and run through the same translator.
+  CuPy-generated kernels compile with CuPy's `-ftz=true`.
+* A NumPy function without a GPU implementation raises NotImplementedError
+  naming it. There is no host fallback.
+* NumPy hands out views of an ndarray subclass without asking it, so
+  `np.asarray/np.array/...` of a device array would read GPU memory with work
+  still queued (CuPy raises instead): those entry points wait for the GPU.
+  This was the cause of a deterministic NaN in the initial pressure field
+  when two dispatches shared a command buffer.
+* `tests/metal/xp_parity_check.py`: 117 checks against NumPy (4 dtypes,
+  broadcasting, strided views, reductions, scans, masks, gathers, custom
+  kernels): 0 failures — bit-exact, or within |err| <= n·eps·Σ|x| for
+  floating-point reductions whose summation order differs from NumPy's.
+
+## FP32 subnormals (CUDA `--ftz=false` modules)
+
+ArWen's own device preflights caught it: the legacy RRTMG LW kernel returned
+0 where the Fortran keeps 9.9999461e-41. Modules CUDA compiles without FTZ
+(MYNN, RRTMG, smag2d, terrain drag, diffusion, hydrology — 20 source files)
+now route every float `+ - * /`, compound assignment, comparison, negation,
+`_rn` intrinsic and math function through helpers that take the hardware
+result unless an operand is subnormal or the result is below 2^-125 and not
+an exact zero; then the correctly rounded IEEE result is computed in software
+(binary64 rounded to odd, then once to binary32). Checked on the host:
+20 M cases × 6 operations, subnormal-heavy, 0 mismatches
+(`tests/metal/sf32_host_check.cpp`). The RRTMG LW/SW and legacy-prep device
+preflights now pass on the M3 Max.
+
+`a > b ? a : b` on floats is translated to `fmaxf` (and the three sibling
+forms): NVRTC emits setp/selp, but CUDA's results follow ptxas's FMNMX
+selection (max(+0, −0) = +0), which ArWen's legacy prep preflight checks.
+
+## Compile cost (measured, `tools/metal/pipeline_timing.py`)
+
+Soft-float routines are out of line; inlined into every operation they made
+one MYNN pipeline compile run for more than 6 minutes. Now: all 54 source files
+translate + compile to metallib + build their pipelines; worst cases thompson
+(55 s + 22 s for 105 pipelines), smag2d (44 s + 14 s), tiedtke (41 s + 4 s).
+Metallibs are cached on disk; pipelines (~3 min in total) are rebuilt by each
+process — an MTLBinaryArchive cache is pending (Milestone 7).
+
+## macOS portability fixes outside gpuwm/metal
+
+* `gpuwm/bridges.py`: Rust bridges are Mach-O on macOS (the probe only knew
+  ELF/PE).
+* Rust tools built with `cargo build --release --locked --offline -p rw-netcdf
+  -p netcdf-writer -p static-fields -p rw-fetch` (crates using cudarc are not
+  built; the renderer is therefore unavailable and runs draw no pictures).

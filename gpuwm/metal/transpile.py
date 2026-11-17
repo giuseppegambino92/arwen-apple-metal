@@ -794,6 +794,9 @@ class _Module:
         self.edit_globals()
         self.edit_functions()
         self.edit_expressions()
+        self.edit_select_minmax()
+        if not self.opts.ftz:
+            self.edit_float_ops()
         self.edit_tokens()
         body = self.rw.apply()
         return self.finish(body)
@@ -984,6 +987,16 @@ class _Module:
                 return True
         return False
 
+    def _deducible_elsewhere(self, params, i) -> bool:
+        """Is the dependent pointee type of params[i] also named by a non-pointer parameter?"""
+        name = re.sub(r"\b(const|volatile)\b|[*&\s]", "", params[i].type.get_pointee().spelling)
+        for j, q in enumerate(params):
+            if j == i or _canon(q.type).kind == T.POINTER:
+                continue
+            if re.search(r"\b%s\b" % re.escape(name), q.type.spelling):
+                return True
+        return False
+
     @staticmethod
     def _dependent(t) -> bool:
         k, ck = t.kind, _canon(t).kind
@@ -1012,7 +1025,7 @@ class _Module:
                 ety = self.msl_type(t.get_pointee(), storage=True)
                 self.rw.replace(p.extent.start.offset, p.extent.end.offset,
                                 f"__arwen_gptr<{ety}> {pname}{self._param_default(p)}")
-            elif ct.kind == T.POINTER and self._dependent(t.get_pointee()):
+            elif ct.kind == T.POINTER and self._dependent(t.get_pointee()) and not self._deducible_elsewhere(params, i):
                 # the function template deduces its own parameter from T*: keep it
                 # deducible, in device memory
                 self.rw.replace(p.extent.start.offset, p.extent.end.offset,
@@ -1134,6 +1147,100 @@ class _Module:
             elif k in (K.CSTYLE_CAST_EXPR, K.CXX_FUNCTIONAL_CAST_EXPR, K.CXX_STATIC_CAST_EXPR,
                        K.CXX_REINTERPRET_CAST_EXPR, K.CXX_CONST_CAST_EXPR):
                 self.edit_explicit_cast(c)
+
+    def edit_select_minmax(self):
+        """``a > b ? a : b`` on floats -> fmaxf(a, b) (and the three sibling forms).
+
+        NVRTC emits setp + selp for these, but ptxas selects them into FMNMX, and
+        CUDA results follow FMNMX's semantics (max(+0, -0) = +0, NaN loses);
+        ArWen's RRTMG legacy prep preflight checks exactly that on the device.
+        Only side-effect-free operands that are textually identical are matched."""
+        simple = re.compile(r"^[\w.\[\]\s()>-]+$")
+        for c in self.nodes:
+            if c.kind != K.CONDITIONAL_OPERATOR or self.fn_of.get(c.hash) is None or _canon(c.type).kind != T.FLOAT:
+                continue
+            kids = list(c.get_children())
+            if len(kids) != 3:
+                continue
+            cond = kids[0]
+            while cond.kind in (K.PAREN_EXPR, K.UNEXPOSED_EXPR) and len(list(cond.get_children())) == 1:
+                cond = list(cond.get_children())[0]
+            if cond.kind != K.BINARY_OPERATOR:
+                continue
+            ck = list(cond.get_children())
+            if len(ck) != 2 or _canon(ck[0].type).kind != T.FLOAT or _canon(ck[1].type).kind != T.FLOAT:
+                continue
+            ops = [t.spelling for t in _tokens(cond) if ck[0].extent.end.offset <= t.extent.start.offset < ck[1].extent.start.offset]
+            if ops not in (["<"], [">"]):
+                continue
+            txt = lambda n: re.sub(r"\s+", "", self.text[n.extent.start.offset:n.extent.end.offset])
+            a, b, t, f = txt(ck[0]), txt(ck[1]), txt(kids[1]), txt(kids[2])
+            if not (simple.match(a) and simple.match(b)) or "++" in a + b or "--" in a + b or "=" in a + b:
+                continue
+            if (t, f) == (a, b):
+                fn = "fmaxf" if ops == [">"] else "fminf"
+            elif (t, f) == (b, a):
+                fn = "fminf" if ops == [">"] else "fmaxf"
+            else:
+                continue
+            if self.rw.in_opaque(c.extent.start.offset, c.extent.end.offset):
+                continue
+            # three disjoint replacements around the operands, so edits inside them still apply
+            self.rw.replace(c.extent.start.offset, ck[0].extent.start.offset, f"{fn}(")
+            self.rw.replace(ck[0].extent.end.offset, ck[1].extent.start.offset, ", ")
+            self.rw.replace(ck[1].extent.end.offset, c.extent.end.offset, ")")
+            self._select_done.update(n.hash for n in (cond,))
+
+    _FBIN = {"+": "__arwen_fadd", "-": "__arwen_fsubtract", "*": "__arwen_fmul", "/": "__arwen_fdiv",
+             "<": "__arwen_flt", "<=": "__arwen_fle", ">": "__arwen_fgt", ">=": "__arwen_fge",
+             "==": "__arwen_feq", "!=": "__arwen_fne"}
+    _FCOMP = {"+=": "__arwen_fiadd", "-=": "__arwen_fisub", "*=": "__arwen_fimul", "/=": "__arwen_fidiv"}
+
+    def edit_float_ops(self):
+        """CUDA --ftz=false: route float arithmetic and comparisons through the
+        gradual-underflow-preserving helpers (Apple GPUs flush FP32 subnormals)."""
+        def is_f32(t):
+            return _canon(t).kind == T.FLOAT
+        for c in self.nodes:
+            if self.fn_of.get(c.hash) is None:
+                continue
+            k = c.kind
+            if k in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR):
+                kids = list(c.get_children())
+                if len(kids) != 2:
+                    continue
+                lhs, rhs = kids
+                ops = [t for t in _tokens(c) if lhs.extent.end.offset <= t.extent.start.offset < rhs.extent.start.offset]
+                if len(ops) != 1:
+                    continue
+                op = ops[0]
+                if c.hash in self._select_done:
+                    continue
+                if k == K.BINARY_OPERATOR and op.spelling in self._FBIN and is_f32(lhs.type) and is_f32(rhs.type):
+                    fn = self._FBIN[op.spelling]
+                elif k == K.COMPOUND_ASSIGNMENT_OPERATOR and op.spelling in self._FCOMP and is_f32(lhs.type) \
+                        and is_f32(rhs.type):
+                    fn = self._FCOMP[op.spelling]
+                else:
+                    continue
+                s0, s1 = lhs.extent.start.offset, rhs.extent.end.offset
+                if s0 == s1 or self.rw.in_opaque(s0, s1):
+                    continue
+                w = s1 - s0
+                if k == K.COMPOUND_ASSIGNMENT_OPERATOR:
+                    self.rw.insert(s0, f"{fn}(&(", order=-w)
+                    self.rw.replace(op.extent.start.offset, op.extent.end.offset, "), ")
+                else:
+                    self.rw.insert(s0, f"{fn}(", order=-w)
+                    self.rw.replace(op.extent.start.offset, op.extent.end.offset, ", ")
+                self.rw.insert(s1, ")", order=w)
+            elif k == K.UNARY_OPERATOR and is_f32(c.type):
+                toks = _tokens(c)
+                kids = list(c.get_children())
+                if toks and toks[0].spelling == "-" and kids and toks[0].extent.end.offset <= kids[0].extent.start.offset \
+                        and not self.rw.in_opaque(c.extent.start.offset, c.extent.end.offset):
+                    self.rw.replace(toks[0].extent.start.offset, toks[0].extent.end.offset, "__arwen_fneg(")
+                    self.rw.insert(c.extent.end.offset, ")", order=c.extent.end.offset - c.extent.start.offset)
 
     def edit_explicit_cast(self, c):
         ops = [ch for ch in c.get_children() if ch.kind.is_expression()]
@@ -1619,6 +1726,7 @@ def translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str 
     mod = _Module(pp, opts, f64_mode, filename)
     mod._literal_done = set()
     mod._cast_done = set()
+    mod._select_done = set()
     return mod.run()
 
 

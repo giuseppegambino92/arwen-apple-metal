@@ -92,6 +92,84 @@ inline __arwen_ctx_t __arwen_make_ctx(constant __arwen_launch_t& L, uint3 tid, u
 // ------------------------------------------------------------------ FP64
 #include "arwen_f64.h"
 
+// ------------------------------------------------------------------ FP32 gradual underflow (CUDA --ftz=false)
+// Apple GPUs flush FP32 subnormal operands and results.  Modules CUDA compiled
+// with --ftz=false (ARWEN_FTZ == 0) route every float operation through these:
+// the hardware result unless an operand is subnormal or the result is below
+// 2^-125 and not an exact zero, in which case the correctly rounded IEEE result
+// is computed in software (sf32_*, exact).  ARWEN_FTZ == 1 modules (CuPy's
+// default -ftz=true) use the hardware directly, matching CUDA.
+// binary64 evaluations behind the FP32 slow paths below.  For the functions
+// that equal their argument (or 1, or pi/2) to far below half an ulp when the
+// argument is subnormal, that value is returned directly.
+inline __f64 __arwen_f64_exp(__f64 x) { return exp(x); }
+inline __f64 __arwen_f64_exp2(__f64 x) { return exp2(x); }
+inline __f64 __arwen_f64_exp10(__f64 x) { return exp10(x); }
+inline __f64 __arwen_f64_log(__f64 x) { return log(x); }
+inline __f64 __arwen_f64_log2(__f64 x) { return log2(x); }
+inline __f64 __arwen_f64_log10(__f64 x) { return log10(x); }
+inline __f64 __arwen_f64_sqrt(__f64 x) { return sqrt(x); }
+inline __f64 __arwen_f64_rsqrt(__f64 x) { return __f64{0x3FF0000000000000UL} / sqrt(x); }
+inline __f64 __arwen_f64_sin(__f64 x) { return sin(x); }
+inline __f64 __arwen_f64_cos(__f64 x) { return cos(x); }
+inline __f64 __arwen_f64_tan(__f64 x) { return tan(x); }
+inline __f64 __arwen_f64_atan(__f64 x) { return atan(x); }
+inline __f64 __arwen_f64_asin(__f64 x) { return x; }
+inline __f64 __arwen_f64_sinh(__f64 x) { return x; }
+inline __f64 __arwen_f64_tanh(__f64 x) { return x; }
+inline __f64 __arwen_f64_asinh(__f64 x) { return x; }
+inline __f64 __arwen_f64_atanh(__f64 x) { return x; }
+inline __f64 __arwen_f64_acos(__f64 x) { return __f64{0x3FF921FB54442D18UL}; }
+inline __f64 __arwen_f64_cosh(__f64 x) { return __f64{0x3FF0000000000000UL}; }
+inline __f64 __arwen_f64_acosh(__f64 x) { return __f64{SF_DEFAULT_NAN}; }
+
+inline bool __arwen_fsub(float x) { uint u = as_type<uint>(x) & 0x7fffffffu; return u != 0u && u < 0x00800000u; }
+inline bool __arwen_flow(float r) { return (as_type<uint>(r) & 0x7f800000u) <= 0x00800000u; }   // |r| < 2^-125 or zero
+inline float __arwen_fneg(float x) { return as_type<float>(as_type<uint>(x) ^ 0x80000000u); }
+inline float __arwen_fadd(float a, float b) {
+    float r = a + b;
+    if (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && !(a == __arwen_fneg(b)))) return sf32_add(a, b);
+    return r;
+}
+inline float __arwen_fsubtract(float a, float b) {
+    float r = a - b;
+    if (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && !(a == b))) return sf32_sub(a, b);
+    return r;
+}
+inline float __arwen_fmul(float a, float b) {
+    float r = a * b;
+    if (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && a != 0.0f && b != 0.0f)) return sf32_mul(a, b);
+    return r;
+}
+inline float __arwen_fdiv(float a, float b) {
+    float r = a / b;
+    if (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && a != 0.0f)) return sf32_div(a, b);
+    return r;
+}
+inline float __arwen_fsqrt(float a) { return __arwen_fsub(a) ? sf32_sqrt(a) : metal::precise::sqrt(a); }
+inline float __arwen_ffma(float a, float b, float c) {
+    float r = metal::fma(a, b, c);
+    if (__arwen_fsub(a) || __arwen_fsub(b) || __arwen_fsub(c) || __arwen_flow(r)) return sf32_fma(a, b, c);
+    return r;
+}
+#define ARWEN_FCMP(name, op, sfexpr)                                                                   \
+    inline bool name(float a, float b) {                                                               \
+        if (__arwen_fsub(a) || __arwen_fsub(b)) { ulong x = sf_from_f32(a), y = sf_from_f32(b); return sfexpr; } \
+        return a op b;                                                                                 \
+    }
+ARWEN_FCMP(__arwen_flt, <, sf_lt(x, y))
+ARWEN_FCMP(__arwen_fle, <=, sf_le(x, y))
+ARWEN_FCMP(__arwen_fgt, >, sf_lt(y, x))
+ARWEN_FCMP(__arwen_fge, >=, sf_le(y, x))
+ARWEN_FCMP(__arwen_feq, ==, sf_eq(x, y))
+ARWEN_FCMP(__arwen_fne, !=, !sf_eq(x, y))
+#define ARWEN_FIOP(name, fn)                                                                           \
+    template <typename P> inline auto name(P p, float b) { *p = fn(*p, b); return *p; }
+ARWEN_FIOP(__arwen_fiadd, __arwen_fadd)
+ARWEN_FIOP(__arwen_fisub, __arwen_fsubtract)
+ARWEN_FIOP(__arwen_fimul, __arwen_fmul)
+ARWEN_FIOP(__arwen_fidiv, __arwen_fdiv)
+
 // ------------------------------------------------------------------ synchronisation
 inline void __syncthreads() { metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup | metal::mem_flags::mem_device); }
 inline void __syncwarp(uint = 0xffffffffu) { metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup | metal::mem_flags::mem_device); }
@@ -216,6 +294,7 @@ inline float __uint2float_rn(uint x) { return (float)x; }
 // these is one correctly rounded IEEE operation (verified on M3 Max: 0
 // mismatches in 2^20 normal-range cases; subnormal operands/results are
 // flushed by the GPU, see docs/metal-backend.md).
+#if ARWEN_FTZ
 inline float __fadd_rn(float a, float b) { return a + b; }
 inline float __fsub_rn(float a, float b) { return a - b; }
 inline float __fmul_rn(float a, float b) { return a * b; }
@@ -223,11 +302,26 @@ inline float __fdiv_rn(float a, float b) { return a / b; }
 inline float __frcp_rn(float a) { return 1.0f / a; }
 inline float __fsqrt_rn(float a) { return metal::precise::sqrt(a); }
 inline float __fmaf_rn(float a, float b, float c) { return metal::fma(a, b, c); }
+#else
+inline float __fadd_rn(float a, float b) { return __arwen_fadd(a, b); }
+inline float __fsub_rn(float a, float b) { return __arwen_fsubtract(a, b); }
+inline float __fmul_rn(float a, float b) { return __arwen_fmul(a, b); }
+inline float __fdiv_rn(float a, float b) { return __arwen_fdiv(a, b); }
+inline float __frcp_rn(float a) { return __arwen_fdiv(1.0f, a); }
+inline float __fsqrt_rn(float a) { return __arwen_fsqrt(a); }
+inline float __fmaf_rn(float a, float b, float c) { return __arwen_ffma(a, b, c); }
+#endif
 inline float __fdividef(float a, float b) { return metal::fast::divide(a, b); }
 inline float __expf(float a) { return metal::fast::exp(a); }
 inline float __logf(float a) { return metal::fast::log(a); }
 inline float __powf(float a, float b) { return metal::fast::pow(a, b); }
-inline uint __arwen_fgt_u32(float a, float b) { return a > b ? 1u : 0u; }
+inline uint __arwen_fgt_u32(float a, float b) {
+#if ARWEN_FTZ
+    return a > b ? 1u : 0u;
+#else
+    return __arwen_fgt(a, b) ? 1u : 0u;
+#endif
+}
 
 // ------------------------------------------------------------------ integer intrinsics
 inline int __clz(int x) { return (int)metal::clz((uint)x); }
@@ -254,8 +348,10 @@ ARWEN_MINMAX(long)
 ARWEN_MINMAX(ulong)
 ARWEN_MINMAX(short)
 ARWEN_MINMAX(ushort)
-inline float min(float a, float b) { return metal::fmin(a, b); }
-inline float max(float a, float b) { return metal::fmax(a, b); }
+inline float fminf(float, float);
+inline float fmaxf(float, float);
+inline float min(float a, float b) { return fminf(a, b); }
+inline float max(float a, float b) { return fmaxf(a, b); }
 inline uint min(int a, uint b) { return metal::min((uint)a, b); }
 inline uint max(int a, uint b) { return metal::max((uint)a, b); }
 inline uint min(uint a, int b) { return metal::min(a, (uint)b); }
@@ -269,9 +365,22 @@ inline long labs(long x) { return metal::abs(x); }
 inline long llabs(long x) { return metal::abs(x); }
 
 // ------------------------------------------------------------------ float math (CUDA names, C99 semantics)
+#if ARWEN_FTZ
 #define ARWEN_F1(cuda, metalfn)                                   \
     inline float cuda##f(float x) { return metal::precise::metalfn(x); } \
     inline float cuda(float x) { return metal::precise::metalfn(x); }
+#else
+// subnormal argument, or a result below 2^-125: evaluate in binary64 (sf64,
+// < 1 ulp) and round once to binary32 with gradual underflow
+#define ARWEN_F1(cuda, metalfn)                                                                       \
+    inline float cuda##f(float x) {                                                                   \
+        float r = metal::precise::metalfn(x);                                                         \
+        if (__arwen_fsub(x) || (__arwen_flow(r) && x != 0.0f))                                        \
+            return sf_to_f32(__arwen_f64_##metalfn(__f64{sf_from_f32(x)}).v);                         \
+        return r;                                                                                     \
+    }                                                                                                 \
+    inline float cuda(float x) { return cuda##f(x); }
+#endif
 ARWEN_F1(exp, exp)
 ARWEN_F1(exp2, exp2)
 ARWEN_F1(exp10, exp10)
@@ -292,9 +401,21 @@ ARWEN_F1(tanh, tanh)
 ARWEN_F1(asinh, asinh)
 ARWEN_F1(acosh, acosh)
 ARWEN_F1(atanh, atanh)
+#if ARWEN_FTZ
 #define ARWEN_FE(cuda, metalfn)                                   \
     inline float cuda##f(float x) { return metal::metalfn(x); }   \
     inline float cuda(float x) { return metal::metalfn(x); }
+#else
+#define ARWEN_FE(cuda, metalfn)                                                                 \
+    inline float cuda##f(float x) { return __arwen_fsub(x) ? __arwen_fe_slow_##metalfn(x) : metal::metalfn(x); } \
+    inline float cuda(float x) { return cuda##f(x); }
+inline float __arwen_fe_slow_fabs(float x) { return as_type<float>(as_type<uint>(x) & 0x7fffffffu); }
+inline float __arwen_fe_slow_floor(float x) { return sf_to_f32(sf_floor(sf_from_f32(x))); }
+inline float __arwen_fe_slow_ceil(float x) { return sf_to_f32(sf_ceil(sf_from_f32(x))); }
+inline float __arwen_fe_slow_trunc(float x) { return sf_to_f32(sf_trunc(sf_from_f32(x))); }
+inline float __arwen_fe_slow_round(float x) { return sf_to_f32(sf_round(sf_from_f32(x))); }
+inline float __arwen_fe_slow_rint(float x) { return sf_to_f32(sf_rint(sf_from_f32(x))); }
+#endif
 ARWEN_FE(fabs, fabs)
 ARWEN_FE(floor, floor)
 ARWEN_FE(ceil, ceil)
@@ -306,11 +427,37 @@ inline float nearbyint(float x) { return metal::rint(x); }
 #define ARWEN_F2(cuda, expr)                                                \
     inline float cuda##f(float x, float y) { return expr; }                 \
     inline float cuda(float x, float y) { return expr; }
+// CUDA fmaxf/fminf (FMNMX): NaN loses to a number; -0 < +0.
+inline float __arwen_fmax_ieee(float x, float y, bool ge) {
+    if (metal::isnan(x)) return y;
+    if (metal::isnan(y)) return x;
+    if (x == 0.0f && y == 0.0f) return as_type<float>(as_type<uint>(x) & as_type<uint>(y));
+    return ge ? x : y;
+}
+inline float __arwen_fmin_ieee(float x, float y, bool le) {
+    if (metal::isnan(x)) return y;
+    if (metal::isnan(y)) return x;
+    if (x == 0.0f && y == 0.0f) return as_type<float>(as_type<uint>(x) | as_type<uint>(y));
+    return le ? x : y;
+}
+#if ARWEN_FTZ
 ARWEN_F2(atan2, metal::precise::atan2(x, y))
-ARWEN_F2(fmax, metal::fmax(x, y))
-ARWEN_F2(fmin, metal::fmin(x, y))
+ARWEN_F2(fmax, __arwen_fmax_ieee(x, y, x >= y))
+ARWEN_F2(fmin, __arwen_fmin_ieee(x, y, x <= y))
 ARWEN_F2(fmod, metal::precise::fmod(x, y))
 ARWEN_F2(copysign, metal::copysign(x, y))
+#else
+inline float __arwen_f2_slow(float r, float x, float y, int op) {
+    if (!(__arwen_fsub(x) || __arwen_fsub(y) || (__arwen_flow(r) && x != 0.0f))) return r;
+    __f64 a{sf_from_f32(x)}, b{sf_from_f32(y)};
+    return sf_to_f32((op == 0 ? atan2(a, b) : fmod(a, b)).v);
+}
+ARWEN_F2(atan2, __arwen_f2_slow(metal::precise::atan2(x, y), x, y, 0))
+ARWEN_F2(fmax, __arwen_fmax_ieee(x, y, __arwen_fge(x, y)))
+ARWEN_F2(fmin, __arwen_fmin_ieee(x, y, __arwen_fle(x, y)))
+ARWEN_F2(fmod, __arwen_f2_slow(metal::precise::fmod(x, y), x, y, 1))
+ARWEN_F2(copysign, as_type<float>((as_type<uint>(x) & 0x7fffffffu) | (as_type<uint>(y) & 0x80000000u)))
+#endif
 ARWEN_F2(fdim, (metal::isnan(x) || metal::isnan(y)) ? x + y : (x > y ? x - y : 0.0f))
 inline float fmaf(float a, float b, float c) { return metal::fma(a, b, c); }
 inline float fma(float a, float b, float c) { return metal::fma(a, b, c); }
@@ -352,7 +499,16 @@ inline float __arwen_powf(float x, float y) {
     float r = metal::precise::pow(ax, y);
     return (x < 0.0f && yodd) ? -r : r;
 }
+#if ARWEN_FTZ
 inline float powf(float x, float y) { return __arwen_powf(x, y); }
+#else
+inline float powf(float x, float y) {
+    float r = __arwen_powf(x, y);
+    if (__arwen_fsub(x) || __arwen_fsub(y) || (__arwen_flow(r) && x != 0.0f))
+        return sf_to_f32(pow(__f64{sf_from_f32(x)}, __f64{sf_from_f32(y)}).v);
+    return r;
+}
+#endif
 inline float pow(float x, float y) { return __arwen_powf(x, y); }
 inline float pow(float x, int n) { return __arwen_powf(x, (float)n); }
 

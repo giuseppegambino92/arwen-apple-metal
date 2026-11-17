@@ -941,6 +941,9 @@ def native_executable_format(path: Path) -> tuple[str | None, str]:
         return None, f"cannot be read: {error}"
     if head[:4] == b"\x7fELF":
         return "elf", "ELF executable header"
+    # macOS: 64-bit Mach-O (MH_MAGIC_64 / MH_CIGAM_64) and universal binaries
+    if head[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe"):
+        return "macho", "Mach-O executable header"
     if head[:2] == b"MZ" and len(head) >= 0x40:
         offset = int.from_bytes(head[0x3c:0x40], "little")
         # The signature lives past this window; its OFFSET is what a
@@ -951,7 +954,7 @@ def native_executable_format(path: Path) -> tuple[str | None, str]:
         return None, ("has an MZ stub whose PE signature offset is out of "
                       "range -- truncated or not an executable")
     return None, (f"is not a native executable ({len(head)} byte(s) read, "
-                  "no ELF or PE header)")
+                  "no ELF, PE or Mach-O header)")
 
 
 def launchable(path: Path) -> tuple[bool, str]:
@@ -968,7 +971,7 @@ def launchable(path: Path) -> tuple[bool, str]:
     binary_format, evidence = native_executable_format(path)
     if binary_format is None:
         return False, f"exists but {evidence}"
-    expected = "pe" if os.name == "nt" else "elf"
+    expected = "pe" if os.name == "nt" else ("macho" if sys.platform == "darwin" else "elf")
     if binary_format != expected:
         return False, (f"exists but is a {binary_format.upper()} binary on a "
                        f"host that runs {expected.upper()} -- built for "

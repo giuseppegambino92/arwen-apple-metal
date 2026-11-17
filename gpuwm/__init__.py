@@ -27,6 +27,12 @@ from __future__ import annotations
 
 import time as _time
 
+# Apple Metal backend: serve ``import cupy`` from gpuwm.metal.xp before any
+# module imports CuPy (docs/metal-backend.md).
+from gpuwm.metal import shim as _metal_shim
+if _metal_shim.requested():
+    _metal_shim.install()
+
 #: The earliest instant any gpuwm code runs in this process, on both
 #: clocks: :data:`LAUNCH_MONOTONIC` for durations and
 #: :data:`LAUNCH_UNIX_MS` for the wall a receipt is stamped with.

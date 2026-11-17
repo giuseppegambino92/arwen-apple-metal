@@ -83,8 +83,11 @@ struct Runtime {
     id<MTLBuffer> null_buf = nil;
     id<MTLSharedEvent> order_event = nil;    // serialises command buffers (resources are untracked)
     uint64_t order_value = 0;
+    bool flush_on_alloc = false;             // debugging: new command buffer after each allocation
     bool concurrent = false;                 // serial encoder (+ barrier); true = concurrent + barriers
     NSMutableArray* deferred = nil;          // buffers to keep alive until the current cb completes
+    // buffers released while committed work may still use them: (command buffer, buffer)
+    std::vector<std::pair<id<MTLCommandBuffer>, id<MTLBuffer>>> zombies;
     std::recursive_mutex mu;
     int batch = 256;
     int in_cb = 0;
@@ -122,6 +125,12 @@ struct Runtime {
         if (!b) throw std::runtime_error("metal: out of memory allocating " + std::to_string(n) + " bytes");
         [residency addAllocation:b];
         residency_dirty = true;
+        // the residency set is committed when the next command buffer begins; work
+        // already being encoded must see this allocation resident too
+        if (enc != nil) {
+            if (flush_on_alloc) commit();
+            else [enc useResource:b usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+        }
         auto* r = new Buffer();
         r->buf = b;
         r->nbytes = n;
@@ -134,37 +143,34 @@ struct Runtime {
     void release(id<MTLBuffer> b, size_t n) {
         std::lock_guard<std::recursive_mutex> g(mu);
         live_bytes -= (int64_t)n;
-        if (cb != nil || (last_committed != nil && [last_committed status] < MTLCommandBufferStatusCompleted)) {
-            // may still be referenced by encoded or in-flight work
+        if (cb != nil) {
+            // referenced by work still being encoded: released when that command buffer completes
             [deferred addObject:b];
-            if (cb == nil) flush_deferred_to(last_committed);
+        } else if (last_committed != nil && [last_committed status] < MTLCommandBufferStatusCompleted) {
+            // referenced by committed, in-flight work: reaped once it has completed
+            zombies.emplace_back(last_committed, b);
         } else {
             [residency removeAllocation:b];
             residency_dirty = true;
         }
     }
 
-    void flush_deferred_to(id<MTLCommandBuffer> target) {
-        if ([deferred count] == 0) return;
-        NSArray* keep = [deferred copy];
-        [deferred removeAllObjects];
-        id<MTLResidencySet> rs = residency;
-        Runtime* self_ = this;
-        if (target == nil || [target status] >= MTLCommandBufferStatusCompleted) {
-            std::lock_guard<std::recursive_mutex> g(mu);
-            for (id<MTLBuffer> b in keep) [rs removeAllocation:b];
-            residency_dirty = true;
-            return;
+    void reap() {
+        size_t k = 0;
+        for (size_t i = 0; i < zombies.size(); ++i) {
+            if ([zombies[i].first status] >= MTLCommandBufferStatusCompleted) {
+                [residency removeAllocation:zombies[i].second];
+                residency_dirty = true;
+            } else {
+                zombies[k++] = zombies[i];
+            }
         }
-        [target addCompletedHandler:^(id<MTLCommandBuffer>) {
-            std::lock_guard<std::recursive_mutex> g(self_->mu);
-            for (id<MTLBuffer> b in keep) [rs removeAllocation:b];
-            self_->residency_dirty = true;
-        }];
+        zombies.resize(k);
     }
 
     void begin() {
         if (cb == nil) {
+            reap();
             if (residency_dirty) { [residency commit]; residency_dirty = false; }
             cb = [queue commandBufferWithUnretainedReferences];
             Runtime* self_ = this;
@@ -237,6 +243,10 @@ struct Runtime {
             n_sync++;
         }
         if (wait != nil) [wait waitUntilCompleted];
+        {
+            std::lock_guard<std::recursive_mutex> g(mu);
+            reap();
+        }
         check_error();
     }
 
@@ -304,6 +314,7 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def_rw("batch", &Runtime::batch)
         .def_rw("barrier_between", &Runtime::barrier_between)
         .def_rw("concurrent", &Runtime::concurrent)
+        .def_rw("flush_on_alloc", &Runtime::flush_on_alloc)
         .def("alloc", &Runtime::alloc, nb::rv_policy::take_ownership, nb::keep_alive<0, 1>())
         .def("load_library", &Runtime::load_library, nb::rv_policy::take_ownership)
         .def("dispatch", &Runtime::dispatch, nb::arg("pipeline"), nb::arg("args"), nb::arg("launch"),

@@ -205,6 +205,7 @@ xp = _ArrayModule("gpuwm.backend.xp")
 from gpuwm.hip_backend import HipBackend
 register('hip', lambda: HipBackend('hip'))
 register('hip-nvidia', lambda: HipBackend('hip-nvidia'))
+register('metal', lambda: __import__('gpuwm.metal.shim', fromlist=['backend']).backend())
 
 
 def __getattr__(name):

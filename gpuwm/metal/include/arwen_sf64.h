@@ -21,6 +21,10 @@
 
 #ifdef __METAL_VERSION__
 #define SF_INLINE inline __attribute__((always_inline))
+// the arithmetic entry points stay out of line: inlining a full soft-float
+// operation at every double/subnormal-capable float operation of a large
+// kernel made Metal's backend compile run for many minutes
+#define SF_OUTLINE __attribute__((noinline))
 #define SF_CONSTEXPR constexpr
 typedef ulong sf_u64;
 typedef long sf_i64;
@@ -34,6 +38,7 @@ SF_INLINE float sf_bits_f32(sf_u32 u) { return as_type<float>(u); }
 #include <cstdint>
 #include <cstring>
 #define SF_INLINE inline
+#define SF_OUTLINE inline
 #define SF_CONSTEXPR constexpr
 typedef uint64_t sf_u64;
 typedef int64_t sf_i64;
@@ -66,7 +71,11 @@ SF_INLINE sf_u64 sf_propagate_nan(sf_u64 a, sf_u64 b) {
 // SoftFloat 3e softfloat_roundPackToF64, round-to-nearest-even.
 // ``sig`` carries the significand with its leading 1 at bit 62; ``exp`` is the
 // biased exponent minus one (the leading bit is added by SF_PACK).
-SF_INLINE sf_u64 sf_round_pack(bool sign, int exp, sf_u64 sig) {
+// ``odd``: round to odd instead (keep the truncated significand, set its last
+// bit when anything was discarded).  A binary64 result rounded to odd and then
+// rounded once to binary32 is the correctly rounded binary32 result (53 >= 24+2),
+// which is how the FP32 subnormal emulation computes exact float operations.
+SF_INLINE sf_u64 sf_round_pack(bool sign, int exp, sf_u64 sig, bool odd = false) {
     sf_u64 round_bits = sig & 0x3FF;
     if ((sf_u32)exp >= 0x7FDu) {
         if (exp < 0) {
@@ -77,18 +86,22 @@ SF_INLINE sf_u64 sf_round_pack(bool sign, int exp, sf_u64 sig) {
             return SF_PACK(sign, 0x7FF, 0);
         }
     }
-    sig = (sig + 0x200) >> 10;
-    sig &= ~(sf_u64)((round_bits ^ 0x200) == 0);
+    if (odd) {
+        sig = (sig >> 10) | (sf_u64)(round_bits != 0);
+    } else {
+        sig = (sig + 0x200) >> 10;
+        sig &= ~(sf_u64)((round_bits ^ 0x200) == 0);
+    }
     if (!sig) exp = 0;
     return SF_PACK(sign, exp, sig);
 }
 
-SF_INLINE sf_u64 sf_norm_round_pack(bool sign, int exp, sf_u64 sig) {
+SF_INLINE sf_u64 sf_norm_round_pack(bool sign, int exp, sf_u64 sig, bool odd = false) {
     int shift = sf_clz64(sig) - 1;
     exp -= shift;
     if (shift >= 10 && (sf_u32)exp < 0x7FDu)
         return SF_PACK(sign, sig ? exp : 0, sig << (shift - 10));
-    return sf_round_pack(sign, exp, sig << shift);
+    return sf_round_pack(sign, exp, sig << shift, odd);
 }
 
 SF_INLINE void sf_norm_subnormal(sf_u64 frac, SF_THREAD int& exp, SF_THREAD sf_u64& sig) {
@@ -97,7 +110,7 @@ SF_INLINE void sf_norm_subnormal(sf_u64 frac, SF_THREAD int& exp, SF_THREAD sf_u
     sig = frac << shift;
 }
 
-SF_INLINE sf_u64 sf_add_mags(sf_u64 a, sf_u64 b, bool sz) {
+SF_INLINE sf_u64 sf_add_mags(sf_u64 a, sf_u64 b, bool sz, bool odd = false) {
     int ea = SF_EXP(a), eb = SF_EXP(b);
     sf_u64 sa = SF_FRAC(a), sb = SF_FRAC(b);
     int d = ea - eb, ez;
@@ -124,10 +137,10 @@ SF_INLINE sf_u64 sf_add_mags(sf_u64 a, sf_u64 b, bool sz) {
         sig = 0x2000000000000000UL + sa + sb;
         if (sig < 0x4000000000000000UL) { --ez; sig <<= 1; }
     }
-    return sf_round_pack(sz, ez, sig);
+    return sf_round_pack(sz, ez, sig, odd);
 }
 
-SF_INLINE sf_u64 sf_sub_mags(sf_u64 a, sf_u64 b, bool sz) {
+SF_INLINE sf_u64 sf_sub_mags(sf_u64 a, sf_u64 b, bool sz, bool odd = false) {
     int ea = SF_EXP(a), eb = SF_EXP(b);
     sf_u64 sa = SF_FRAC(a), sb = SF_FRAC(b);
     int d = ea - eb, ez;
@@ -161,20 +174,20 @@ SF_INLINE sf_u64 sf_sub_mags(sf_u64 a, sf_u64 b, bool sz) {
         ez = ea;
         sig = sa - sb;
     }
-    return sf_norm_round_pack(sz, ez - 1, sig);
+    return sf_norm_round_pack(sz, ez - 1, sig, odd);
 }
 
-SF_INLINE sf_u64 sf_add(sf_u64 a, sf_u64 b) {
+SF_OUTLINE sf_u64 sf_add(sf_u64 a, sf_u64 b, bool odd = false) {
     bool sa = SF_SIGN(a);
-    return (sa == SF_SIGN(b)) ? sf_add_mags(a, b, sa) : sf_sub_mags(a, b, sa);
+    return (sa == SF_SIGN(b)) ? sf_add_mags(a, b, sa, odd) : sf_sub_mags(a, b, sa, odd);
 }
 
-SF_INLINE sf_u64 sf_sub(sf_u64 a, sf_u64 b) {
+SF_OUTLINE sf_u64 sf_sub(sf_u64 a, sf_u64 b, bool odd = false) {
     bool sa = SF_SIGN(a);
-    return (sa == SF_SIGN(b)) ? sf_sub_mags(a, b, sa) : sf_add_mags(a, b, sa);
+    return (sa == SF_SIGN(b)) ? sf_sub_mags(a, b, sa, odd) : sf_add_mags(a, b, sa, odd);
 }
 
-SF_INLINE sf_u64 sf_mul(sf_u64 a, sf_u64 b) {
+SF_OUTLINE sf_u64 sf_mul(sf_u64 a, sf_u64 b) {
     bool sz = SF_SIGN(a) ^ SF_SIGN(b);
     int ea = SF_EXP(a), eb = SF_EXP(b);
     sf_u64 sa = SF_FRAC(a), sb = SF_FRAC(b);
@@ -197,7 +210,7 @@ SF_INLINE sf_u64 sf_mul(sf_u64 a, sf_u64 b) {
     return sf_round_pack(sz, ez, sig);
 }
 
-SF_INLINE sf_u64 sf_div(sf_u64 a, sf_u64 b) {
+SF_OUTLINE sf_u64 sf_div(sf_u64 a, sf_u64 b, bool odd = false) {
     bool sz = SF_SIGN(a) ^ SF_SIGN(b);
     int ea = SF_EXP(a), eb = SF_EXP(b);
     sf_u64 sa = SF_FRAC(a), sb = SF_FRAC(b);
@@ -224,10 +237,10 @@ SF_INLINE sf_u64 sf_div(sf_u64 a, sf_u64 b) {
         rem <<= 1;
     }
     q |= (sf_u64)(rem != 0);
-    return sf_round_pack(sz, ez, q);
+    return sf_round_pack(sz, ez, q, odd);
 }
 
-SF_INLINE sf_u64 sf_sqrt(sf_u64 a) {
+SF_OUTLINE sf_u64 sf_sqrt(sf_u64 a, bool odd = false) {
     bool s = SF_SIGN(a);
     int e = SF_EXP(a);
     sf_u64 f = SF_FRAC(a);
@@ -252,7 +265,7 @@ SF_INLINE sf_u64 sf_sqrt(sf_u64 a) {
         if (rem >= trial) { rem -= trial; r = (r << 1) | 1; } else { r <<= 1; }
     }
     sf_u64 z = (r << 8) | (sf_u64)(rem != 0);
-    return sf_round_pack(false, ez, z);
+    return sf_round_pack(false, ez, z, odd);
 }
 
 // ---- 128-bit helpers for fma
@@ -287,7 +300,7 @@ SF_INLINE sf_u128 sf_add128(sf_u128 a, sf_u128 b) { sf_u128 r; r.lo = a.lo + b.l
 SF_INLINE sf_u128 sf_sub128(sf_u128 a, sf_u128 b) { sf_u128 r; r.lo = a.lo - b.lo; r.hi = a.hi - b.hi - (sf_u64)(a.lo < b.lo); return r; }
 
 // a*b + c with a single rounding.
-SF_INLINE sf_u64 sf_fma(sf_u64 a, sf_u64 b, sf_u64 c) {
+SF_OUTLINE sf_u64 sf_fma(sf_u64 a, sf_u64 b, sf_u64 c, bool odd = false) {
     bool sa = SF_SIGN(a), sb = SF_SIGN(b), sc = SF_SIGN(c), sp = sa ^ sb;
     int ea = SF_EXP(a), eb = SF_EXP(b), ec = SF_EXP(c);
     sf_u64 fa = SF_FRAC(a), fb = SF_FRAC(b), fc = SF_FRAC(c);
@@ -320,7 +333,7 @@ SF_INLINE sf_u64 sf_fma(sf_u64 a, sf_u64 b, sf_u64 c) {
         int p = 127 - sf_clz128(P);
         sf_u64 sig;
         if (p > 62) { sf_u128 t = sf_shr_jam128(P, p - 62); sig = t.lo; } else { sig = P.lo << (62 - p); }
-        return sf_round_pack(sp, Pe + p + 1022, sig);
+        return sf_round_pack(sp, Pe + p + 1022, sig, odd);
     }
     if (ec) { mc = fc | 0x0010000000000000UL; Ec = ec - 1075; } else { mc = fc; Ec = 1 - 1075; }
     sf_u128 C; C.hi = 0; C.lo = mc;
@@ -340,7 +353,7 @@ SF_INLINE sf_u64 sf_fma(sf_u64 a, sf_u64 b, sf_u64 c) {
     int p = 127 - sf_clz128(S);
     sf_u64 sig;
     if (p > 62) { sf_u128 t = sf_shr_jam128(S, p - 62); sig = t.lo; } else { sig = S.lo << (62 - p); }
-    return sf_round_pack(sz, lsb + p + 1022, sig);
+    return sf_round_pack(sz, lsb + p + 1022, sig, odd);
 }
 
 // ---- comparisons (IEEE: NaN unordered, +0 == -0)
@@ -362,7 +375,7 @@ SF_INLINE bool sf_le(sf_u64 a, sf_u64 b) {
 }
 
 // ---- conversions
-SF_INLINE sf_u64 sf_from_f32(float f) {
+SF_OUTLINE sf_u64 sf_from_f32(float f) {
     sf_u32 u = sf_f32_bits(f);
     bool s = u >> 31;
     int e = (int)((u >> 23) & 0xFF);
@@ -399,7 +412,7 @@ SF_INLINE float sf_round_pack_f32(bool s, int e, sf_u32 sig) {
     return sf_bits_f32(((sf_u32)s << 31) + ((sf_u32)e << 23) + sig);
 }
 
-SF_INLINE float sf_to_f32(sf_u64 a) {
+SF_OUTLINE float sf_to_f32(sf_u64 a) {
     bool s = SF_SIGN(a);
     int e = SF_EXP(a);
     sf_u64 f = SF_FRAC(a);
@@ -517,3 +530,14 @@ SF_INLINE sf_u64 sf_rint(sf_u64 a) {
     sf_u64 r = sf_sub(sf_add(a, big), big);
     return (r & 0x7FFFFFFFFFFFFFFFUL) ? r : (r | (a & 0x8000000000000000UL));
 }
+
+
+// ---- exact binary32 arithmetic with gradual underflow (for CUDA --ftz=false code)
+// Apple GPUs flush FP32 subnormal operands and results; these compute the
+// correctly rounded IEEE binary32 result through binary64 rounded to odd.
+SF_OUTLINE float sf32_add(float a, float b) { return sf_to_f32(sf_add(sf_from_f32(a), sf_from_f32(b), true)); }
+SF_OUTLINE float sf32_sub(float a, float b) { return sf_to_f32(sf_sub(sf_from_f32(a), sf_from_f32(b), true)); }
+SF_OUTLINE float sf32_mul(float a, float b) { return sf_to_f32(sf_mul(sf_from_f32(a), sf_from_f32(b))); }   // exact in binary64
+SF_OUTLINE float sf32_div(float a, float b) { return sf_to_f32(sf_div(sf_from_f32(a), sf_from_f32(b), true)); }
+SF_OUTLINE float sf32_sqrt(float a) { return sf_to_f32(sf_sqrt(sf_from_f32(a), true)); }
+SF_OUTLINE float sf32_fma(float a, float b, float c) { return sf_to_f32(sf_fma(sf_from_f32(a), sf_from_f32(b), sf_from_f32(c), true)); }
