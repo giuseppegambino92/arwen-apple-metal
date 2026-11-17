@@ -113,3 +113,26 @@ f64 mode `sf64`, `xcrun metal -O3` (Metal toolchain 32023.922, Xcode 27.2):
 
 The kernel set of every module equals the `__global__` set of its clang AST.
 Compiling is necessary, not sufficient: numerical parity is Milestones 4–5.
+
+## Runtime (`gpuwm/metal/native/arwen_metal_rt.mm`, `gpuwm/metal/runtime.py`)
+
+Objective-C++ (nanobind) extension built on first use with `xcrun clang++`
+(no CMake), cached by source hash. Shared-storage MTLBuffers (CPU and GPU
+address the same bytes), one MTLResidencySet on the queue, kernels launched
+with their argument struct via `setBytes`, metallib cache keyed by SHA-256 of
+(source, options, FP64 mode, translator revision, headers, toolchain).
+
+**Ordering, measured** (`tools/metal/ordering_check.py`: 1 500 dependent
+dispatches, 1 000 and 2 000 000 elements). Resources are untracked (they are
+reached through GPU addresses), so Metal sees no dependencies:
+
+* without ordering between command buffers, 200–340 of 2 000 dependent
+  increments were lost, even with one dispatch per command buffer — the GPU
+  overlaps consecutive command buffers. Fixed with an MTLSharedEvent chain
+  (each command buffer waits for the previous one's signal);
+* a *concurrent* encoder without barriers loses updates (as expected); serial,
+  serial + barrier, and concurrent + barrier are exact. Default: serial +
+  buffer barrier.
+
+Cost: 6.5–9 µs per dispatch (Python packing + encoding) with 256 dispatches
+per command buffer; ~300–550 µs with one dispatch per command buffer.
