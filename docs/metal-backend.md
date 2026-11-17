@@ -317,3 +317,22 @@ Commits are also issued after 16 dispatches when the GPU has run dry
 1-hour forecast after this change: 165 s wall in total (first Metal hour:
 436 s), steps d02 median 0.406 s, d01 0.284 s, sum 152 s; 01:00 wrfout again
 bit-identical to the pre-optimization run (142.8 M words).
+
+## Host-side dispatch cost
+
+- Device arrays cache their GPU address (`ndarray._ga`; a view's data pointer
+  never changes); kernel arguments are packed by one precompiled
+  `struct.Struct` per kernel.
+- Elementwise ufuncs cache, per call signature (ufunc, operand kinds, out
+  dtypes, options), the resolved loop and generated expression, and per
+  (expression, operand dtypes/shapes/strides) the kernel and packed layout.
+- Buffer pool in the native runtime: a released buffer is pooled (by size
+  class, staying resident) only once no committed or encoding work can
+  reference it, so a pooled buffer is a fresh buffer for GPU and CPU alike;
+  `ARWEN_METAL_POOL_MB` caps it (default 4096).
+
+Measured: `a += b` 45 → 17 µs, a RawKernel launch 9.5 → 5.5 µs, `a * 2.0 + b`
+(two kernels, two temporaries) 216 → 81 µs.  1-hour forecast: 150 s wall,
+d02 median 0.391 s/step, d01 0.227 s/step, sum of steps 134 s (first Metal
+hour: 408 s), 82,741 allocations of which 65,974 from the pool; 01:00 wrfout
+again bit-identical to the pre-optimization run.

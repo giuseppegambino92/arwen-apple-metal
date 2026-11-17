@@ -42,7 +42,7 @@ def _wrap(view: np.ndarray, mem) -> "ndarray":
 
 
 class ndarray:
-    __slots__ = ("_v", "_gpuwm_mem", "__weakref__")
+    __slots__ = ("_v", "_gpuwm_mem", "_ga", "__weakref__")   # _ga: GPU address of element 0, cached
     _gpuwm_backend_array = True
     __array_priority__ = 100.0
 

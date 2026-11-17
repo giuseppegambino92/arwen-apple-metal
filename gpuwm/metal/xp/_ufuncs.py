@@ -21,8 +21,26 @@ def _strides_for(a, shape):
     return st
 
 
+_EW_PLANS = {}
+
+
 def elementwise(expr, outs, ins, scalars, preamble=""):
     """Run ``expr`` over the broadcast shape of ``outs`` (outputs define the shape)."""
+    ops = list(outs) + list(ins)
+    try:
+        key = (expr, preamble, tuple((a._v.dtype, a._v.shape, a._v.strides) for a in ops),
+               len(outs), tuple(dt for dt, _ in scalars))
+    except AttributeError:
+        key = None
+    plan = _EW_PLANS.get(key) if key is not None else None
+    if plan is not None:
+        k, n, layout = plan
+        K.launch_1d(k, n, ops + [v for _, v in scalars] + [layout])
+        return
+    _elementwise_plan(expr, outs, ins, scalars, preamble, key)
+
+
+def _elementwise_plan(expr, outs, ins, scalars, preamble, key):
     shape = outs[0].shape
     n = 1
     for s in shape:
@@ -39,7 +57,10 @@ def elementwise(expr, outs, ins, scalars, preamble=""):
     src = K.elementwise_source(expr, tuple(K.ctype(o.dtype) for o in outs), tuple(K.ctype(a.dtype) for a in ins),
                                tuple(K.ctype(dt) for dt, _ in scalars), preamble)
     k = K.kernel(src, "ew")
-    args = list(outs) + list(ins) + [v for _, v in scalars] + [K.pack_layout(n, cshape, cstrides, max(len(outs) + len(ins), 1))]
+    layout = K.pack_layout(n, cshape, cstrides, max(len(outs) + len(ins), 1))
+    if key is not None and len(_EW_PLANS) < 65536:
+        _EW_PLANS[key] = (k, n, layout)
+    args = list(outs) + list(ins) + [v for _, v in scalars] + [layout]
     K.launch_1d(k, n, args)
 
 
@@ -184,10 +205,60 @@ def _scalar_value(x):
     raise TypeError(f"unsupported operand type {type(x).__name__} for a device array operation")
 
 
+_CALL_PLANS = {}
+
+
 def call(ufunc, inputs, out=None, dtype=None, where=True, casting="same_kind", order="K", signature=None, subok=True):
     name = ufunc.__name__
     if where is not True:
         raise NotImplementedError(f"{name}(where=...) on the Metal backend")
+    # fast path: the loop, the expression and the scalar handling depend only on
+    # the operands' kinds (array dtype / scalar type), the out dtypes and the options
+    outs0 = list(out) if isinstance(out, tuple) else ([out] if out is not None else [None] * ufunc.nout)
+    sk = []
+    for x in inputs:
+        if is_device(x):
+            sk.append(("a", x._v.dtype))
+        elif isinstance(x, np.ndarray) and x.ndim > 0:
+            sk = None
+            break
+        else:
+            try:
+                sk.append(("s", _scalar_value(x)[1]))
+            except TypeError:
+                sk = None
+                break
+    if sk is not None and all(o is None or is_device(o) for o in outs0):
+        pkey = (ufunc, tuple(sk), tuple(None if o is None else o._v.dtype for o in outs0), dtype, casting,
+                None if signature is None else tuple(signature))
+        plan = _CALL_PLANS.get(pkey)
+        if plan is not None:
+            return _run_plan(plan, ufunc, inputs, outs0, name)
+    else:
+        pkey = None
+    return _call_slow(ufunc, inputs, out, dtype, casting, signature, name, pkey)
+
+
+def _run_plan(plan, ufunc, inputs, outs, name):
+    in_loop, out_loop, expr, pre = plan
+    arrs = [x for x in inputs if is_device(x)]
+    shapes = [a._v.shape for a in arrs] + [o._v.shape for o in outs if o is not None]
+    shape = shapes[0] if len(set(shapes)) == 1 else (np.broadcast_shapes(*shapes) if shapes else ())
+    res = []
+    for k in range(ufunc.nout):
+        o = outs[k]
+        if o is None:
+            o = _empty(shape, out_loop[k])
+        elif o._v.shape != shape:
+            raise ValueError(f"{name}: output shape {o.shape} does not match broadcast shape {shape}")
+        res.append(o)
+    scalars = [(np.dtype(in_loop[j]), _cast(_scalar_value(x)[0], in_loop[j]))
+               for j, x in enumerate(inputs) if not is_device(x)]
+    elementwise(expr, res, arrs, scalars, pre)
+    return res[0] if ufunc.nout == 1 else tuple(res)
+
+
+def _call_slow(ufunc, inputs, out, dtype, casting, signature, name, pkey):
     arrs, kinds = [], []
     for x in inputs:
         if is_device(x):
@@ -242,6 +313,8 @@ def call(ufunc, inputs, out=None, dtype=None, where=True, casting="same_kind", o
     decl = " ".join(f"{K.ctype(out_loop[k])} r{k};" for k in range(nout))
     store = " ".join(f"o{k} = ({K.ctype(res[k].dtype)})r{k};" for k in range(nout))
     expr = " ".join(loads) + f" {decl} {stmt_out} {store}"
+    if pkey is not None and len(_CALL_PLANS) < 65536:
+        _CALL_PLANS[pkey] = (tuple(in_loop), tuple(out_loop), expr, pre)
     elementwise(expr, res, dev_ins, scalars, pre)
     return res[0] if nout == 1 else tuple(res)
 

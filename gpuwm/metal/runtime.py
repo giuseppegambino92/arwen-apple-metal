@@ -44,6 +44,7 @@ def rt():
                 _RT = native().Runtime()
                 _RT.batch = int(os.environ.get("ARWEN_METAL_BATCH", "256"))
                 _RT.eager = int(os.environ.get("ARWEN_METAL_EAGER", "16"))
+                _RT.pool_cap = int(os.environ.get("ARWEN_METAL_POOL_MB", "4096")) << 20
                 if os.environ.get("ARWEN_METAL_ORDER"):           # diagnostic: 0 MTLEvent, 1 MTLSharedEvent, 2 none
                     _RT.set_order_mode(int(os.environ["ARWEN_METAL_ORDER"]))
                 if os.environ.get("ARWEN_METAL_TIMELINE"):
@@ -247,12 +248,21 @@ def device_address(a) -> int:
     """GPU address of the first element of a device array (or 0 for None)."""
     if a is None:
         return 0
+    try:
+        return a._ga                   # cached: a device array's data pointer never changes
+    except AttributeError:
+        pass
     mem = getattr(a, "_gpuwm_mem", None)
     if mem is None:
         if isinstance(a, (int, np.integer)):
             return int(a)              # a GPU address carried as an integer (pointer tables)
         raise KernelError(f"kernel argument of type {type(a).__name__} is not a Metal device array")
-    return mem.gpu + (a._v.__array_interface__["data"][0] - mem.cpu)
+    ga = mem.gpu + (a._v.__array_interface__["data"][0] - mem.cpu)
+    try:
+        a._ga = ga
+    except AttributeError:
+        pass
+    return ga
 
 
 class Kernel:
@@ -267,7 +277,54 @@ class Kernel:
         self._layout = self.info["params"]
         self._size = self.info["args_size"]
 
+    def _packer(self):
+        """One struct.Struct for the whole argument block (None if a parameter kind needs the slow path)."""
+        fmt, pos, kinds = "<", 0, []
+        for p in sorted(self._layout, key=lambda p: p["offset"]):
+            off = p["offset"]
+            if off < pos:
+                return None
+            fmt += "x" * (off - pos)
+            if p["kind"] == "ptr":
+                fmt += "Q"; pos = off + 8; kinds.append(0)
+            elif p["kind"] == "scalar" and p["code"] in _FMT:
+                c = _FMT[p["code"]][1]
+                fmt += c; pos = off + struct.calcsize("<" + c)
+                kinds.append(1 if p["code"] in "fd" else (2 if p["code"] == "?" else 3))
+            elif p["kind"] == "struct":
+                fmt += f"{p['size']}s"; pos = off + p["size"]; kinds.append(4)
+            else:
+                return None
+        if [p["offset"] for p in self._layout] != sorted(p["offset"] for p in self._layout):
+            return None
+        fmt += "x" * ((self._size or 16) - pos)
+        return struct.Struct(fmt), kinds
+
     def pack(self, args) -> bytes:
+        pk = self.__dict__.get("_pk", False)
+        if pk is False:
+            pk = self._pk = self._packer()
+        if pk is not None and len(args) == len(pk[1]):
+            vals = []
+            try:
+                for k, a in zip(pk[1], args):
+                    if k == 0:
+                        vals.append(device_address(a) if a is not None else 0)
+                    elif k == 1:
+                        vals.append(float(a))
+                    elif k == 2:
+                        vals.append(bool(a))
+                    elif k == 3:
+                        vals.append(int(a))
+                    else:
+                        raw = a if isinstance(a, (bytes, bytearray)) else bytes(np.asarray(a).tobytes())
+                        vals.append(bytes(raw))
+                return pk[0].pack(*vals)
+            except struct.error:
+                pass                         # wrong struct size etc.: the slow path reports it
+        return self._pack_slow(args)
+
+    def _pack_slow(self, args) -> bytes:
         params = self._layout
         if len(args) != len(params):
             raise KernelError(f"{self.name}: {len(args)} arguments for {len(params)} parameters")

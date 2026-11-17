@@ -21,6 +21,7 @@
 #include <nanobind/stl/pair.h>
 #include <mach/mach_time.h>
 #include <atomic>
+#include <unordered_map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -119,6 +120,33 @@ struct Runtime {
     std::atomic<int> error_flag{0};
     std::string error_msg;
     int64_t live_bytes = 0, peak_bytes = 0;
+    // pool of retired buffers by size class: a buffer enters only once no
+    // committed or encoding work can reference it, so a reuse is a fresh buffer
+    // for the GPU and for the CPU alike; pooled buffers stay resident
+    std::unordered_map<size_t, std::vector<id<MTLBuffer>>> pool;
+    int64_t pooled_bytes = 0, pool_cap = (int64_t)4096 << 20;
+    uint64_t n_alloc = 0, n_pool_hits = 0;
+
+    static size_t size_class(size_t n) {
+        const size_t page = 16384;
+        if (n <= ((size_t)4 << 20)) return (n + page - 1) / page * page;
+        size_t p = 1;
+        while (p < n) p <<= 1;
+        size_t step = p / 8;
+        return (n + step - 1) / step * step;
+    }
+
+    // a buffer no work can reference any more: pool it or drop it
+    void retire(id<MTLBuffer> b) {
+        size_t len = [b length];
+        if (pooled_bytes + (int64_t)len <= pool_cap && len == size_class(len)) {
+            pool[len].push_back(b);
+            pooled_bytes += (int64_t)len;
+        } else {
+            [residency removeAllocation:b];
+            residency_dirty = true;
+        }
+    }
 
     Runtime() {
         dev = MTLCreateSystemDefaultDevice();
@@ -143,10 +171,28 @@ struct Runtime {
     Buffer* alloc(size_t nbytes) {
         std::lock_guard<std::recursive_mutex> g(mu);
         size_t n = nbytes ? nbytes : 16;
-        id<MTLBuffer> b = [dev newBufferWithLength:n options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
-        if (!b) throw std::runtime_error("metal: out of memory allocating " + std::to_string(n) + " bytes");
-        [residency addAllocation:b];
-        residency_dirty = true;
+        size_t cls = size_class(n);
+        n_alloc++;
+        id<MTLBuffer> b = nil;
+        auto it = pool.find(cls);
+        if (it != pool.end() && !it->second.empty()) {
+            b = it->second.back();
+            it->second.pop_back();
+            pooled_bytes -= (int64_t)cls;
+            n_pool_hits++;
+        } else {
+            b = [dev newBufferWithLength:cls options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+            if (!b && pooled_bytes) {                  // memory pressure: give the pool back and retry
+                for (auto& kv : pool) for (id<MTLBuffer> x : kv.second) [residency removeAllocation:x];
+                pool.clear();
+                pooled_bytes = 0;
+                [residency commit];
+                b = [dev newBufferWithLength:cls options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+            }
+            if (!b) throw std::runtime_error("metal: out of memory allocating " + std::to_string(n) + " bytes");
+            [residency addAllocation:b];
+            residency_dirty = true;
+        }
         // the residency set is committed when the next command buffer begins; work
         // already being encoded must see this allocation resident too
         if (enc != nil) {
@@ -172,8 +218,7 @@ struct Runtime {
             // referenced by committed, in-flight work: reaped once it has completed
             zombies.emplace_back(last_committed, b);
         } else {
-            [residency removeAllocation:b];
-            residency_dirty = true;
+            retire(b);
         }
     }
 
@@ -181,8 +226,7 @@ struct Runtime {
         size_t k = 0;
         for (size_t i = 0; i < zombies.size(); ++i) {
             if ([zombies[i].first status] >= MTLCommandBufferStatusCompleted) {
-                [residency removeAllocation:zombies[i].second];
-                residency_dirty = true;
+                retire(zombies[i].second);
             } else {
                 zombies[k++] = zombies[i];
             }
@@ -223,12 +267,10 @@ struct Runtime {
         if ([deferred count]) {
             NSArray* keep = [deferred copy];
             [deferred removeAllObjects];
-            id<MTLResidencySet> rs = residency;
             Runtime* self_ = this;
             [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
                 std::lock_guard<std::recursive_mutex> g(self_->mu);
-                for (id<MTLBuffer> b in keep) [rs removeAllocation:b];
-                self_->residency_dirty = true;
+                for (id<MTLBuffer> b in keep) self_->retire(b);
             }];
         }
         [cb commit];
@@ -352,6 +394,9 @@ struct Runtime {
         d["command_buffers"] = n_cb;
         d["synchronizations"] = n_sync;
         d["eager_commits"] = n_eager;
+        d["allocations"] = n_alloc;
+        d["pool_hits"] = n_pool_hits;
+        d["pooled_bytes"] = pooled_bytes;
         d["live_bytes"] = live_bytes;
         d["peak_bytes"] = peak_bytes;
         d["recommended_max_working_set"] = (uint64_t)[dev recommendedMaxWorkingSetSize];
@@ -385,6 +430,7 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def_prop_ro("name", &Runtime::name)
         .def_rw("batch", &Runtime::batch)
         .def_rw("eager", &Runtime::eager)
+        .def_rw("pool_cap", &Runtime::pool_cap)
         .def_rw("timeline", &Runtime::timeline)
         .def("set_order_mode", [](Runtime& r, int m) {
             r.order_mode = m;
