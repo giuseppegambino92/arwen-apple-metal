@@ -280,11 +280,15 @@ copy only when its fingerprint (the function, every table/helper it reaches,
 the compile options, the fast-path sources) is in `fastlibm_receipt.json`,
 which `tools/metal/verify_fastlibm.py` fills after comparing routed and
 original on **all 2^32 binary32 inputs** on the GPU.  powf is routed per call
-site, only where the exponent is a literal, and each (copy, exponent) pair is
-verified on all 2^32 x; variable-exponent calls stay exact.  Unverified copies
+site, only where the exponent is a compile-time constant, and each (copy,
+exponent) pair is verified on all 2^32 x; variable-exponent calls stay exact.
+A constant exponent is a literal, an expression of literals under binary32
+`+ - * /` (`__f*_rn` or helpers that are exactly one PTX `*.rn.f32`), or a
+name every declaration of which is `const float|real` with such an
+initializer and one value; pure forwarding aliases (`mynn_powf`) are followed.  Unverified copies
 are recorded under the cache directory for the verifier.
 
-Receipt for the Sicily2KM_ECM run: 47 (copy, options[, exponent]) entries —
+Receipt for the Sicily2KM_ECM run: 55 (copy, options[, exponent]) entries —
 logf, expf, powf in MYNN, Noah/Tiedtke (gfk), RRTMG LW/SW — each 4,294,967,296
 inputs, 0 differing words; fast-path share of all inputs 0.50 (logf),
 0.52 (expf), 0.12–0.50 (powf, by exponent).
@@ -292,5 +296,6 @@ inputs, 0 differing words; fast-path share of all inputs 0.50 (logf),
 End-to-end: the 1-hour forecast with every optimization of this section and
 the two before it is **bit-identical** to the 1-hour run made before them
 (`tools/metal/wrfout_bitwise.py`, 01:00 d01 + d02: 142,775,319 words, 0 differ).
-Per-step wall time over the hour: d02 median 1.238 → 0.557 s, d01 0.659 →
-0.329 s; sum of steps 408 → 191 s.
+Per-step wall time over the hour: d02 median 1.238 → 0.471 s, d01 0.659 →
+0.311 s; sum of steps 408 → 179 s (second 1-hour run, constant exponents
+included: again 0 differing words of 142.8 M).

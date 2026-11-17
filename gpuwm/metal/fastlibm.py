@@ -198,6 +198,96 @@ def _real_is_float(pp: str) -> bool:
     return bool(m) and all(t == "float" for t in m)
 
 
+_FOPS = {"__fdiv_rn": "/", "__fmul_rn": "*", "__fadd_rn": "+", "__fsub_rn": "-"}
+
+
+def _float_op_functions(pp: str) -> dict:
+    """Two-float-parameter functions that are exactly one IEEE round-to-nearest
+    operation on (a, b): 'return __fOP_rn(a, b);' or PTX 'OP.rn.f32 %0, %1, %2'."""
+    found = {}
+    for m in _HDR2.finditer(pp):
+        name, a, b = m.group(2), m.group(4), m.group(6)
+        j, d = m.end(), 1
+        while d and j < len(pp):
+            d += {"{": 1, "}": -1}.get(pp[j], 0)
+            j += 1
+        body = re.sub(r"\s+", "", pp[m.end():j - 1])
+        op = None
+        mm = re.fullmatch(r"return(__f(?:div|mul|add|sub)_rn)\(" + re.escape(a) + "," + re.escape(b) + r"\);", body)
+        if mm:
+            op = mm.group(1)
+        mm = re.fullmatch(r"(?:real|float)(\w+);asm(?:volatile)?\(\"(add|sub|mul|div)\.rn\.f32%0,%1,%2;\"" +
+                          r":\"=f\"\(\1\):\"f\"\(" + re.escape(a) + r"\),\"f\"\(" + re.escape(b) + r"\)\);return\1;", body)
+        if mm:
+            op = f"__f{mm.group(2)}_rn"
+        prev = found.get(name, op)
+        found[name] = op if prev == op else None      # conflicting definitions: unusable
+    return {k: v for k, v in found.items() if v}
+
+
+def _eval_f32(text: str, depth=0, ops=None):
+    """binary32 bits of a constant expression made of float literals and
+    __f{add,sub,mul,div}_rn (IEEE binary32, round to nearest); None otherwise."""
+    import numpy as np
+    t = text.strip()
+    while t.startswith("(") and t.endswith(")") and _split_args(t, 0)[1] == len(t):
+        t = t[1:-1].strip()
+    b = float32_bits_of_literal(t)
+    if b is not None:
+        return b
+    m = re.match(r"^([A-Za-z_]\w*)\s*\(", t)
+    if not m or depth > 8:
+        return None
+    op = m.group(1) if m.group(1) in _FOPS else (ops or {}).get(m.group(1))
+    if op is None:
+        return None
+    args, end = _split_args(t, m.end() - 1)
+    if not args or len(args) != 2 or end != len(t):
+        return None
+    xs = [_eval_f32(a, depth + 1, ops) for a in args]
+    if None in xs:
+        return None
+    x, y = (np.uint32(v).view(np.float32) for v in xs)
+    with np.errstate(all="ignore"):
+        r = {"/": x / y, "*": x * y, "+": x + y, "-": x - y}[_FOPS[op]]
+    return int(np.float32(r).view(np.uint32))
+
+
+def exponent_resolver(pp: str):
+    """arg text -> binary32 bits of a literal, or of a name every declaration of
+    which is 'const float|real NAME = <constant expression>' with one value."""
+    cache = {}
+    ops = _float_op_functions(pp)
+
+    def resolve(arg: str):
+        b = _eval_f32(arg, 0, ops)                  # a literal or a constant expression
+        if b is not None:
+            return b
+        name = arg.strip()
+        while name.startswith("(") and name.endswith(")"):
+            name = name[1:-1].strip()
+        if not re.fullmatch(r"[A-Za-z_]\w*", name):
+            return None
+        if name not in cache:
+            decls = list(re.finditer(r"(\bconst\s+|\bconstexpr\s+|\bstatic\s+)*\b(?:float|real|double|int|auto|unsigned|long)\s+"
+                                     + re.escape(name) + r"\b\s*([=;,)\[])", pp))
+            vals = set()
+            for d in decls:
+                quals = d.group(1) or ""
+                if "const" not in quals or d.group(2) != "=":
+                    vals = None
+                    break
+                end = pp.find(";", d.end())
+                v = _eval_f32(pp[d.end():end], 0, ops)
+                if v is None or not re.match(r"(\bconst\s+|\bconstexpr\s+|\bstatic\s+)*\b(?:float|real)\b", pp[d.start():d.end()]):
+                    vals = None
+                    break
+                vals.add(v)
+            cache[name] = next(iter(vals)) if vals and len(vals) == 1 else None
+        return cache[name]
+    return resolve
+
+
 @dataclasses.dataclass
 class Candidate:
     name: str
@@ -270,19 +360,39 @@ def candidates(pp: str, opts) -> list[Candidate]:
             if arity == 1:
                 out.append(Candidate(name, fam, _key(fam, opts, closure), s, e, m.end() - 1))
                 continue
-            # powf: one entry per literal exponent used at a call site
+            # powf: one entry per constant exponent used at a call site of the copy
+            # or of a pure forwarding alias (body 'return <copy>(x, y);')
             seen = set()
-            for c in re.finditer(r"\b" + re.escape(name) + r"\s*\(", pp):
+            resolve = exponent_resolver(pp)
+            names = [name] + _aliases(pp, name)
+            for c in re.finditer(r"\b(" + "|".join(map(re.escape, names)) + r")\s*\(", pp):
                 if s <= c.start() < e:
                     continue
                 args, _end = _split_args(pp, c.end() - 1)
                 if not args or len(args) != 2:
                     continue
-                yb = float32_bits_of_literal(args[1])
+                yb = resolve(args[1])
                 if yb is None or yb in seen:
                     continue
                 seen.add(yb)
                 out.append(Candidate(name, fam, _key(fam, opts, closure, yb), s, e, m.end() - 1, yb))
+    return out
+
+
+def _aliases(pp: str, copy: str) -> list:
+    """Functions whose whole body is 'return <copy>(a, b);' with their own two float parameters."""
+    out = []
+    for m in _HDR2.finditer(pp):
+        name, a, b = m.group(2), m.group(4), m.group(6)
+        if name == copy:
+            continue
+        j, d = m.end(), 1
+        while d and j < len(pp):
+            d += {"{": 1, "}": -1}.get(pp[j], 0)
+            j += 1
+        body = re.sub(r"\s+", "", pp[m.end():j - 1])
+        if body == f"return{copy}({a},{b});":
+            out.append(name)
     return out
 
 
@@ -325,7 +435,8 @@ def substitute(pp: str, cands) -> str:
             f"    float __arwen_r = {FAMILIES['powf'][0]}(__arwen_x, __uint_as_float(0x{c.ybits:08X}u));\n"
             f"    if (__float_as_uint(__arwen_r) != 0x{UNSURE_BITS:08X}u) return __arwen_r;\n"
             f"    return {name}(__arwen_x, __uint_as_float(0x{c.ybits:08X}u));\n}}\n" for c in cs)))
-        routes[name] = {c.ybits: _wrapper_name(c) for c in cs}
+        for n in [name] + _aliases(pp, name):
+            routes[n] = {c.ybits: _wrapper_name(c) for c in cs}
     out, pos = [], 0
     for a, b, text in sorted(edits, key=lambda t: (t[0], t[1])):
         if a < pos:
@@ -335,11 +446,11 @@ def substitute(pp: str, cands) -> str:
         pos = b
     out.append(pp[pos:])
     text = "".join(out)
-    return _rewrite_calls(text, routes) if routes else text
+    return _rewrite_calls(text, routes, exponent_resolver(pp)) if routes else text
 
 
-def _rewrite_calls(text: str, routes: dict) -> str:
-    """Replace name(x, <literal>) by the routed wrapper(x), innermost calls included."""
+def _rewrite_calls(text: str, routes: dict, resolve) -> str:
+    """Replace name(x, <constant exponent>) by the routed wrapper(x), innermost calls included."""
     pat = re.compile(r"\b(" + "|".join(map(re.escape, routes)) + r")\s*\(")
     out, pos = [], 0
     for m in pat.finditer(text):
@@ -348,12 +459,12 @@ def _rewrite_calls(text: str, routes: dict) -> str:
         args, end = _split_args(text, m.end() - 1)
         if not args or len(args) != 2:
             continue
-        yb = float32_bits_of_literal(args[1])
+        yb = resolve(args[1])
         w = routes[m.group(1)].get(yb)
         if w is None:
             continue
         out.append(text[pos:m.start()])
-        out.append(f"{w}({_rewrite_calls(args[0], routes)})")
+        out.append(f"{w}({_rewrite_calls(args[0], routes, resolve)})")
         pos = end
     out.append(text[pos:])
     return "".join(out)
