@@ -224,3 +224,24 @@ deep convective columns, 6 342 words here — it is the referee choice, not the
 port.) `GPUWM_WRF_EXACT` reaches Metal compiles: every compile asks
 `cupy.cuda.compiler._NVRTCProgram(src).compile(options)`, which gpuwm's
 option hooks wrap exactly as on CUDA.
+
+## First hour on Metal vs the RTX 5090 run (measured)
+
+`gpuwm go Sicily2KM_ECM --backend metal --run-seconds 3600`: SUCCESS, 309 steps
+(d01 80, d02 229 — the same adaptive step sequence as the CUDA run, which
+ends the hour at dt 24 s / 12 s too), 436 s wall on the M3 Max (CUDA: ~10.6 s
+per simulated hour). `tools/metal/compare_wrfout.py` at 01:00, Metal − CUDA:
+
+| field | d01 bias | d01 RMSE | d01 corr | d02 bias | d02 RMSE | d02 corr |
+|---|---|---|---|---|---|---|
+| T2 (K) | −3.0e-5 | 0.039 | 0.99995 | +9.7e-5 | 0.054 | 0.99985 |
+| 10 m wind speed (m/s) | −2.0e-6 | 0.015 | 0.99998 | −3.8e-5 | 0.015 | 0.99997 |
+| PSFC (Pa) | −0.003 | 0.30 | 1.0000 | −0.006 | 0.075 | 1.0000 |
+| rain (mm) | +3.5e-7 | 7.6e-5 | 0.9991 | +1.8e-7 | 2.4e-5 | 0.99997 |
+
+At 00:00 every surface field and (on d02) every prognostic is word-identical;
+d01's initial T/U/V/PH/QVAPOR/MU differ in rounding (T max 6e-5 K) and the
+diagnostic P by up to 0.086 Pa — under investigation. The hour-1 differences
+are the expected growth of rounding-level differences (FMA contraction, libm)
+through moist convection: no bias, correlations ≥ 0.9985, isolated maxima
+(T2 1.4–1.7 K).

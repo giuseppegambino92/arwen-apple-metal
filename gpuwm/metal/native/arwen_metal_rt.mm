@@ -18,6 +18,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/pair.h>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -83,7 +84,10 @@ struct Runtime {
     id<MTLBuffer> null_buf = nil;
     id<MTLSharedEvent> order_event = nil;    // serialises command buffers (resources are untracked)
     uint64_t order_value = 0;
-    bool flush_on_alloc = false;             // debugging: new command buffer after each allocation
+    bool flush_on_alloc = false;
+    bool profile = false;                    // one command buffer per dispatch, GPU time per kernel
+    std::vector<std::pair<id<MTLCommandBuffer>, std::string>> prof_pending;
+    std::vector<std::pair<std::string, double>> prof_done;             // debugging: new command buffer after each allocation
     bool concurrent = false;                 // serial encoder (+ barrier); true = concurrent + barriers
     NSMutableArray* deferred = nil;          // buffers to keep alive until the current cb completes
     // buffers released while committed work may still use them: (command buffer, buffer)
@@ -226,6 +230,12 @@ struct Runtime {
         if (tg_mem) [enc setThreadgroupMemoryLength:((tg_mem + 15) / 16) * 16 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(bx, by, bz)];
         n_dispatch++;
+        if (profile) {
+            id<MTLCommandBuffer> mine = cb;
+            commit();
+            prof_pending.emplace_back(mine, p->name);
+            return;
+        }
         if (++in_cb >= batch) commit();
     }
 
@@ -275,6 +285,23 @@ struct Runtime {
         }
     }
 
+    std::vector<std::pair<std::string, double>> profile_drain() {
+        std::lock_guard<std::recursive_mutex> g(mu);
+        size_t k = 0;
+        for (size_t i = 0; i < prof_pending.size(); ++i) {
+            id<MTLCommandBuffer> c = prof_pending[i].first;
+            if ([c status] >= MTLCommandBufferStatusCompleted) {
+                prof_done.emplace_back(prof_pending[i].second, [c GPUEndTime] - [c GPUStartTime]);
+            } else {
+                prof_pending[k++] = prof_pending[i];
+            }
+        }
+        prof_pending.resize(k);
+        std::vector<std::pair<std::string, double>> out;
+        out.swap(prof_done);
+        return out;
+    }
+
     nb::dict stats() {
         nb::dict d;
         d["dispatches"] = n_dispatch;
@@ -315,6 +342,8 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def_rw("barrier_between", &Runtime::barrier_between)
         .def_rw("concurrent", &Runtime::concurrent)
         .def_rw("flush_on_alloc", &Runtime::flush_on_alloc)
+        .def_rw("profile", &Runtime::profile)
+        .def("profile_drain", &Runtime::profile_drain)
         .def("alloc", &Runtime::alloc, nb::rv_policy::take_ownership, nb::keep_alive<0, 1>())
         .def("load_library", &Runtime::load_library, nb::rv_policy::take_ownership)
         .def("dispatch", &Runtime::dispatch, nb::arg("pipeline"), nb::arg("args"), nb::arg("launch"),

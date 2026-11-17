@@ -42,6 +42,10 @@ def rt():
                 _RT.batch = int(os.environ.get("ARWEN_METAL_BATCH", "256"))
                 _RT.flush_on_alloc = os.environ.get("ARWEN_METAL_FLUSH_ON_ALLOC", "") == "1"
                 _RT.concurrent = os.environ.get("ARWEN_METAL_CONCURRENT", "") == "1"
+                if os.environ.get("ARWEN_METAL_PROFILE"):
+                    _RT.profile = True
+                    import atexit
+                    atexit.register(_write_profile)
     return _RT
 
 
@@ -74,6 +78,32 @@ class DeviceMemory:
         pass
 
 
+_PROFILE = {}
+
+
+def _collect_profile():
+    for name, sec in _RT.profile_drain():
+        t = _PROFILE.setdefault(name, [0, 0.0])
+        t[0] += 1
+        t[1] += sec
+
+
+def _write_profile():
+    """ARWEN_METAL_PROFILE=<file>: GPU seconds per kernel name (one dispatch per command buffer)."""
+    try:
+        _RT.synchronize()
+    except Exception:
+        pass
+    _collect_profile()
+    rows = sorted(_PROFILE.items(), key=lambda kv: -kv[1][1])
+    total = sum(v[1] for v in _PROFILE.values()) or 1.0
+    path = os.environ["ARWEN_METAL_PROFILE"].replace("{pid}", str(os.getpid()))
+    with open(path, "w") as f:
+        f.write(f"# total GPU seconds {total:.3f} over {sum(v[0] for v in _PROFILE.values())} dispatches\n")
+        for name, (n, sec) in rows:
+            f.write(f"{sec:10.4f} s {100*sec/total:6.2f}% {n:8d} calls {1e6*sec/max(n,1):10.1f} us/call  {name}\n")
+
+
 _pending = False
 
 
@@ -82,6 +112,8 @@ def synchronize():
     global _pending
     rt().synchronize()
     _pending = False
+    if _PROFILE is not None and getattr(_RT, "profile", False):
+        _collect_profile()
 
 
 def host_sync():
