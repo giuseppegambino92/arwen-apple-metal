@@ -436,6 +436,62 @@ def take_along_axis(arr, indices, axis=-1):
     return _gather(arr, idx, axis, along=True)
 
 
+@implements(np.repeat)
+def repeat(a, repeats, axis=None):
+    """GPU gather; the source index of every output element follows from the
+    shape and ``repeats`` alone (a device ``repeats`` is read like CuPy does)."""
+    a = _dev(a)
+    if axis is None:
+        a, axis = a.ravel(), 0
+    axis = axis % a.ndim
+    n = a.shape[axis]
+    r = np.asarray(repeats.get() if is_device(repeats) else repeats)
+    if r.ndim == 0:
+        r = np.full(n, int(r), dtype=np.int64)
+    if r.shape != (n,) or (r < 0).any():
+        raise ValueError(f"repeat: repeats {r.shape} do not match axis length {n} or are negative")
+    idx = np.repeat(np.arange(n, dtype=np.int64), r.astype(np.int64))
+    return _gather(a, asarray(idx), axis)
+
+
+_SEARCHSORTED = """
+template <class T> __device__ __forceinline__ bool npy_lt(T x, T y) { return x < y || (y != y && x == x); }
+extern "C" __global__ void searchsorted_k(const T_* a, long long n, const T_* v, long long m, int right, long long* out) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= m) return;
+    T_ x = v[i];
+    long long lo = 0, hi = n;
+    while (lo < hi) {
+        long long mid = lo + ((hi - lo) >> 1);
+        bool go_right = right ? !npy_lt(x, a[mid]) : npy_lt(a[mid], x);
+        if (go_right) lo = mid + 1; else hi = mid;
+    }
+    out[i] = lo;
+}
+"""
+
+
+@implements(np.searchsorted)
+def searchsorted(a, v, side="left", sorter=None):
+    """Binary search on the GPU with numpy's ordering (NaN sorts last)."""
+    a = _dev(a)
+    if a.ndim != 1:
+        raise ValueError("searchsorted: a must be 1-D")
+    if sorter is not None:
+        a = take(a, _dev(sorter))
+    scalar = not is_device(v) and np.ndim(v) == 0
+    vv = _dev(v) if not scalar else asarray(np.asarray(v))
+    dt = np.result_type(a.dtype, vv.dtype)
+    aa = a.astype(dt) if a.dtype != dt else (a if a.flags.c_contiguous else a.copy())
+    vf = vv.astype(dt).ravel() if vv.dtype != dt else (vv.ravel() if vv.flags.c_contiguous else vv.copy().ravel())
+    out = _empty(vv.shape, np.int64)
+    m = vf.size
+    if m:
+        k = K.kernel(f"#define T_ {K.ctype(dt)}\n" + _SEARCHSORTED, "searchsorted_k")
+        k(((m + 255) // 256,), (256,), (aa, aa.size, vf, m, int(side == "right"), out))
+    return out[()] if scalar else out
+
+
 _COMPACT = """
 extern "C" __global__ void flag_count(const char* m, int itemsize, long long n, unsigned int* counts, long long chunk) {
     long long b = (long long)blockIdx.x * blockDim.x + threadIdx.x;

@@ -117,5 +117,15 @@ for a in ins[1:]:
     ref1 = ref1 + a
 check("ElementwiseKernel 12 operands broadcast o1", o1, ref1)
 check("ElementwiseKernel 12 operands broadcast o2", o2, ins[0] * ins[4] * ins[7])
+# repeat / searchsorted (rrtmg_sw batched SW and the legacy LW prep use them)
+rh = rng.standard_normal((4, 3)).astype(np.float32)
+check("repeat axis=1", cp.repeat(cp.asarray(rh)[:, None], 14, axis=1), np.repeat(rh[:, None], 14, axis=1))
+check("repeat counts axis=0", cp.repeat(cp.asarray(rh), [1, 0, 2, 3], axis=0), np.repeat(rh, [1, 0, 2, 3], axis=0))
+check("repeat flat", cp.repeat(cp.asarray(rh), 2), np.repeat(rh, 2))
+st = np.sort(rng.standard_normal(300).astype(np.float32))
+st = np.concatenate([st, st[100:120], [np.float32(np.nan)]]); st.sort()
+sv = rng.standard_normal(500).astype(np.float32); sv[::37] = np.nan
+check("searchsorted left", cp.searchsorted(cp.asarray(st), cp.asarray(sv)), np.searchsorted(st, sv))
+check("searchsorted right", cp.searchsorted(cp.asarray(st), cp.asarray(sv), side="right"), np.searchsorted(st, sv, side="right"))
 print(f"{checks} checks, {len(fails)} failures")
 sys.exit(1 if fails else 0)
