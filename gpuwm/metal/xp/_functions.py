@@ -12,7 +12,7 @@ import numpy as np
 
 from .. import runtime
 from . import _kernels as K
-from ._core import _empty, _np_ndarray, asarray, assign, is_device, ndarray
+from ._core import _empty, _wrap, asarray, assign, broadcast, is_device, ndarray
 from . import _ufuncs as U
 
 _IMPL = {}
@@ -38,28 +38,43 @@ def _dev(a):
 
 
 # ------------------------------------------------------------------ views (numpy metadata, no copy)
-def _view_impl(func, **fixed):
+def _item(a, key):
+    return a[key]
+
+
+def _views(fn):
+    """A numpy view function applied to the device arrays' internal views."""
     def f(*args, **kwargs):
-        kwargs.update(fixed)
-        return func._implementation(*args, **kwargs)
+        mem = next(x._gpuwm_mem for x in args if isinstance(x, ndarray))
+        res = fn(*[x._v if isinstance(x, ndarray) else x for x in args], **kwargs)
+        if isinstance(res, (list, tuple)):
+            return type(res)(_wrap(r, mem) if isinstance(r, np.ndarray) else r for r in res)
+        return _wrap(res, mem) if isinstance(res, np.ndarray) else res
     return f
 
 
 for _fn in (np.expand_dims, np.squeeze, np.transpose, np.moveaxis, np.swapaxes, np.atleast_1d, np.atleast_2d,
-            np.atleast_3d, np.shape, np.ndim, np.size, np.result_type, np.may_share_memory, np.shares_memory,
-            np.broadcast_shapes):
-    if hasattr(_fn, "_implementation"):
-        implements(_fn)(_view_impl(_fn))
+            np.atleast_3d, np.flip):
+    implements(_fn)(_views(_fn))
+implements(np.shape)(lambda a: a.shape)
+implements(np.ndim)(lambda a: a.ndim)
+implements(np.size)(lambda a, axis=None: a.size if axis is None else a.shape[axis])
+implements(np.result_type)(lambda *args: np.result_type(*[x.dtype if isinstance(x, ndarray) else x for x in args]))
+implements(np.may_share_memory, np.shares_memory)(
+    lambda a, b, max_work=None: isinstance(a, ndarray) and isinstance(b, ndarray) and a._gpuwm_mem is b._gpuwm_mem
+    and np.may_share_memory(a._v, b._v))
 
 
 @implements(np.broadcast_to)
 def broadcast_to(a, shape, subok=True):
-    return np.broadcast_to._implementation(_dev(a), shape, subok=True)
+    return broadcast(_dev(a), shape)
 
 
 @implements(np.broadcast_arrays)
 def broadcast_arrays(*args, subok=True):
-    return list(np.broadcast_arrays._implementation(*[_dev(a) for a in args], subok=True))
+    arrs = [_dev(a) for a in args]
+    shape = np.broadcast_shapes(*[a.shape for a in arrs])
+    return [broadcast(a, shape) for a in arrs]
 
 
 @implements(np.reshape)
@@ -117,11 +132,11 @@ def where_(cond, x=None, y=None, out=None):
     shape = np.broadcast_shapes(*shapes)
     res = out if out is not None else _empty(shape, rt)
     T = K.ctype(res.dtype)
-    ins, scal, ex = [np.broadcast_to._implementation(cond, shape, subok=True)], [], []
+    ins, scal, ex = [broadcast(cond, shape)], [], []
     for j, v in enumerate(xs):
         if is_device(v):
             ex.append(f"({T})a{len(ins)}")
-            ins.append(np.broadcast_to._implementation(v, shape, subok=True))
+            ins.append(broadcast(v, shape))
         else:
             ex.append(f"s{len(scal)}")
             scal.append((np.dtype(res.dtype), U._cast(np.asarray(v).item(), res.dtype)))
@@ -148,10 +163,10 @@ def isclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):
     res = _empty(shape, np.bool_)
     dt = np.result_type(a.dtype, b.dtype if is_device(b) else np.asarray(b).dtype, np.float64 if a.dtype.kind != "f" else a.dtype)
     T = K.ctype(dt)
-    ins = [np.broadcast_to._implementation(a, shape, subok=True)]
+    ins = [broadcast(a, shape)]
     scal = [(np.dtype(dt), float(rtol)), (np.dtype(dt), float(atol))]
     if is_device(b):
-        ins.append(np.broadcast_to._implementation(b, shape, subok=True))
+        ins.append(broadcast(b, shape))
         bx = f"({T})a1"
     else:
         scal.append((np.dtype(dt), float(b)))
@@ -274,7 +289,7 @@ def concatenate(arrays, axis=0, out=None, dtype=None, casting="same_kind"):
     for a in arrays:
         sl = [slice(None)] * nd
         sl[axis] = slice(pos, pos + a.shape[axis])
-        assign(_np_ndarray.__getitem__(res, tuple(sl)), a)
+        assign(_item(res, tuple(sl)), a)
         pos += a.shape[axis]
     return res
 
@@ -284,17 +299,17 @@ def stack(arrays, axis=0, out=None, dtype=None, casting="same_kind"):
     arrays = [_dev(a) for a in arrays]
     nd = arrays[0].ndim + 1
     axis = axis % nd
-    return concatenate([np.expand_dims._implementation(a, axis) for a in arrays], axis=axis, out=out, dtype=dtype)
+    return concatenate([_wrap(np.expand_dims(a._v, axis), a._gpuwm_mem) for a in arrays], axis=axis, out=out, dtype=dtype)
 
 
 @implements(np.vstack)
 def vstack(tup, *, dtype=None, casting="same_kind"):
-    return concatenate([np.atleast_2d._implementation(_dev(a)) for a in tup], axis=0, dtype=dtype)
+    return concatenate([_views(np.atleast_2d)(_dev(a)) for a in tup], axis=0, dtype=dtype)
 
 
 @implements(np.hstack)
 def hstack(tup, *, dtype=None, casting="same_kind"):
-    arrs = [np.atleast_1d._implementation(_dev(a)) for a in tup]
+    arrs = [_views(np.atleast_1d)(_dev(a)) for a in tup]
     return concatenate(arrs, axis=0 if arrs[0].ndim == 1 else 1, dtype=dtype)
 
 
@@ -314,16 +329,11 @@ def roll(a, shift, axis=None):
         sh %= n
         out = _empty(res.shape, res.dtype)
         sl = lambda s: tuple(s if k == ax else slice(None) for k in range(res.ndim))
-        assign(_np_ndarray.__getitem__(out, sl(slice(sh, None))), _np_ndarray.__getitem__(res, sl(slice(0, n - sh))))
+        assign(_item(out, sl(slice(sh, None))), _item(res, sl(slice(0, n - sh))))
         if sh:
-            assign(_np_ndarray.__getitem__(out, sl(slice(0, sh))), _np_ndarray.__getitem__(res, sl(slice(n - sh, None))))
+            assign(_item(out, sl(slice(0, sh))), _item(res, sl(slice(n - sh, None))))
         res = out
     return res
-
-
-@implements(np.flip)
-def flip(m, axis=None):
-    return np.flip._implementation(_dev(m), axis)
 
 
 @implements(np.pad)
@@ -338,10 +348,10 @@ def pad(array, pad_width, mode="constant", **kwargs):
         if np.ndim(cv) != 0:
             raise NotImplementedError("numpy.pad with per-axis constant_values on the Metal backend")
         res.fill(cv)
-        assign(_np_ndarray.__getitem__(res, inner), a)
+        assign(_item(res, inner), a)
         return res
     if mode == "edge":
-        assign(_np_ndarray.__getitem__(res, inner), a)
+        assign(_item(res, inner), a)
         cur = [slice(int(pw[k, 0]), int(pw[k, 0] + a.shape[k])) for k in range(a.ndim)]
         for k in range(a.ndim):
             lo, hi = int(pw[k, 0]), int(pw[k, 1])
@@ -350,12 +360,12 @@ def pad(array, pad_width, mode="constant", **kwargs):
                 full[k] = slice(0, lo)
                 src = list(cur)
                 src[k] = slice(lo, lo + 1)
-                assign(_np_ndarray.__getitem__(res, tuple(full)), _np_ndarray.__getitem__(res, tuple(src)))
+                assign(_item(res, tuple(full)), _item(res, tuple(src)))
             if hi:
                 full[k] = slice(lo + a.shape[k], lo + a.shape[k] + hi)
                 src = list(cur)
                 src[k] = slice(lo + a.shape[k] - 1, lo + a.shape[k])
-                assign(_np_ndarray.__getitem__(res, tuple(full)), _np_ndarray.__getitem__(res, tuple(src)))
+                assign(_item(res, tuple(full)), _item(res, tuple(src)))
             cur[k] = slice(0, shape[k])
         return res
     raise NotImplementedError(f"numpy.pad(mode={mode!r}) on the Metal backend")
@@ -422,7 +432,7 @@ def take_along_axis(arr, indices, axis=-1):
     axis = axis % arr.ndim
     idx = _dev(indices)
     if idx.shape[:axis] != arr.shape[:axis] or idx.shape[axis + 1:] != arr.shape[axis + 1:]:
-        idx = np.broadcast_to._implementation(idx, arr.shape[:axis] + (idx.shape[axis],) + arr.shape[axis + 1:], subok=True)
+        idx = broadcast(idx, arr.shape[:axis] + (idx.shape[axis],) + arr.shape[axis + 1:])
     return _gather(arr, idx, axis, along=True)
 
 
@@ -508,19 +518,19 @@ def advanced_getitem(a, key):
         raise NotImplementedError("advanced indexing mixed with integers/None/Ellipsis on the Metal backend")
     k = key[pos]
     k = _dev(k) if not isinstance(k, (list, tuple)) else asarray(np.asarray(k))
-    lead = _np_ndarray.__getitem__(a, key[:pos]) if pos else a     # slices only: a view
+    lead = a[key[:pos]] if pos else a     # slices only: a view
     if k.dtype == np.bool_:
         if k.shape != lead.shape[pos:pos + k.ndim]:
             raise IndexError("boolean index shape mismatch")
         if pos:
             raise NotImplementedError("boolean index after slices on the Metal backend")
         src = lead if lead.flags.c_contiguous else lead.copy()
-        flat = _np_ndarray.reshape(src, (-1,) + lead.shape[k.ndim:])
+        flat = src.reshape((-1,) + lead.shape[k.ndim:])
         res = _gather(flat, flatnonzero(k), 0)
     else:
         res = _gather(lead, k, pos)
     rest = key[pos + 1:]
-    return _np_ndarray.__getitem__(res, (slice(None),) * (pos + k.ndim) + rest) if rest else res
+    return res[(slice(None),) * (pos + k.ndim) + rest] if rest else res
 
 
 _SCATTER = """
@@ -553,7 +563,7 @@ def advanced_setitem(a, key, value):
         flat_shape = a.shape
     if not a.flags.c_contiguous:
         raise NotImplementedError("advanced assignment into a non-contiguous array on the Metal backend")
-    dst = _np_ndarray.reshape(a, flat_shape)
+    dst = a.reshape(flat_shape)
     inner = int(np.prod(dst.shape[1:], dtype=np.int64)) * a.dtype.itemsize
     n = idx.size
     if n == 0:

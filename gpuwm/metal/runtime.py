@@ -168,7 +168,7 @@ def device_address(a) -> int:
         if isinstance(a, (int, np.integer)):
             return int(a)              # a GPU address carried as an integer (pointer tables)
         raise KernelError(f"kernel argument of type {type(a).__name__} is not a Metal device array")
-    return mem.gpu + (a.__array_interface__["data"][0] - mem.cpu)
+    return mem.gpu + (a._v.__array_interface__["data"][0] - mem.cpu)
 
 
 class Kernel:
@@ -228,7 +228,9 @@ class Kernel:
         global _pending
         check = bool(_NANCHECK)
         if check:
-            before = _nan_counts(args)
+            internal = self.name in ("ew", "ek", "rk", "red_thread", "red_block", "scan_rows", "gather_axis",
+                                     "flag_count", "scan_counts", "scatter_idx", "scatter_rows")
+            before = _nan_counts(args, nan_only=internal)
         _pending = True
         g = self.module.globals.buf if self.module.globals is not None else None
         rt().dispatch(self.pso, self.pack(args), _launch(grid[0], grid[1], grid[2], block[0], block[1], block[2], split),
@@ -236,14 +238,21 @@ class Kernel:
         if _SYNC_EACH:
             synchronize()
         if check:
-            after = _nan_counts(args)
+            after = _nan_counts(args, nan_only=internal)
             for i, (b0, a0) in enumerate(zip(before, after)):
                 if a0 > b0:
                     import sys
                     p = self._layout[i]["name"] if i < len(self._layout) else str(i)
                     msg = (f"[arwen-metal NANCHECK] kernel {self.name} (module {self.module.key[:12]}) "
-                           f"raised NaN count of argument {i} ({p}) from {b0} to {a0}; grid {grid} block {block}")
+                           f"raised the non-finite count of argument {i} ({p}) from {b0} to {a0}; grid {grid} block {block}\n"
+                           + "\n".join(f"    arg {j}: {_summary(x)}" for j, x in enumerate(args)))
                     print(msg, file=sys.stderr, flush=True)
+                    dump = os.environ.get("ARWEN_METAL_NANCHECK_DUMP")
+                    if dump:
+                        np.savez(dump, kernel=self.name, module=self.module.key, grid=np.array(grid), block=np.array(block),
+                                 **{f"arg{j}": (x._v.copy() if getattr(x, "_gpuwm_mem", None) is not None
+                                                else np.asarray(x)) for j, x in enumerate(args)
+                                    if not isinstance(x, (bytes, bytearray))})
                     if _NANCHECK == "raise":
                         raise FloatingPointError(msg)
 
@@ -254,7 +263,18 @@ _NANCHECK = os.environ.get("ARWEN_METAL_NANCHECK", "")
 _SYNC_EACH = os.environ.get("ARWEN_METAL_SYNC_EACH", "") == "1"   # debugging: wait for every dispatch
 
 
-def _nan_counts(args):
+def _summary(a):
+    if getattr(a, "_gpuwm_mem", None) is None:
+        return repr(a)[:60] if not isinstance(a, (bytes, bytearray)) else f"<{len(a)} bytes>"
+    v = a._v
+    if v.dtype.kind != "f" or v.size == 0:
+        return f"{v.dtype}{v.shape}"
+    fin = np.isfinite(v)
+    return (f"{v.dtype}{v.shape} nan={int(np.isnan(v).sum())} inf={int(np.isinf(v).sum())} "
+            f"min={float(v[fin].min()) if fin.any() else None} max={float(v[fin].max()) if fin.any() else None}")
+
+
+def _nan_counts(args, nan_only=False):
     out = []
     synchronize()
     for a in args:
@@ -262,7 +282,7 @@ def _nan_counts(args):
         if mem is not None and getattr(a, "dtype", None) is not None and a.dtype.kind == "f":
             # whole underlying buffer: kernels address memory beyond the view's extent
             whole = np.frombuffer(mem, dtype=a.dtype, count=mem.nbytes // a.dtype.itemsize)
-            out.append(int(np.count_nonzero(np.isnan(whole))))
+            out.append(int(np.count_nonzero(np.isnan(whole) if nan_only else ~np.isfinite(whole))))
         else:
             out.append(0)
     return out

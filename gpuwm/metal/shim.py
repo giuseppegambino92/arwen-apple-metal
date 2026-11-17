@@ -44,7 +44,6 @@ def install():
     os.environ["GPUWM_BACKEND"] = "metal"
     os.environ["GPUWM_AOT"] = "off"
     from gpuwm.metal import xp
-    _guard_numpy_host_conversions(xp)
     # gpuwm recognises device arrays by their type's module, as CuPy's is "cupy"
     xp.ndarray.__module__ = "cupy"
     xp._gpuwm_metal = True

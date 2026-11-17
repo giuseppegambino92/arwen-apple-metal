@@ -8,7 +8,7 @@ import numpy as np
 
 from .. import runtime
 from . import _kernels as K
-from ._core import _empty, _np_ndarray, is_device, ndarray
+from ._core import _empty, is_device, ndarray, broadcast
 
 
 def _strides_for(a, shape):
@@ -39,7 +39,7 @@ def elementwise(expr, outs, ins, scalars, preamble=""):
     src = K.elementwise_source(expr, tuple(K.ctype(o.dtype) for o in outs), tuple(K.ctype(a.dtype) for a in ins),
                                tuple(K.ctype(dt) for dt, _ in scalars), preamble)
     k = K.kernel(src, "ew")
-    args = list(outs) + list(ins) + [v for _, v in scalars] + [K.pack_layout(n, cshape, cstrides)]
+    args = list(outs) + list(ins) + [v for _, v in scalars] + [K.pack_layout(n, cshape, cstrides, max(len(outs) + len(ins), 1))]
     K.launch_1d(k, n, args)
 
 
@@ -173,7 +173,7 @@ def _expr(name, loop, nin):
 def _scalar_value(x):
     if isinstance(x, np.generic):
         return x.item(), x.dtype
-    if isinstance(x, _np_ndarray) and x.ndim == 0 and not is_device(x):
+    if isinstance(x, np.ndarray) and x.ndim == 0:
         return x.item(), x.dtype
     if isinstance(x, (bool, np.bool_)):
         return bool(x), np.dtype(np.bool_)
@@ -193,7 +193,7 @@ def call(ufunc, inputs, out=None, dtype=None, where=True, casting="same_kind", o
         if is_device(x):
             arrs.append(x)
             kinds.append(x.dtype)
-        elif isinstance(x, _np_ndarray) and x.ndim > 0:
+        elif isinstance(x, np.ndarray) and x.ndim > 0:
             raise TypeError(f"{name}: unsupported operand: host numpy.ndarray mixed with device arrays "
                             "(convert with asarray first, as CuPy requires)")
         else:
@@ -366,8 +366,8 @@ def reduce(name, a, axis=None, dtype=None, out=None, keepdims=False, initial=Non
     oshp, ost = K.collapse(oshape, ost) if oshape else ((), [(), ()])
     rst = [[a.strides[k] for k in axes]]
     rshp, rst = K.collapse(rshape, rst)
-    LO = K.pack_layout(on, oshp, ost)
-    LR = K.pack_layout(rn, rshp, rst)
+    LO = K.pack_layout(on, oshp, ost, 2)
+    LR = K.pack_layout(rn, rshp, rst, 2)
     base = a
     if on >= 2048 or rn <= 64:
         k = K.kernel(src, "red_thread")
@@ -395,7 +395,7 @@ def accumulate(name, a, axis=0, dtype=None, out=None):
     init = {"add": f"({A})0", "multiply": f"({A})1", "maximum": "x", "minimum": "x"}[name]
     if name in ("maximum", "minimum"):
         op = op if a.dtype.kind == "f" else op.replace(" || x != x", "")
-    src = K.SCAN_SOURCE_TMPL.format(lay=K._layout_struct(), offs=K._OFFSETS, acc_t=A, in_t=K.ctype(a.dtype),
+    src = K.SCAN_SOURCE_TMPL.format(lay=K._layout_struct(2), offs=K._OFFSETS, acc_t=A, in_t=K.ctype(a.dtype),
                                     out_t=K.ctype(out_dt), init=(f"({A})*(const {K.ctype(a.dtype)}*)(in + off[1])"
                                                                   if init == "x" else init), op=op)
     rows_shape = tuple(s for k, s in enumerate(a.shape) if k != axis)
@@ -406,7 +406,7 @@ def accumulate(name, a, axis=0, dtype=None, out=None):
         return res
     ost = [[res.strides[k] for k in range(a.ndim) if k != axis], [a.strides[k] for k in range(a.ndim) if k != axis]]
     shp, ost = K.collapse(rows_shape, ost) if rows_shape else ((), [(), ()])
-    LO = K.pack_layout(rn, shp, ost)
+    LO = K.pack_layout(rn, shp, ost, 2)
     k = K.kernel(src, "scan_rows")
     k(((rn + 127) // 128,), (128,), (res, a, LO, a.shape[axis], res.strides[axis], a.strides[axis]))
     return res

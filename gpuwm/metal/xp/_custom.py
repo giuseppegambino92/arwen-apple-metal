@@ -8,7 +8,7 @@ import numpy as np
 
 from .. import runtime
 from . import _kernels as K
-from ._core import _empty, asarray, is_device
+from ._core import _empty, asarray, broadcast, is_device
 from . import _ufuncs as U
 
 # ------------------------------------------------------------------ RawModule / RawKernel / driver Function
@@ -210,7 +210,7 @@ class ElementwiseKernel:
                 arrays.append(a)
             elif is_device(a):
                 k = len(lay_ops)
-                lay_ops.append(np.broadcast_to._implementation(a, shape, subok=True))
+                lay_ops.append(broadcast(a, shape))
                 params.append(f"{'' if is_out else 'const '}char* __p_{n}")
                 arrays.append(None)
                 if is_out:
@@ -224,7 +224,7 @@ class ElementwiseKernel:
         typedefs = "".join(f"typedef {K.ctype(res(t))} {t};\n" for t in dict.fromkeys(
             t for t, _, _ in self.in_params + self.out_params if t not in _DT))
         nops = max(len(lay_ops), 1)
-        src = f"""{K._layout_struct()}
+        src = f"""{K._layout_struct(max(len(lay_ops), 1))}
 {K._OFFSETS}
 {typedefs}{self.preamble}
 extern "C" __global__ void ek({", ".join(params + ["long long __n", "Lay __L"])}) {{
@@ -241,7 +241,7 @@ extern "C" __global__ void ek({", ".join(params + ["long long __n", "Lay __L"])}
         kern = K.kernel(src, "ek")
         strides = [U._strides_for(a, shape) for a in lay_ops]
         cshape, cstrides = K.collapse(shape, strides) if lay_ops else ((nelem,), [])
-        lay = K.pack_layout(nelem, cshape, cstrides)
+        lay = K.pack_layout(nelem, cshape, cstrides, max(len(lay_ops), 1))
         kargs = []
         li = 0
         for (t, n, raw), a, spec in zip(self.in_params + self.out_params, args, arrays):
@@ -292,13 +292,13 @@ class ReductionKernel:
             self.reduce_type if self.reduce_type else K.ctype(out_dt))
         res = out if out is not None else _empty(kshape if keepdims else oshape, out_dt)
         rv = res.reshape(oshape) if res.shape != oshape else res
-        b = [np.broadcast_to._implementation(a, shape, subok=True) for a in arrs]
+        b = [broadcast(a, shape) for a in arrs]
         loads = " ".join(f"const {K.ctype(a.dtype)} {n} = *(const {K.ctype(a.dtype)}*)(p{j} + o{j} + r[{j}]);"
                          for j, ((t, n, raw), a) in enumerate(zip(self.in_params, b)))
         pre_t = "".join(f"typedef {K.ctype(res_t(t))} {t};\n" for t in {t for t, _, _ in self.in_params + self.out_params}
                         if t not in _DT)
         np_ = len(b)
-        src = f"""{K._layout_struct()}
+        src = f"""{K._layout_struct(np_ + 1)}
 {K._OFFSETS}
 {pre_t}{self.preamble}
 __device__ __forceinline__ {red_t} __red({red_t} a, {red_t} b) {{ return ({self.reduce_expr}); }}
@@ -334,5 +334,5 @@ extern "C" __global__ void __launch_bounds__(256) rk({", ".join(f"const char* p{
         rst = [[a.strides[k] for k in axes] for a in b]
         rshp, rst = K.collapse(rshape, rst)
         if on:
-            kern((on,), (256,), tuple(b) + (rv, K.pack_layout(on, oshp, ost), K.pack_layout(rn, rshp, rst)))
+            kern((on,), (256,), tuple(b) + (rv, K.pack_layout(on, oshp, ost, np_ + 1), K.pack_layout(rn, rshp, rst, np_ + 1)))
         return res

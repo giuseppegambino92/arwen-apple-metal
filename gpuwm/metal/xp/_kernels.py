@@ -15,7 +15,7 @@ import numpy as np
 from .. import runtime
 
 MAXD = 8          # dimensions after collapsing
-MAXOPS = 4        # array operands of one elementwise kernel (outputs + inputs)
+MAXOPS = 48       # array operands of one kernel (the layout struct is sized per kernel)
 
 CTYPE = {
     np.dtype(np.bool_): "bool", np.dtype(np.int8): "signed char", np.dtype(np.uint8): "unsigned char",
@@ -44,17 +44,22 @@ def kernel(source: str, name: str) -> runtime.Kernel:
     return _module(source).get_function(name)
 
 
-def _layout_struct():
-    return f"struct Lay {{ long long n; int nd; int pad; long long shape[{MAXD}]; long long st[{MAXOPS}][{MAXD}]; }};"
+def _layout_struct(nops):
+    """The shape/stride block of one kernel, sized for exactly ``nops`` operands."""
+    if not 1 <= nops <= MAXOPS:
+        raise NotImplementedError(f"{nops} array operands in one generated kernel (limit {MAXOPS})")
+    return f"struct Lay {{ long long n; int nd; int pad; long long shape[{MAXD}]; long long st[{nops}][{MAXD}]; }};"
 
 
-def pack_layout(n, shape, strides_list) -> bytes:
+def pack_layout(n, shape, strides_list, nops) -> bytes:
     nd = len(shape)
     if nd > MAXD:
         raise ValueError(f"more than {MAXD} dimensions after collapsing")
+    if len(strides_list) > nops:
+        raise ValueError(f"{len(strides_list)} operand stride rows for a layout of {nops}")
     shp = list(shape) + [1] * (MAXD - nd)
     out = struct.pack(f"<qii{MAXD}q", n, nd, 0, *shp)
-    for k in range(MAXOPS):
+    for k in range(nops):
         st = list(strides_list[k]) if k < len(strides_list) else []
         st = st + [0] * (MAXD - len(st))
         out += struct.pack(f"<{MAXD}q", *st)
@@ -107,7 +112,7 @@ def elementwise_source(expr: str, out_types: tuple, in_types: tuple, scalar_type
                     for k, t in enumerate(in_types))
     decls = "".join(f"        {t} o{k};\n" for k, t in enumerate(out_types))
     stores = "".join(f"        *({t}*)(p{k} + off[{k}]) = o{k};\n" for k, t in enumerate(out_types))
-    return f"""{_layout_struct()}
+    return f"""{_layout_struct(max(nops, 1))}
 {_OFFSETS}
 {preamble}
 extern "C" __global__ void ew({", ".join(params)}) {{
@@ -137,7 +142,7 @@ def reduction_source(acc_t: str, in_t: str, out_t: str, init: str, step: str, me
     ``x`` (flat reduced index ``j``); ``merge(acc, other)`` combines partials in a
     fixed tree order (deterministic)."""
     idx = "long long" if with_index else "int"
-    return f"""{_layout_struct()}
+    return f"""{_layout_struct(2)}
 {_OFFSETS}
 struct Acc {{ {acc_t} v; {idx} j; }};
 __device__ __forceinline__ void acc_step(Acc& a, {in_t} x, long long j) {{ {step} }}

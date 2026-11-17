@@ -1,15 +1,19 @@
-"""Device arrays for the Metal backend: numpy ndarrays living in GPU memory.
+"""Device arrays for the Metal backend.
 
-``ndarray`` is a numpy.ndarray subclass whose bytes are an MTLBuffer in shared
-storage.  Shape/stride/view logic is numpy's own (views never copy); every
-computation is a GPU kernel (ufuncs, reductions, the numpy functions in
-``_functions``); every host access first waits for queued GPU work.  A numpy
-operation with no GPU implementation raises NotImplementedError naming it --
-there is no silent host fallback.
+``ndarray`` is NOT a numpy.ndarray, exactly as CuPy's is not: gpuwm (like any
+CuPy code) tells host from device arrays with ``isinstance(x, np.ndarray)``,
+and NumPy must refuse to read device memory implicitly (``np.asarray`` of a
+device array raises TypeError, as in CuPy).
+
+Each array holds ``_v``, a numpy view over its MTLBuffer (shared storage,
+unified memory), used only for shape/stride/view bookkeeping -- slicing,
+transposes and reshapes never copy.  Every computation is a GPU kernel
+(ufuncs, reductions, the numpy functions in ``_functions``); host reads wait
+for queued GPU work.  A NumPy operation without a GPU implementation raises
+NotImplementedError naming it: there is no silent host fallback.
 """
 from __future__ import annotations
 
-import builtins
 import numbers
 import operator
 
@@ -17,8 +21,6 @@ import numpy as np
 
 from .. import runtime
 from . import _kernels as K
-
-_np_ndarray = np.ndarray
 
 
 class MemoryPointer:
@@ -28,46 +30,91 @@ class MemoryPointer:
     def __init__(self, mem, ptr):
         self.mem, self.ptr = mem, ptr
 
+    def __int__(self):
+        return int(self.ptr)
 
-class ndarray(np.ndarray):
+
+def _wrap(view: np.ndarray, mem) -> "ndarray":
+    a = object.__new__(ndarray)
+    a._v = view
+    a._gpuwm_mem = mem
+    return a
+
+
+class ndarray:
+    __slots__ = ("_v", "_gpuwm_mem", "__weakref__")
     _gpuwm_backend_array = True
     __array_priority__ = 100.0
 
-    def __new__(cls, shape, dtype=float, memptr=None, strides=None, order="C"):
-        return _empty(shape, dtype, order=order)
-
-    def __array_finalize__(self, obj):
-        mem = getattr(obj, "_gpuwm_mem", None)
-        if mem is not None:
-            # only a view into the same MTLBuffer is a device array; numpy-made
-            # copies of a device array live in host memory and are not
-            p = self.__array_interface__["data"][0]
-            if not (mem.cpu <= p < mem.cpu + max(mem.nbytes, 1)) and self.size:
-                mem = None
+    def __init__(self, shape, dtype=float, memptr=None, strides=None, order="C"):
+        if memptr is None:
+            src = _empty(shape, dtype, order=order)
+            self._v, self._gpuwm_mem = src._v, src._gpuwm_mem
+            return
+        mem = memptr.mem
+        dtype = np.dtype(dtype)
+        if isinstance(shape, (numbers.Integral, np.integer)):
+            shape = (int(shape),)
+        offset = int(memptr.ptr) - mem.gpu
+        if not 0 <= offset <= mem.nbytes:
+            raise ValueError("memptr does not point into its memory")
+        base = np.frombuffer(mem, dtype=np.uint8)
+        self._v = np.ndarray(tuple(shape), dtype, buffer=base, offset=offset, strides=strides,
+                             order="F" if order == "F" else "C")
         self._gpuwm_mem = mem
 
-    # ----------------------------------------------------------- CuPy surface
+    # ----------------------------------------------------------- structure (numpy's own bookkeeping)
+    shape = property(lambda s: s._v.shape)
+    dtype = property(lambda s: s._v.dtype)
+    strides = property(lambda s: s._v.strides)
+    ndim = property(lambda s: s._v.ndim)
+    size = property(lambda s: s._v.size)
+    itemsize = property(lambda s: s._v.itemsize)
+    nbytes = property(lambda s: s._v.nbytes)
+    flags = property(lambda s: s._v.flags)
+    base = property(lambda s: None)
+
+    @shape.setter
+    def shape(self, value):
+        self._v.shape = value          # numpy raises when it would need a copy
+
+    @property
+    def T(self):
+        return _wrap(self._v.T, self._gpuwm_mem)
+
+    @property
+    def real(self):
+        return self
+
     @property
     def data(self):
         return MemoryPointer(self._gpuwm_mem, runtime.device_address(self))
-
-    @property
-    def __cuda_array_interface__(self):
-        """CuPy's device-array description; ``data`` is the GPU address (unified memory)."""
-        if self._gpuwm_mem is None:
-            raise AttributeError("__cuda_array_interface__")
-        return {"shape": self.shape, "typestr": self.dtype.str, "descr": self.dtype.descr,
-                "data": (runtime.device_address(self), False), "version": 3,
-                "strides": None if self.flags.c_contiguous else self.strides}
 
     @property
     def device(self):
         from . import cuda
         return cuda.Device(0)
 
-    def get(self, stream=None, order="C", out=None, blocking=True):
+    @property
+    def __cuda_array_interface__(self):
+        """CuPy's device-array description; ``data`` is the GPU address."""
+        return {"shape": self.shape, "typestr": self.dtype.str, "descr": self.dtype.descr,
+                "data": (runtime.device_address(self), False), "version": 3,
+                "strides": None if self.flags.c_contiguous else self.strides}
+
+    def __len__(self):
+        return len(self._v)
+
+    def __hash__(self):
+        raise TypeError("unhashable type: 'cupy.ndarray'")
+
+    # ----------------------------------------------------------- host access (waits for the GPU)
+    def _host(self):
         runtime.host_sync()
-        h = np.array(self.view(_np_ndarray), order=order, copy=True)
+        return self._v
+
+    def get(self, stream=None, order="C", out=None, blocking=True):
+        h = np.array(self._host(), order=order, copy=True)
         if out is not None:
             out[...] = h
             return out
@@ -78,29 +125,16 @@ class ndarray(np.ndarray):
         if arr.shape != self.shape:
             raise ValueError(f"shape mismatch in set: {arr.shape} vs {self.shape}")
         runtime.host_sync()
-        self.view(_np_ndarray)[...] = arr
-
-    def toDlpack(self):
-        raise NotImplementedError("DLPack export is not available on the Metal backend")
-
-    # ----------------------------------------------------------- host access
-    def _host(self):
-        runtime.host_sync()
-        return self.view(_np_ndarray)
-
-    def tobytes(self, order="C"):
-        return self._host().tobytes(order)
-
-    @property
-    def ctypes(self):
-        runtime.host_sync()
-        return _np_ndarray.ctypes.__get__(self)
+        self._v[...] = arr
 
     def item(self, *args):
         return self._host().item(*args)
 
     def tolist(self):
         return self._host().tolist()
+
+    def tobytes(self, order="C"):
+        return self._host().tobytes(order)
 
     def __float__(self):
         return float(self._host())
@@ -118,15 +152,17 @@ class ndarray(np.ndarray):
         return complex(self._host())
 
     def __repr__(self):
-        return "metal." + repr(self._host())
+        return "array(" + np.array2string(self._host(), separator=", ") + f", dtype={self.dtype})"
 
     def __str__(self):
         return str(self._host())
 
+    def __format__(self, spec):
+        return format(self._host() if self.ndim else self._host().item(), spec)
+
     def __array__(self, dtype=None, copy=None):
-        # CuPy refuses implicit conversion to host arrays; so do we.
-        raise TypeError("Implicit conversion to a NumPy array is not allowed on the Metal backend; "
-                        "use .get() or asnumpy()")
+        raise TypeError("Implicit conversion to a NumPy array is not allowed. "
+                        "Please use `.get()` to construct a NumPy array explicitly.")
 
     def __iter__(self):
         if self.ndim == 0:
@@ -143,6 +179,12 @@ class ndarray(np.ndarray):
     def __copy__(self):
         return self.copy()
 
+    def __dlpack__(self, *a, **k):
+        raise NotImplementedError("DLPack is not available on the Metal backend")
+
+    def toDlpack(self):
+        raise NotImplementedError("DLPack is not available on the Metal backend")
+
     # ----------------------------------------------------------- numpy protocols
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         from . import _ufuncs
@@ -155,28 +197,71 @@ class ndarray(np.ndarray):
     # ----------------------------------------------------------- indexing
     def __getitem__(self, key):
         if _is_basic(key):
-            res = _np_ndarray.__getitem__(self, key)
-            if isinstance(res, _np_ndarray):
-                return res
-            # a scalar read: the element must be up to date
-            runtime.host_sync()
-            return _np_ndarray.__getitem__(self, key)
+            res = self._v[_keyv(key)]
+            if isinstance(res, np.ndarray):
+                return _wrap(res, self._gpuwm_mem)
+            runtime.host_sync()                    # a scalar read: the element must be up to date
+            return self._v[_keyv(key)]
         from . import _functions
         return _functions.advanced_getitem(self, key)
 
     def __setitem__(self, key, value):
         if _is_basic(key):
-            dst = _np_ndarray.__getitem__(self, key)
-            if not isinstance(dst, _np_ndarray):
-                dst = _np_ndarray.__getitem__(self, (key,) if not isinstance(key, tuple) else key + (Ellipsis,))
-            assign(dst, value)
+            k = _keyv(key)
+            k = k if isinstance(k, tuple) else (k,)
+            if not any(x is Ellipsis for x in k):
+                k = k + (Ellipsis,)                # an Ellipsis makes numpy return a (0-d) view
+            assign(_wrap(self._v[k], self._gpuwm_mem), value)
             return
         from . import _functions
         _functions.advanced_setitem(self, key, value)
 
-    # ----------------------------------------------------------- methods with GPU semantics
+    # ----------------------------------------------------------- views
+    def view(self, dtype=None, type=None):
+        if type is not None and type is not ndarray:
+            raise TypeError("a device array cannot be viewed as another array type")
+        return _wrap(self._v.view() if dtype is None else self._v.view(dtype), self._gpuwm_mem)
+
+    def reshape(self, *shape, order="C"):
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        if order == "C":
+            v = self._v.view()
+            try:
+                v.shape = shape                   # succeeds only when no copy is needed
+                return _wrap(v, self._gpuwm_mem)
+            except AttributeError:
+                c = self.copy("C")
+                return _wrap(c._v.reshape(shape), c._gpuwm_mem)
+        src = self if self.flags.f_contiguous else self.copy("F")
+        return _wrap(src._v.reshape(shape, order="F"), src._gpuwm_mem)
+
+    def ravel(self, order="C"):
+        if (order == "C" and self.flags.c_contiguous) or (order == "F" and self.flags.f_contiguous):
+            return _wrap(self._v.reshape(-1, order=order), self._gpuwm_mem)
+        o = order if order in "CF" else "C"
+        c = self.copy(o)
+        return _wrap(c._v.reshape(-1, order=o), c._gpuwm_mem)
+
+    def flatten(self, order="C"):
+        o = order if order in "CF" else "C"
+        c = self.copy(o)
+        return _wrap(c._v.reshape(-1, order=o), c._gpuwm_mem)
+
+    def transpose(self, *axes):
+        if len(axes) == 1 and isinstance(axes[0], (tuple, list)):
+            axes = tuple(axes[0])
+        return _wrap(self._v.transpose(*axes) if axes else self._v.transpose(), self._gpuwm_mem)
+
+    def swapaxes(self, a, b):
+        return _wrap(self._v.swapaxes(a, b), self._gpuwm_mem)
+
+    def squeeze(self, axis=None):
+        return _wrap(self._v.squeeze(axis), self._gpuwm_mem)
+
+    # ----------------------------------------------------------- data-moving methods (GPU)
     def copy(self, order="C"):
-        out = _empty(self.shape, self.dtype, order=order if order in "CF" else "C")
+        out = _empty(self.shape, self.dtype, order="F" if order == "F" else "C")
         assign(out, self)
         return out
 
@@ -184,54 +269,101 @@ class ndarray(np.ndarray):
         dtype = np.dtype(dtype)
         if not copy and dtype == self.dtype:
             return self
-        out = _empty(self.shape, dtype, order="F" if (order == "F" or (order in "AK" and self.flags.f_contiguous
-                                                                       and not self.flags.c_contiguous)) else "C")
+        f = order == "F" or (order in "AK" and self.flags.f_contiguous and not self.flags.c_contiguous)
+        out = _empty(self.shape, dtype, "F" if f else "C")
         assign(out, self)
         return out
 
     def fill(self, value):
         assign(self, value)
 
-    def reshape(self, *shape, order="C"):
-        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
-            shape = tuple(shape[0])
-        if order == "C":
-            v = _np_ndarray.view(self)
-            try:
-                v.shape = shape          # succeeds only when no copy is needed
-                return v
-            except AttributeError:
-                pass
-            return _np_ndarray.reshape(self.copy("C"), shape)
-        src = self if self.flags.f_contiguous else self.copy("F")
-        return _np_ndarray.reshape(src, shape, order="F")
+    # reductions and friends: NumPy's functions dispatch back to the GPU implementations
+    def sum(self, axis=None, dtype=None, out=None, keepdims=False):
+        return np.sum(self, axis=axis, dtype=dtype, out=out, keepdims=keepdims)
 
-    def ravel(self, order="C"):
-        if (order == "C" and self.flags.c_contiguous) or (order == "F" and self.flags.f_contiguous):
-            return _np_ndarray.reshape(self, -1, order=order)
-        return _np_ndarray.reshape(self.copy(order if order in "CF" else "C"), -1, order=order if order in "CF" else "C")
+    def prod(self, axis=None, dtype=None, out=None, keepdims=False):
+        return np.prod(self, axis=axis, dtype=dtype, out=out, keepdims=keepdims)
 
-    def flatten(self, order="C"):
-        return self.copy(order if order in "CF" else "C").ravel(order)
+    def max(self, axis=None, out=None, keepdims=False):
+        return np.max(self, axis=axis, out=out, keepdims=keepdims)
 
-    def view(self, dtype=None, type=None):
-        if dtype is None and type is None:
-            return _np_ndarray.view(self)
-        if type is not None and type is not ndarray and dtype is None and not isinstance(dtype, np.dtype):
-            raise TypeError("viewing a device array as another array type is not supported")
-        return _np_ndarray.view(self, dtype) if dtype is not None else _np_ndarray.view(self)
+    def min(self, axis=None, out=None, keepdims=False):
+        return np.min(self, axis=axis, out=out, keepdims=keepdims)
 
-    def __len__(self):
-        return _np_ndarray.__len__(self)
+    def mean(self, axis=None, dtype=None, out=None, keepdims=False):
+        return np.mean(self, axis=axis, dtype=dtype, out=out, keepdims=keepdims)
 
-    def __hash__(self):
-        raise TypeError("unhashable type: 'ndarray'")
+    def any(self, axis=None, out=None, keepdims=False):
+        return np.any(self, axis=axis, out=out, keepdims=keepdims)
 
-    def __dlpack__(self, *a, **k):
-        raise NotImplementedError("DLPack is not available on the Metal backend")
+    def all(self, axis=None, out=None, keepdims=False):
+        return np.all(self, axis=axis, out=out, keepdims=keepdims)
+
+    def argmax(self, axis=None, out=None, keepdims=False):
+        return np.argmax(self, axis=axis, out=out, keepdims=keepdims)
+
+    def argmin(self, axis=None, out=None, keepdims=False):
+        return np.argmin(self, axis=axis, out=out, keepdims=keepdims)
+
+    def cumsum(self, axis=None, dtype=None, out=None):
+        return np.cumsum(self, axis=axis, dtype=dtype, out=out)
+
+    def clip(self, min=None, max=None, out=None):
+        return np.clip(self, min, max, out=out)
+
+    def nonzero(self):
+        return np.nonzero(self)
+
+    def round(self, decimals=0, out=None):
+        if decimals:
+            raise NotImplementedError("round(decimals != 0) on the Metal backend")
+        return np.rint(self, out=out)
+
+    def conj(self):
+        return self
 
     def __matmul__(self, other):
         raise NotImplementedError("matmul on the Metal backend")
+
+
+# operators: NumPy's ufuncs, which dispatch to the GPU through __array_ufunc__
+def _binop(uf):
+    def f(self, other):
+        return uf(self, other)
+
+    def r(self, other):
+        return uf(other, self)
+
+    def i(self, other):
+        return uf(self, other, out=(self,))
+    return f, r, i
+
+
+for _name, _uf in (("add", np.add), ("sub", np.subtract), ("mul", np.multiply), ("truediv", np.true_divide),
+                   ("floordiv", np.floor_divide), ("mod", np.remainder), ("pow", np.power), ("and", np.bitwise_and),
+                   ("or", np.bitwise_or), ("xor", np.bitwise_xor), ("lshift", np.left_shift),
+                   ("rshift", np.right_shift)):
+    _f, _r, _i = _binop(_uf)
+    setattr(ndarray, f"__{_name}__", _f)
+    setattr(ndarray, f"__r{_name}__", _r)
+    setattr(ndarray, f"__i{_name}__", _i)
+for _name, _uf in (("lt", np.less), ("le", np.less_equal), ("gt", np.greater), ("ge", np.greater_equal),
+                   ("eq", np.equal), ("ne", np.not_equal)):
+    setattr(ndarray, f"__{_name}__", (lambda uf: lambda self, other: uf(self, other))(_uf))
+ndarray.__neg__ = lambda self: np.negative(self)
+ndarray.__pos__ = lambda self: np.positive(self)
+ndarray.__abs__ = lambda self: np.absolute(self)
+ndarray.__invert__ = lambda self: np.invert(self)
+ndarray.__divmod__ = lambda self, other: np.divmod(self, other)
+
+
+def _keyv(key):
+    """Index for the internal numpy view: device-array scalars become ints."""
+    if isinstance(key, tuple):
+        return tuple(_keyv(k) for k in key)
+    if isinstance(key, ndarray) and key.ndim == 0:
+        return key.item()
+    return key
 
 
 def _is_basic(key) -> bool:
@@ -243,6 +375,8 @@ def _is_basic(key) -> bool:
         if isinstance(k, (bool, np.bool_)):
             return False
         if isinstance(k, (numbers.Integral, np.integer)):
+            continue
+        if isinstance(k, ndarray) and k.ndim == 0 and k.dtype.kind in "iu":
             continue
         return False
     return True
@@ -262,41 +396,41 @@ def _empty(shape, dtype=float, order="C"):
             raise ValueError("negative dimensions are not allowed")
         n *= s
     mem = runtime.DeviceMemory(max(n * dtype.itemsize, 1))
-    a = _np_ndarray.__new__(ndarray, shape, dtype, buffer=mem, order="F" if order == "F" else "C")
-    a._gpuwm_mem = mem
-    return a
+    v = np.ndarray(shape, dtype, buffer=mem, order="F" if order == "F" else "C")
+    return _wrap(v, mem)
 
 
 def is_device(a) -> bool:
-    return isinstance(a, ndarray) and a._gpuwm_mem is not None
+    return isinstance(a, ndarray)
+
+
+def broadcast(a, shape):
+    """A zero-copy broadcast view of a device array."""
+    return _wrap(np.broadcast_to(a._v, shape), a._gpuwm_mem)
 
 
 # ------------------------------------------------------------------ assignment (GPU copy / fill / cast)
 def assign(dst, src):
-    """dst[...] = src on the GPU (broadcasting, casting like numpy's same_kind/unsafe assignment)."""
+    """dst[...] = src on the GPU (broadcasting, casting like numpy's unsafe assignment)."""
     if not is_device(dst):
         raise TypeError("assignment target is not a device array")
-    if isinstance(src, (numbers.Number, np.generic, bool)) or (isinstance(src, _np_ndarray) and not is_device(src) and src.ndim == 0):
+    if isinstance(src, (numbers.Number, np.generic, bool)) or (isinstance(src, np.ndarray) and src.ndim == 0):
         if dst.size == 0:
             return
         val = np.asarray(src).item() if not isinstance(src, (numbers.Number, bool)) else src
         from ._ufuncs import elementwise
         elementwise("o0 = s0;", [dst], [], [(np.dtype(dst.dtype), _cast_scalar(val, dst.dtype))])
         return
-    if isinstance(src, _np_ndarray) and not is_device(src):
+    if isinstance(src, np.ndarray):
         # host -> device: unified memory, so a CPU write once the GPU is done with dst
-        src = np.asarray(src)
         runtime.host_sync()
-        dst.view(_np_ndarray)[...] = src
+        dst._v[...] = src
         return
     if not is_device(src):
         src = asarray(src)
     if dst.size == 0:
         return
-    src_b = np.broadcast_to(src.view(_np_ndarray), dst.shape) if src.shape != dst.shape else src
-    if src_b is not src:
-        src_b = src_b.view(ndarray)
-        src_b._gpuwm_mem = src._gpuwm_mem
+    src_b = broadcast(src, dst.shape) if src.shape != dst.shape else src
     from ._ufuncs import elementwise
     elementwise("o0 = (%s)a0;" % K.ctype(dst.dtype), [dst], [src_b], [])
 
@@ -329,14 +463,14 @@ def ones(shape, dtype=float, order="C"):
 
 def full(shape, fill_value, dtype=None, order="C"):
     if dtype is None:
-        dtype = np.asarray(fill_value).dtype if not is_device(fill_value) else fill_value.dtype
+        dtype = fill_value.dtype if is_device(fill_value) else np.asarray(fill_value).dtype
     a = _empty(shape, dtype, order)
     assign(a, fill_value)
     return a
 
 
 def _like_order(a, order):
-    if order == "K" or order == "A":
+    if order in ("K", "A"):
         return "F" if a.flags.f_contiguous and not a.flags.c_contiguous else "C"
     return order
 
@@ -379,7 +513,7 @@ def array(obj, dtype=None, copy=True, order="K", subok=False, ndmin=0, blocking=
         raise TypeError(f"cannot create a device array of dtype {h.dtype}")
     out = _empty(h.shape, h.dtype, "F" if (h.flags.f_contiguous and not h.flags.c_contiguous) else "C")
     if h.size:
-        out.view(_np_ndarray)[...] = h       # fresh buffer: no GPU work can touch it yet
+        out._v[...] = h              # fresh buffer: no GPU work can touch it yet
     return out
 
 

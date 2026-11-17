@@ -105,5 +105,17 @@ check("ElementwiseKernel raw+T", ek2(cp.asarray(ah.ravel()), ah.size, cp.empty(a
 rk = cp.ReductionKernel("T x", "int32 y", "isfinite(x) ? 0 : 1", "a | b", "y = a", "0", "nonfinite")
 zz = ah.copy(); zz[3, 7] = np.inf
 check("ReductionKernel", rk(cp.asarray(zz), axis=1), (~np.isfinite(zz)).any(axis=1).astype(np.int32))
+# many operands with different shapes (regression: the layout block once held 4 operands)
+nz_, ny_, nx_ = 5, 7, 9
+ins = [rng.uniform(1, 2, s).astype(np.float32) for s in [(nz_, ny_, nx_)] * 4 + [(ny_, nx_)] * 3 + [(nz_, 1, 1)] * 3]
+names = [f"x{i}" for i in range(len(ins))]
+ekm = cp.ElementwiseKernel(", ".join(f"float32 {n}" for n in names), "float32 o1, float32 o2",
+                           "o1 = " + " + ".join(names) + "; o2 = x0 * x4 * x7;", "many_ops")
+o1, o2 = ekm(*[cp.asarray(a) for a in ins])
+ref1 = ins[0]
+for a in ins[1:]:
+    ref1 = ref1 + a
+check("ElementwiseKernel 12 operands broadcast o1", o1, ref1)
+check("ElementwiseKernel 12 operands broadcast o2", o2, ins[0] * ins[4] * ins[7])
 print(f"{checks} checks, {len(fails)} failures")
 sys.exit(1 if fails else 0)
