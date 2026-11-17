@@ -136,16 +136,21 @@ inline float __arwen_fneg(float x) { return as_type<float>(as_type<uint>(x) ^ 0x
 // Inside the rare branch the exact conditions decide; only a real subnormal
 // case reaches the software routine (sf32_*), so the semantics are unchanged.
 #define ARWEN_EXPF(x) (as_type<uint>(x) & 0x7f800000u)
+// Inner conditions without short-circuit branches: (bits << 1) - 1 maps
+// zeros to 0xffffffff, subnormals to [1, 2^24 - 3] and normals above, so one
+// min and one compare tell whether either operand is subnormal.
+inline bool __arwen_fsub2(float a, float b) {
+    return metal::min((as_type<uint>(a) << 1) - 1u, (as_type<uint>(b) << 1) - 1u) < 0x00ffffffu;
+}
 inline float __arwen_fadd(float a, float b) {
     float r = a + b;
-    if (ARWEN_EXPF(r) < (27u << 23) &&
-        (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && !(a == __arwen_fneg(b)))))
+    if (ARWEN_EXPF(r) < (27u << 23) && (__arwen_fsub2(a, b) | (__arwen_flow(r) & (a != __arwen_fneg(b)))))
         return sf32_add(a, b);
     return r;
 }
 inline float __arwen_fsubtract(float a, float b) {
     float r = a - b;
-    if (ARWEN_EXPF(r) < (27u << 23) && (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && !(a == b))))
+    if (ARWEN_EXPF(r) < (27u << 23) && (__arwen_fsub2(a, b) | (__arwen_flow(r) & (a != b))))
         return sf32_sub(a, b);
     return r;
 }
@@ -154,14 +159,13 @@ inline bool __arwen_fmulband(float r) {          // exponent field 0 or 1, or al
 }
 inline float __arwen_fmul(float a, float b) {
     float r = a * b;
-    if (__arwen_fmulband(r) &&
-        (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && a != 0.0f && b != 0.0f)))
+    if (__arwen_fmulband(r) && (__arwen_fsub2(a, b) | (__arwen_flow(r) & (a != 0.0f) & (b != 0.0f))))
         return sf32_mul(a, b);
     return r;
 }
 inline float __arwen_fdiv(float a, float b) {
     float r = a / b;
-    if (__arwen_fmulband(r) && (__arwen_fsub(a) || __arwen_fsub(b) || (__arwen_flow(r) && a != 0.0f)))
+    if (__arwen_fmulband(r) && (__arwen_fsub2(a, b) | (__arwen_flow(r) & (a != 0.0f))))
         return sf32_div(a, b);
     return r;
 }

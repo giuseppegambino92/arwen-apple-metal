@@ -33,6 +33,8 @@ SF_INLINE int sf_clz64(sf_u64 a) { return (int)metal::clz(a); }
 SF_INLINE sf_u64 sf_mulhi64(sf_u64 a, sf_u64 b) { return metal::mulhi(a, b); }
 SF_INLINE sf_u32 sf_f32_bits(float f) { return as_type<sf_u32>(f); }
 SF_INLINE float sf_bits_f32(sf_u32 u) { return as_type<float>(u); }
+SF_INLINE float sf_rcpf(float x) { return 1.0f / x; }
+SF_INLINE float sf_rsqrtf(float x) { return metal::precise::rsqrt(x); }
 #define SF_THREAD thread
 #else
 #include <cstdint>
@@ -47,6 +49,8 @@ SF_INLINE int sf_clz64(sf_u64 a) { return a ? __builtin_clzll(a) : 64; }
 SF_INLINE sf_u64 sf_mulhi64(sf_u64 a, sf_u64 b) { return (sf_u64)(((unsigned __int128)a * b) >> 64); }
 SF_INLINE sf_u32 sf_f32_bits(float f) { sf_u32 u; memcpy(&u, &f, 4); return u; }
 SF_INLINE float sf_bits_f32(sf_u32 u) { float f; memcpy(&f, &u, 4); return f; }
+SF_INLINE float sf_rcpf(float x) { return 1.0f / x; }
+SF_INLINE float sf_rsqrtf(float x) { return 1.0f / __builtin_sqrtf(x); }
 #define SF_THREAD
 #endif
 
@@ -229,43 +233,25 @@ SF_OUTLINE sf_u64 sf_div(sf_u64 a, sf_u64 b, bool odd = false) {
     sa |= 0x0010000000000000UL;
     sb |= 0x0010000000000000UL;
     if (sa < sb) { --ez; sa <<= 1; }
-    // restoring division: q = floor(sa * 2^62 / sb), quotient in [2^62, 2^63)
-    sf_u64 rem = sa, q = 0;
-    for (int i = 0; i < 63; ++i) {
-        q <<= 1;
-        if (rem >= sb) { rem -= sb; q |= 1; }
-        rem <<= 1;
+    // q = floor(sa * 2^62 / sb) in [2^62, 2^63), sticky = remainder != 0.
+    // Long division in radix 2^10: each digit floor((rem << 10) / sb) is
+    // estimated with the FP32 hardware (relative error < 2^-21, so the
+    // estimate is the digit or one off) and made exact by one integer
+    // correction; the remainder stays exact throughout.
+    sf_u64 rem = sa - sb, q = 1;                 // sa in [sb, 2 sb): leading bit 1
+    float rb = sf_rcpf((float)sb);
+    for (int k = 0; k < 7; ++k) {
+        int s = k < 6 ? 10 : 2;                  // 6 * 10 + 2 = 62 more bits
+        sf_u64 num = rem << s;                   // rem < sb < 2^53: num < 2^63
+        sf_u64 d = (sf_u64)((float)num * rb);
+        sf_i64 r = (sf_i64)(num - d * sb);
+        if (r < 0) { --d; r += (sf_i64)sb; }
+        else if ((sf_u64)r >= sb) { ++d; r -= (sf_i64)sb; }
+        q = (q << s) | d;
+        rem = (sf_u64)r;
     }
     q |= (sf_u64)(rem != 0);
     return sf_round_pack(sz, ez, q, odd);
-}
-
-SF_OUTLINE sf_u64 sf_sqrt(sf_u64 a, bool odd = false) {
-    bool s = SF_SIGN(a);
-    int e = SF_EXP(a);
-    sf_u64 f = SF_FRAC(a);
-    if (e == 0x7FF) {
-        if (f) return sf_propagate_nan(a, 0);
-        return s ? SF_DEFAULT_NAN : a;
-    }
-    if (s) return (e | f) ? SF_DEFAULT_NAN : a;
-    if (!e) { if (!f) return a; sf_norm_subnormal(f, e, f); }
-    int unb = e - 0x3FF;
-    int ez = (unb >> 1) + 0x3FE;   // arithmetic shift: floor(unb / 2)
-    sf_u64 sig = f | 0x0010000000000000UL;
-    if (unb & 1) sig <<= 1;
-    // r = floor(sqrt(sig << 56)), 55 significant bits; radicand bits 0..109
-    sf_u64 nhi = sig >> 8, nlo = sig << 56;
-    sf_u64 r = 0, rem = 0;
-    for (int i = 54; i >= 0; --i) {
-        int sh = 2 * i;
-        sf_u64 pair = (sh >= 64) ? ((nhi >> (sh - 64)) & 3) : (((nlo >> sh) | (sh ? (nhi << (64 - sh)) : 0)) & 3);
-        rem = (rem << 2) | pair;
-        sf_u64 trial = (r << 2) | 1;
-        if (rem >= trial) { rem -= trial; r = (r << 1) | 1; } else { r <<= 1; }
-    }
-    sf_u64 z = (r << 8) | (sf_u64)(rem != 0);
-    return sf_round_pack(false, ez, z, odd);
 }
 
 // ---- 128-bit helpers for fma
@@ -298,6 +284,49 @@ SF_INLINE sf_u128 sf_shr_jam128(sf_u128 a, int n) {
 SF_INLINE bool sf_lt128(sf_u128 a, sf_u128 b) { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
 SF_INLINE sf_u128 sf_add128(sf_u128 a, sf_u128 b) { sf_u128 r; r.lo = a.lo + b.lo; r.hi = a.hi + b.hi + (sf_u64)(r.lo < a.lo); return r; }
 SF_INLINE sf_u128 sf_sub128(sf_u128 a, sf_u128 b) { sf_u128 r; r.lo = a.lo - b.lo; r.hi = a.hi - b.hi - (sf_u64)(a.lo < b.lo); return r; }
+
+SF_OUTLINE sf_u64 sf_sqrt(sf_u64 a, bool odd = false) {
+    bool s = SF_SIGN(a);
+    int e = SF_EXP(a);
+    sf_u64 f = SF_FRAC(a);
+    if (e == 0x7FF) {
+        if (f) return sf_propagate_nan(a, 0);
+        return s ? SF_DEFAULT_NAN : a;
+    }
+    if (s) return (e | f) ? SF_DEFAULT_NAN : a;
+    if (!e) { if (!f) return a; sf_norm_subnormal(f, e, f); }
+    int unb = e - 0x3FF;
+    int ez = (unb >> 1) + 0x3FE;   // arithmetic shift: floor(unb / 2)
+    sf_u64 sig = f | 0x0010000000000000UL;
+    if (unb & 1) sig <<= 1;
+    // r = floor(sqrt(N)), N = sig << 56 (sig in [2^52, 2^54)), r in [2^54, 2^55).
+    // y ~ 1/sqrt(t), t = sig / 2^52, from the FP32 hardware, refined by two
+    // fixed-point Newton steps (Y = y * 2^63); r ~ t * y * 2^54 is then within
+    // a few units and made exact against the 128-bit square.
+    sf_u64 xs = sig << 10;                       // t * 2^62
+    sf_u64 Y = (sf_u64)(sf_rsqrtf((float)sig * 0x1p-52f) * 0x1p63f);
+    for (int k = 0; k < 2; ++k) {
+        sf_u64 S = sf_mulhi64(Y, Y) << 1;        // y^2 * 2^63
+        sf_u64 P = sf_mulhi64(xs, S);            // t * y^2 * 2^61
+        Y = sf_mulhi64(Y, 0x6000000000000000UL - P) << 2;   // y * (3 - t y^2) / 2 * 2^63
+    }
+    sf_u64 r = sf_mulhi64(xs, Y) >> 7;           // t * y * 2^54
+    sf_u128 N; N.hi = sig >> 8; N.lo = sig << 56;
+    sf_u128 sq = sf_mul64x64(r, r);
+    while (sf_lt128(N, sq)) {                    // r too large
+        --r;
+        sf_u128 t; t.hi = 0; t.lo = 2 * r + 1;
+        sq = sf_sub128(sq, t);
+    }
+    for (;;) {                                   // (r + 1)^2 <= N: r too small
+        sf_u128 t; t.hi = 0; t.lo = 2 * r + 1;
+        sf_u128 nx = sf_add128(sq, t);
+        if (sf_lt128(N, nx)) break;
+        sq = nx; ++r;
+    }
+    sf_u64 z = (r << 8) | (sf_u64)(sq.hi != N.hi || sq.lo != N.lo);
+    return sf_round_pack(false, ez, z, odd);
+}
 
 // a*b + c with a single rounding.
 SF_OUTLINE sf_u64 sf_fma(sf_u64 a, sf_u64 b, sf_u64 c, bool odd = false) {
