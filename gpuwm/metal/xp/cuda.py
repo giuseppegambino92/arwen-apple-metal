@@ -746,7 +746,17 @@ def _make_cu_launch_kernel():
     return proto(_cu_launch_kernel_impl)
 
 
+class CUDADriverError(RuntimeError):
+    """cupy.cuda.driver.CUDADriverError (raised with a CUresult status)."""
+    def __init__(self, status=1, msg=None):
+        self.status = int(status)
+        super().__init__(msg or f"CUDA driver error {self.status} (Metal backend)")
+
+
 driver = types.SimpleNamespace(occupancyMaxActiveBlocksPerMultiprocessor=lambda f, b, s: 1,
+                               CUDADriverError=CUDADriverError,
+                               ctxGetCurrent=lambda: 1,          # one context, always current
+                               ctxGetDevice=lambda: 0,
                                cuLaunchKernel=_make_cu_launch_kernel(),
                                cuGraphLaunch=_make_cu_graph_launch(),
                                cuEventRecordWithFlags=_cu_event_record_with_flags,
