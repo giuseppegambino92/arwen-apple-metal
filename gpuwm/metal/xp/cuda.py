@@ -604,3 +604,65 @@ def _func_get_attribute(attribute, ptr):
 driver = types.SimpleNamespace(occupancyMaxActiveBlocksPerMultiprocessor=lambda f, b, s: 1,
                                funcGetAttribute=_func_get_attribute,
                                **{"CU_FUNC_ATTRIBUTE_" + n.upper(): i for i, n in enumerate(_FUNC_ATTRS)})
+
+
+# ------------------------------------------------------------------ cuFFT
+def _cufft_module():
+    """cupy.cuda.cufft on Metal: Apple GPUs have no cuFFT; plans run numpy.fft on
+    the CPU over unified memory (declared on first use), in queue order (and
+    recorded, not run, while a CUDA graph is captured).  Work areas are empty."""
+    import sys as _sys
+    import numpy as _np
+    m = types.ModuleType("cupy.cuda.cufft")
+    for k, v in dict(CUFFT_R2C=0x2a, CUFFT_C2R=0x2c, CUFFT_C2C=0x29, CUFFT_D2Z=0x6a, CUFFT_Z2D=0x6c,
+                     CUFFT_Z2Z=0x69, CUFFT_FORWARD=-1, CUFFT_INVERSE=1).items():
+        setattr(m, k, v)
+    told = []
+
+    class _Plan:
+        def __init__(self, shape, fft_type, batch=1, axes=None):
+            self.shape = tuple(int(s) for s in (shape if isinstance(shape, (tuple, list)) else (shape,)))
+            self.fft_type, self.batch = int(fft_type), int(batch)
+            self.nx = self.shape[-1]
+            self.work_area = types.SimpleNamespace(mem=types.SimpleNamespace(size=0), ptr=0)
+
+        def _run(self, a, out, direction):
+            if not told:
+                told.append(1)
+                print("[arwen-metal] cuFFT plan: numpy.fft on the CPU over unified memory (Metal has no cuFFT)",
+                      file=_sys.stderr)
+            _rt_module.synchronize()
+            n = len(self.shape)
+            x = a._v.reshape((-1,) + (a._v.shape[-n:] if a._v.ndim >= n else a._v.shape))
+            axes = tuple(range(-n, 0))
+            t = self.fft_type
+            if t in (m.CUFFT_R2C, m.CUFFT_D2Z):
+                r = _np.fft.rfftn(x, s=self.shape, axes=axes)
+            elif t in (m.CUFFT_C2R, m.CUFFT_Z2D):
+                r = _np.fft.irfftn(x, s=self.shape, axes=axes) * float(_np.prod(self.shape))   # cuFFT: unnormalised
+            elif direction == m.CUFFT_FORWARD:
+                r = _np.fft.fftn(x, axes=axes)
+            else:
+                r = _np.fft.ifftn(x, axes=axes) * float(_np.prod(self.shape))
+            out._v[...] = r.reshape(out._v.shape).astype(out._v.dtype, copy=False)
+
+        def fft(self, a, out, direction):
+            if _rt_module.CAPTURE is not None:
+                _rt_module.CAPTURE.append(("host", lambda: self._run(a, out, direction)))
+                return
+            self._run(a, out, direction)
+
+    class Plan1d(_Plan):
+        def __init__(self, nx, fft_type, batch, devices=None, out=None):
+            super().__init__((nx,), fft_type, batch)
+
+    class PlanNd(_Plan):
+        def __init__(self, shape, inembed=None, istride=1, idist=0, onembed=None, ostride=1, odist=0,
+                     fft_type=None, batch=1, order="C", last_axis=-1, last_size=None):
+            super().__init__(shape, fft_type, batch)
+
+    m.Plan1d, m.PlanNd = Plan1d, PlanNd
+    return m
+
+
+cufft = _cufft_module()

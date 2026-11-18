@@ -487,6 +487,11 @@ def accumulate(name, a, axis=0, dtype=None, out=None):
 
 # ------------------------------------------------------------------ dispatch from __array_ufunc__
 def dispatch(ufunc, method, inputs, kwargs):
+    from . import _functions as _F
+    if _F._has_complex(inputs) or _F._has_complex(kwargs.values()) or _F._has_complex(
+            kwargs.get("out") or () if isinstance(kwargs.get("out"), tuple) else (kwargs.get("out"),)):
+        fn = ufunc if method == "__call__" else getattr(ufunc, method)
+        return _F.host_call(fn, inputs, kwargs)       # complex: NumPy on the CPU (declared)
     out = kwargs.pop("out", None)
     if method == "__call__":
         return call(ufunc, inputs, out=out, **kwargs)

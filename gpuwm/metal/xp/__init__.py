@@ -132,7 +132,34 @@ def _unimplemented_module(name):
     return m
 
 
-fft = _unimplemented_module("cupy.fft")
+def _fft_module():
+    """cupy.fft on Metal: numpy.fft on the CPU over unified memory (declared on
+    first use); Apple GPUs have no cuFFT and ArWen uses FFTs only to build
+    random perturbation patterns."""
+    m = _types.ModuleType("cupy.fft")
+
+    def __getattr__(attr):
+        fn = getattr(_np.fft, attr, None)
+        if fn is None or attr.startswith("_"):
+            raise NotImplementedError(f"cupy.fft.{attr} on the Metal backend")
+        if not callable(fn):
+            return fn
+
+        def f(*args, **kw):
+            return _F.host_call(fn, args, kw)
+        f.__name__ = attr
+        setattr(m, attr, f)
+        return f
+    m.__getattr__ = __getattr__
+    return m
+
+
+fft = _fft_module()
+fft.config = _types.SimpleNamespace(enable_nd_planning=False, get_plan_cache=lambda: _types.SimpleNamespace(
+    set_size=lambda n: None, set_memsize=lambda n: None, clear=lambda: None, get_size=lambda: 0))
+fft._fft = _types.SimpleNamespace(_get_cufft_plan_nd=lambda shape, fft_type, axes=None, order="C", out_size=None,
+                                  to_cache=True: cuda.cufft.PlanNd(tuple(shape[a] for a in (axes or range(len(shape)))),
+                                                                   fft_type=fft_type))
 def _linalg_module():
     """cupy.linalg on Metal: Apple GPUs have no LAPACK (no cuSOLVER equivalent), so
     these run numpy.linalg (LAPACK on the CPU) on the same unified memory, after the

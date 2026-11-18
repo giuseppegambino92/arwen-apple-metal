@@ -104,13 +104,13 @@ def install():
     cuda.__path__ = []
     xp.cuda = cuda
     sys.modules["cupy.cuda"] = cuda
-    for sub in ("runtime", "compiler", "function", "memory", "nvrtc", "driver"):
+    for sub in ("runtime", "compiler", "function", "memory", "nvrtc", "driver", "cufft"):
         mod = types.ModuleType(f"cupy.cuda.{sub}")
         mod.__dict__.update(vars(getattr(cuda, sub)) if not isinstance(getattr(cuda, sub), types.ModuleType)
                             else vars(getattr(cuda, sub)))
         setattr(cuda, sub, mod)
         sys.modules[f"cupy.cuda.{sub}"] = mod
-    for name in ("cupy._core", "cupy._core.core", "cupy.fft", "cupy.linalg", "cupy.random", "cupy.testing",
+    for name in ("cupy._core", "cupy._core.core", "cupy.fft", "cupy.fft._fft", "cupy.fft.config", "cupy.linalg", "cupy.random", "cupy.testing",
                  "cupy_backends", "cupy_backends.cuda", "cupy_backends.cuda.api", "cupy_backends.cuda.api.runtime",
                  "cupy_backends.cuda.api.driver",
                  "cupyx", "cupyx.scipy", "cupyx.scipy.fft", "cupyx.scipy.ndimage", "cupyx.scipy.special",
@@ -126,6 +126,9 @@ def install():
         elif name.count(".") == 1 and name.startswith("cupy.") and isinstance(
                 getattr(xp, name.split(".")[1], None), types.ModuleType):
             m = getattr(xp, name.split(".")[1])        # a real module of the array layer
+        elif name in ("cupy.fft._fft", "cupy.fft.config"):
+            m = types.ModuleType(name)
+            m.__dict__.update(vars(getattr(xp.fft, name.rsplit(".", 1)[1])))
         elif name == "cupyx.scipy.special":
             m = _host_module(name, "scipy.special")
         elif name in ("cupy_backends.cuda.api.runtime", "cupy_backends.cuda.api.driver"):

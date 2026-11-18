@@ -27,9 +27,20 @@ def implements(*funcs):
     return deco
 
 
+def _has_complex(seq):
+    for x in seq:
+        if isinstance(x, (list, tuple)):
+            if _has_complex(x):
+                return True
+        elif getattr(getattr(x, "dtype", None), "kind", None) == "c" or isinstance(x, complex):
+            return True
+    return False
+
+
 def dispatch(func, args, kwargs):
     impl = _IMPL.get(func)
-    if impl is None:
+    if impl is None or _has_complex(args) or _has_complex(kwargs.values()):
+        # complex numbers: stored in unified memory, computed by NumPy on the CPU
         return host_call(func, args, kwargs)
     try:
         return impl(*args, **kwargs)

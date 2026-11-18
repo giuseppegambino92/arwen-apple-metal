@@ -150,7 +150,26 @@ class ndarray:
 
     @property
     def real(self):
-        return self
+        # a view, as NumPy's / CuPy's (complex: the real parts in place)
+        return _wrap(self._v.real, self._gpuwm_mem) if self.dtype.kind == "c" else self
+
+    @real.setter
+    def real(self, value):
+        assign(self.real, value)
+
+    @property
+    def imag(self):
+        if self.dtype.kind == "c":
+            return _wrap(self._v.imag, self._gpuwm_mem)
+        z = _empty(self.shape, self.dtype)
+        z.fill(0)
+        return z
+
+    @imag.setter
+    def imag(self, value):
+        if self.dtype.kind != "c":
+            raise TypeError("array does not have imaginary part to set")
+        assign(self.imag, value)
 
     @property
     def data(self):
@@ -284,6 +303,8 @@ class ndarray:
             k = k if isinstance(k, tuple) else (k,)
             return _wrap(self._v[k + (Ellipsis,)], self._gpuwm_mem)
         from . import _functions
+        if self.dtype.kind == "c":
+            return _functions.host_getitem(self, key)
         try:
             return _functions.advanced_getitem(self, key)
         except NotImplementedError:
@@ -298,6 +319,9 @@ class ndarray:
             assign(_wrap(self._v[k], self._gpuwm_mem), value)
             return
         from . import _functions
+        if self.dtype.kind == "c" or getattr(getattr(value, "dtype", None), "kind", None) == "c":
+            _functions.host_setitem(self, key, value)
+            return
         try:
             _functions.advanced_setitem(self, key, value)
         except NotImplementedError:
@@ -407,7 +431,9 @@ class ndarray:
         return np.rint(self, out=out)
 
     def conj(self):
-        return self
+        return np.conjugate(self) if self.dtype.kind == "c" else self
+
+    conjugate = conj
 
     def __matmul__(self, other):
         raise NotImplementedError("matmul on the Metal backend")
@@ -475,7 +501,7 @@ def _empty(shape, dtype=float, order="C"):
         shape = (int(shape),)
     shape = tuple(int(s) for s in shape)
     dtype = np.dtype(dtype)
-    if dtype.kind not in "biuf":
+    if dtype.kind not in "biufc":
         raise TypeError(f"dtype {dtype} is not supported on the Metal backend")
     n = 1
     for s in shape:
@@ -501,6 +527,14 @@ def assign(dst, src):
     """dst[...] = src on the GPU (broadcasting, casting like numpy's unsafe assignment)."""
     if not is_device(dst):
         raise TypeError("assignment target is not a device array")
+    if dst.dtype.kind == "c" or getattr(getattr(src, "dtype", None), "kind", None) == "c" or isinstance(src, complex):
+        # complex numbers: stored in unified memory, moved by NumPy on the CPU (no Metal kernel)
+        runtime.host_sync()
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
+            np.copyto(dst._v, src._v if is_device(src) else np.asarray(src), casting="unsafe")
+        return
     if isinstance(src, (numbers.Number, np.generic, bool)) or (isinstance(src, np.ndarray) and src.ndim == 0):
         if dst.size == 0:
             return
@@ -596,7 +630,7 @@ def array(obj, dtype=None, copy=True, order="K", subok=False, ndmin=0, blocking=
         from ._functions import stack
         return stack([array(x, dtype=dtype) for x in obj])
     h = np.array(obj, dtype=dtype, order=order if order in "CFAK" else "K", ndmin=ndmin)
-    if h.dtype.kind not in "biuf":
+    if h.dtype.kind not in "biufc":
         raise TypeError(f"cannot create a device array of dtype {h.dtype}")
     out = _empty(h.shape, h.dtype, "F" if (h.flags.f_contiguous and not h.flags.c_contiguous) else "C")
     if h.size:
