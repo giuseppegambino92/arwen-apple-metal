@@ -95,6 +95,9 @@ def install():
         elif name == "cupy._core.core":
             m = types.ModuleType(name)
             m.ndarray = xp.ndarray
+        elif name.count(".") == 1 and name.startswith("cupy.") and isinstance(
+                getattr(xp, name.split(".")[1], None), types.ModuleType):
+            m = getattr(xp, name.split(".")[1])        # a real module of the array layer
         else:
             m = _stub(name)
         sys.modules[name] = m

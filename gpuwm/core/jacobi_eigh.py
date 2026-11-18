@@ -215,12 +215,17 @@ def plan(k: int, dtype_str: str) -> Tier:
             " problems."
         )
     m = k + (k & 1)
-    global_work = k > SHARED_MAX_K
+    cap = _backend_shared_cap()
+    # Above SHARED_MAX_K, or where the backend's per-block shared memory cannot
+    # hold the two working copies (Apple GPUs: 32 KiB), the global-work tier.
+    global_work = k > SHARED_MAX_K or (
+        cap is not None and _shared_per_matrix(m, dtype.itemsize, False) > cap)
     threads = next(t for bound, t in _THREAD_TIERS if m <= bound)
     per_matrix = _shared_per_matrix(m, dtype.itemsize, global_work)
+    limit = _DEFAULT_SHARED_LIMIT if cap is None else min(_DEFAULT_SHARED_LIMIT, cap)
     if threads == 32:
         per_block = max(
-            1, min(_MAX_MATRICES_PER_BLOCK, _DEFAULT_SHARED_LIMIT // per_matrix))
+            1, min(_MAX_MATRICES_PER_BLOCK, limit // per_matrix))
     else:
         per_block = 1
     return Tier(
@@ -234,6 +239,16 @@ def plan(k: int, dtype_str: str) -> Tier:
         shared_bytes=per_matrix * per_block,
         global_work=global_work,
     )
+
+
+def _backend_shared_cap():
+    """Per-block shared memory the backend can grant, when it is below what the
+    CUDA tiers assume (the Metal backend: MTLDevice.maxThreadgroupMemoryLength,
+    32 KiB on Apple GPUs).  None on CUDA.  Reads no device."""
+    import os
+    if os.environ.get("GPUWM_BACKEND", "").strip().lower() != "metal":
+        return None
+    return int(os.environ.get("ARWEN_METAL_TG_LIMIT", "32768"))
 
 
 def supported(k: int, dtype) -> bool:

@@ -183,6 +183,16 @@ def host_sync():
 
 
 # --------------------------------------------------------------------- modules
+def tg_memory_limit() -> int:
+    """MTLDevice.maxThreadgroupMemoryLength (32 KiB on Apple GPU families 7-9)."""
+    global _TG_LIMIT
+    if _TG_LIMIT is None:
+        _TG_LIMIT = int(os.environ.get("ARWEN_METAL_TG_LIMIT") or rt().max_threadgroup_memory())
+    return _TG_LIMIT
+
+
+_TG_LIMIT = None
+
 _SLOW = None
 
 
@@ -361,6 +371,7 @@ class Kernel:
         self.info = module.meta["kernels"][name]
         self.pso = module.pipeline(name)
         self.max_threads = self.pso.max_threads
+        self.static_tg = int(self.pso.static_threadgroup_memory)
         self.splittable = not (self.info["uses_barrier"] or self.info["uses_shared"] or self.info["uses_warp"]
                                or self.info["dyn_shared"])
         self._layout = self.info["params"]
@@ -455,6 +466,12 @@ class Kernel:
                 split += 1
             bx //= split
             gx *= split
+        shared_mem = int(shared_mem)
+        if self.static_tg + shared_mem > tg_memory_limit():
+            # CUDA refuses such a launch ("too many resources requested"); Metal would
+            # run it with threadgroup memory cut short and compute garbage silently
+            raise KernelError(f"{self.name}: {self.static_tg} B static + {shared_mem} B dynamic threadgroup memory "
+                              f"exceeds this GPU's {tg_memory_limit()} B per threadgroup")
         global _pending
         check = bool(_NANCHECK)
         if check:

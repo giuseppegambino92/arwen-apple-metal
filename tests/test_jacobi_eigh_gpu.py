@@ -464,10 +464,14 @@ def test_sizes_above_64_take_the_global_tier(k):
 
 def test_the_shared_tiers_compile_from_the_define_tuple_they_always_had():
     """No shared tier gains the global define, so none of them changes."""
-    from gpuwm.core.jacobi_eigh import SHARED_MAX_K, plan
+    from gpuwm.core.jacobi_eigh import SHARED_MAX_K, _backend_shared_cap, plan
 
     for k in range(2, SHARED_MAX_K + 1):
         tier = plan(k, np.dtype(np.float64).str)
+        if tier.global_work and _backend_shared_cap() is not None:
+            # a backend whose per-block shared memory cannot hold the two working
+            # copies (Metal: 32 KiB) takes the global tier there, by design
+            continue
         assert not tier.global_work
         assert [name for name, _ in tier.defines] == [
             "JACOBI_K", "JACOBI_TPB", "JACOBI_MPB", "JACOBI_SWEEPS",

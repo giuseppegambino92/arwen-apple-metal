@@ -192,6 +192,7 @@ struct Runtime {
     }
 
     std::string name() const { return std::string([[dev name] UTF8String]); }
+    int64_t max_threadgroup_memory() const { return (int64_t)[dev maxThreadgroupMemoryLength]; }
 
     Buffer* alloc(size_t nbytes) {
         std::lock_guard<std::recursive_mutex> g(mu);
@@ -467,6 +468,7 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def_rw("eager", &Runtime::eager)
         .def_rw("pool_cap", &Runtime::pool_cap)
         .def("pool_release", &Runtime::pool_release)
+        .def("max_threadgroup_memory", &Runtime::max_threadgroup_memory)
         .def("pool_blocks", &Runtime::pool_blocks)
         .def_rw("timeline", &Runtime::timeline)
         .def("set_order_mode", [](Runtime& r, int m) {

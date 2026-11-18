@@ -129,7 +129,44 @@ def _unimplemented_module(name):
 
 
 fft = _unimplemented_module("cupy.fft")
-linalg = _unimplemented_module("cupy.linalg")
+def _linalg_module():
+    """cupy.linalg on Metal: Apple GPUs have no LAPACK (no cuSOLVER equivalent), so
+    these run numpy.linalg (LAPACK on the CPU) on the same unified memory, after the
+    GPU is done with the operands, and return device arrays.  Declared, not silent:
+    the first call prints which routine ran on the CPU."""
+    import sys as _sys
+    import numpy as _np
+    m = _types.ModuleType("cupy.linalg")
+    told = set()
+
+    def wrap(name):
+        fn = getattr(_np.linalg, name)
+
+        def f(*args, **kw):
+            if name not in told:
+                told.add(name)
+                print(f"[arwen-metal] cupy.linalg.{name}: LAPACK on the CPU (unified memory; "
+                      "Metal has no GPU LAPACK)", file=_sys.stderr)
+            host = [asnumpy(a) if is_device(a) else a for a in args]
+            out = fn(*host, **kw)
+            if isinstance(out, tuple):
+                return type(out)(*(asarray(x) if isinstance(x, _np.ndarray) else x for x in out)) \
+                    if hasattr(out, "_fields") else tuple(asarray(x) if isinstance(x, _np.ndarray) else x for x in out)
+            return asarray(out) if isinstance(out, _np.ndarray) else out
+        f.__name__ = name
+        return f
+    for name in ("eigh", "eigvalsh", "solve", "inv", "norm", "det", "slogdet", "cholesky", "qr", "svd",
+                 "lstsq", "pinv", "matrix_rank", "matrix_power"):
+        setattr(m, name, wrap(name))
+    m.LinAlgError = _np.linalg.LinAlgError
+
+    def __getattr__(attr):
+        raise NotImplementedError(f"cupy.linalg.{attr} on the Metal backend")
+    m.__getattr__ = __getattr__
+    return m
+
+
+linalg = _linalg_module()
 random = _unimplemented_module("cupy.random")
 def _testing_module():
     """cupy.testing's array assertions: device operands are read back (after the GPU
