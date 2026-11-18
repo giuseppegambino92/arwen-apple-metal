@@ -39,9 +39,11 @@ def _props():
     r = _rt_module.rt()
     total = int(r.stats()["recommended_max_working_set"])
     return {"name": r.name.encode(), "totalGlobalMem": total, "multiProcessorCount": 30,
-            "maxThreadsPerBlock": 1024, "sharedMemPerBlock": 32768, "sharedMemPerBlockOptin": 32768,
+            "maxThreadsPerBlock": 1024, "maxThreadsPerMultiProcessor": 1024, "maxBlocksPerMultiProcessor": 32,
+            "concurrentKernels": 1, "asyncEngineCount": 0, "unifiedAddressing": 1, "managedMemory": 1,
+            "ECCEnabled": 0, "computeMode": 0, "totalConstMem": 65536, "sharedMemPerBlock": 32768, "sharedMemPerBlockOptin": 32768,
             "sharedMemPerMultiprocessor": 65536, "regsPerBlock": 65536, "warpSize": 32,
-            "major": 0, "minor": 0, "clockRate": 1398000, "memoryClockRate": 0, "memoryBusWidth": 512,
+            "major": 12, "minor": 0, "clockRate": 1398000, "memoryClockRate": 0, "memoryBusWidth": 512,
             "l2CacheSize": 0, "maxThreadsDim": (1024, 1024, 1024), "maxGridSize": (2**31 - 1, 65535, 65535),
             "integrated": 1, "canMapHostMemory": 1, "pciBusID": 0, "pciDeviceID": 0, "pciDomainID": 0,
             "uuid": b"apple-metal-gpu0", "gcnArchName": b"apple-metal"}
@@ -264,6 +266,7 @@ class Stream:
     def __init__(self, null=False, non_blocking=False, ptds=False, priority=None):
         self.ptr = 0 if null else id(self)
         self.device_id = 0
+        self.priority = int(priority or 0)     # one Metal queue: priorities are recorded, not enforced
 
     def synchronize(self):
         _rt_module.synchronize()
