@@ -117,10 +117,16 @@ def _expr(name, loop, nin):
         e = "x0 && x1" if b else "x0 * x1"
     elif name in _CMP:
         e = f"x0 {_CMP[name]} x1"
+    elif name in ("maximum", "minimum") and f:
+        # CuPy's float maximum/minimum (cupy/_math/misc.py): any NaN gives NAN,
+        # __int_as_float(0x7fffffff) converted to the loop type, else CUDA's
+        # max/min (fmaxf/fminf: -0 < +0)
+        fn = ("fmaxf" if dt.itemsize == 4 else "fmax") if name == "maximum" else ("fminf" if dt.itemsize == 4 else "fmin")
+        e = f"(isnan(x0) || isnan(x1)) ? ({T})__int_as_float(0x7fffffff) : ({T}){fn}(x0, x1)"
     elif name == "maximum":
-        e = "(x0 >= x1 || x0 != x0) ? x0 : x1" if f else "(x0 >= x1) ? x0 : x1"
+        e = "(x0 >= x1) ? x0 : x1"
     elif name == "minimum":
-        e = "(x0 <= x1 || x0 != x0) ? x0 : x1" if f else "(x0 <= x1) ? x0 : x1"
+        e = "(x0 <= x1) ? x0 : x1"
     elif name == "fmax":
         e = "(x0 >= x1 || x1 != x1) ? x0 : x1" if f else "(x0 >= x1) ? x0 : x1"
     elif name == "fmin":

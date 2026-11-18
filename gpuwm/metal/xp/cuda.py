@@ -157,6 +157,17 @@ def _memcpy2d(dst, dpitch, src, spitch, width, height, kind, stream=0):
 runtime_ns.memcpy2DAsync = _captured(_memcpy2d)
 runtime_ns.memcpy2D = lambda dst, dpitch, src, spitch, width, height, kind: _memcpy2d(
     dst, dpitch, src, spitch, width, height, kind)
+def _launch_host_func(stream, callback, arg):
+    """cudaLaunchHostFunc: ``callback(arg)`` after the work queued before it (in
+    capture order when a CUDA graph is being captured)."""
+    if _rt_module.CAPTURE is not None:
+        _rt_module.CAPTURE.append(("host", lambda: callback(arg)))
+        return
+    _rt_module.synchronize()
+    callback(arg)
+
+
+runtime_ns.launchHostFunc = _launch_host_func
 runtime_ns.memcpy3DAsync = _memcpy3d
 runtime_ns.memcpy3D = lambda params: _memcpy3d(params)
 

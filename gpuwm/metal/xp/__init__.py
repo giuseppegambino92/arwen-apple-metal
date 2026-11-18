@@ -208,16 +208,43 @@ def _random_module():
         fn = getattr(_np.random, attr, None)
         if fn is None or attr.startswith("_"):
             raise NotImplementedError(f"cupy.random.{attr} on the Metal backend")
-        if isinstance(fn, type):           # Generator, RandomState, ...: host objects
+        if attr in ("RandomState", "Generator", "default_rng"):
+            return _device_generator(fn)
+        if isinstance(fn, type):           # other host classes
             return fn
 
         def f(*args, **kw):
-            return _F.host_call(fn, args, kw)
+            dtype = kw.pop("dtype", None)        # CuPy's generators take dtype=; NumPy's module functions do not
+            r = _F.host_call(fn, args, kw)
+            return r.astype(dtype) if dtype is not None and hasattr(r, "astype") else r
         f.__name__ = attr
         setattr(m, attr, f)
         return f
     m.__getattr__ = __getattr__
     return m
+
+
+def _device_generator(factory):
+    """cupy.random.RandomState / default_rng: NumPy's generator on the CPU whose
+    draws come back as device arrays and accept CuPy's ``dtype=``."""
+    class _Gen:
+        def __init__(self, *a, **k):
+            self._g = factory(*a, **k)
+
+        def __getattr__(self, name):
+            meth = getattr(self._g, name)
+            if not callable(meth):
+                return meth
+
+            def f(*args, **kw):
+                dtype = kw.pop("dtype", None)
+                r = meth(*args, **kw)
+                if isinstance(r, _np.ndarray) or isinstance(r, _np.generic):
+                    r = asarray(_np.asarray(r) if dtype is None else _np.asarray(r).astype(dtype))
+                return r
+            return f
+    _Gen.__name__ = getattr(factory, "__name__", "Generator")
+    return _Gen
 
 
 random = _random_module()
