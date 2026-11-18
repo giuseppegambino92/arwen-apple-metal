@@ -336,6 +336,16 @@ ARWEN_ATOMIC_INT(threadgroup, uint, atomic_uint)
                              : metal::atomic_load_explicit(&w[1], metal::memory_order_relaxed);           \
         return (T)(((ulong)old_hi << 32) | old_lo);                                                       \
     }
+// 64-bit compare-and-swap does not exist on Apple GPUs (families 7-9 have no 64-bit
+// CAS, only min/max), and no 32-bit emulation is safe for readers of the word:
+// fail at compile time with the reason instead of an overload error.
+template <typename T> struct __arwen_no_cas64 { static constant bool value = false; };
+template <typename P, typename T>
+inline T atomicCAS(P p, T cmp, T v) {
+    static_assert(__arwen_no_cas64<T>::value,
+                  "64-bit atomicCAS: Apple GPUs have no 64-bit compare-and-swap (see docs/metal-README.md)");
+    return v;
+}
 ARWEN_ATOMIC_ADD64(device, ulong)
 ARWEN_ATOMIC_ADD64(device, long)
 ARWEN_ATOMIC_ADD64(threadgroup, ulong)
