@@ -1,10 +1,11 @@
 # Metal backend (Apple Silicon) — design notes and measurements
 
-Status: **in progress**. Milestones 1–2 (environment, CUDA→MSL translator)
-done; Milestone 3 (runtime, `xp` layer, `--backend metal`) working end to end
-up to the first model step; Milestone 4 (cu6 Tiedtke) bit-exact on the M3 Max; kernel parity and the real run (Milestones 4–7)
-not yet — the first physics step currently produces non-finite RRTMG LW and
-MYNN tendencies.
+Status (2026-11-18): **working**.  A real two-nest forecast (Thompson, MYNN,
+RRTMG, Noah, Tiedtke) runs end to end on an M3 Max, agrees with the RTX 5090
+run within round-off growth (tables below), and is deterministic bit for bit;
+every CUDA unit in the tree builds on Metal (see "Coverage of the whole kernel
+tree").  The sections below are in the order the work was done, so early
+sections describe states that later ones supersede.
 
 The CUDA sources stay canonical. `gpuwm/metal/` translates, at build/JIT
 time, exactly the source string gpuwm hands to NVRTC; nothing on the Metal
@@ -347,21 +348,30 @@ again bit-identical to the pre-optimization run.
 Two gates build every CUDA unit in the repository on Metal (`sf64`, `xcrun metal -O3`):
 
 * `tools/metal/compile_all_units.py`: each `gpuwm/core/kernels/*.cu` assembled the
-  generic way (`kernels.module_source` / `module_options`): **306 of 342 units,
-  1 427 kernels**.  Of the 36 others, 33 are composed by a scheme's own loader
-  (they do not parse alone: their loader prepends helpers or macros) and 3 fail
-  (below).
+  generic way (`kernels.module_source` / `module_options`): **309 of 342
+  units**.  The other 33 are composed by a scheme's own loader (they do not
+  parse alone: their loader prepends helpers or macros).
 * `tools/metal/compile_loader_units.py`: the units composed by production
   loaders (`kernel_prewarm`'s composed/device/KF loaders, preflight's
   production-loaded units, SFIRE, snow optics, P3 reflectivity, vortex
   initialisation, integer tiers, `*_default` sources), called with
-  `GPUWM_BACKEND=metal`: **45 of 46** in the default numerics, **45 of 46** with
-  `GPUWM_WRF_EXACT=1`.
+  `GPUWM_BACKEND=metal`: **46 of 46** in the default numerics and **46 of 46**
+  with `GPUWM_WRF_EXACT=1`.
 
-Not yet translated (a `TranslationError` / MSL error, never a silent fallback):
-`flg_column`, `gsfcsw`, `goddard` — their array views (`FLGPtr<T>`,
-`gsfc_ptr<T>`, `GArray<T,R>`) wrap both thread-local storage arrays and device
-workspace in ONE struct type, and an MSL pointer member has one address space.
+The last three to translate were FLG, GSFC SW and Goddard radiation: their
+array views (`FLGPtr<T>`, `gsfc_ptr<T>`, `GArray<T,R>`) wrap both thread-local
+storage and device workspace in one struct type, and an MSL pointer member has
+one address space.  `parametrize_views` makes the pointer type a template
+parameter (`class __ARWEN_AP = device T*`) and spells the views built over
+local storage with `thread T*`; rank conversions between views become explicit
+(`__arwen_rank<S>()`).  Production modules are unchanged by it (the 233 MSL
+modules of the operational run are byte-identical).
+
+libclang's `Cursor.hash` is 32 bits and collides in large units (thompson 1,
+goddard 10, cam3_emissivity 44 colliding hashes measured); the translator now
+identifies a node by (hash, kind, location) — the location, unlike the extent,
+is the same for a declaration reached through `referenced` (101 of 9 273
+extents differ in thompson, no location does).
 
 Translator constructs added for this coverage are checked for exactness
 against native clang on the host: `tests/metal/translator_features_check.py`
