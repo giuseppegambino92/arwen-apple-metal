@@ -139,7 +139,21 @@ Each piece has a check with a declared tolerance and a measured result:
 | `goto` elimination vs native clang (`tests/metal/goto_semantics_check.py`) | 8 shapes incl. SSiB NEWTON and a jump into a sibling branch (Noah-MP), 0 differing words |
 | Kain-Fritsch (KF-CuP) columns vs WRF's Fortran oracle, `GPUWM_WRF_EXACT=1` | 0 differing words, 5 configurations |
 | glibc libm fast paths (`tools/metal/verify_fastlibm.py`) | all 2³² inputs per routed function, 0 mismatches |
-| ArWen's own GPU test suite on Metal | GPU_SUITE_LINE |
+| ArWen's own GPU test suite on Metal (13 458 tests) | 723 failing (5.4 %), every other test passing or skipped — by cause below (2026-11-18) |
+
+What the 723 failing GPU tests are (2026-11-18; a confirmation rerun of
+their 174 files is under way):
+
+| cause | tests | applies to Metal? |
+|---|---|---|
+| CUDA-only machinery: PTX / NVRTC-direct compiles, nvJitLink, cubin | 212 | no — there is no PTX on Metal |
+| SHA-256 pins of CUDA's output words (they encode `ptxas` FMA choices) | 57 | no — Metal is often closer to the WRF oracle |
+| ArWen test/code drift in 3.0.3 (configs missing attributes the code reads) | 48 | no — fails on any backend |
+| data, tools or environment present only on the CUDA machine or on Linux | 44 | no |
+| CPU references computed on the Mac (Apple libm, NumPy arm64) | 34 | no — Metal matches glibc there |
+| CUDA introspection (local frames, registers, NVRTC builtins) | 22 | no |
+| Apple's compiler service dropping XPC under a parallel run | 9 | flaky; rerun alone passes |
+| Metal-side, to investigate | 297 | yes — part already fixed after the measuring run |
 
 Two checks caught real defects that compiled cleanly: overlapping backward
 `goto` regions jumping to the wrong label (SSiB), and kernels launched with
