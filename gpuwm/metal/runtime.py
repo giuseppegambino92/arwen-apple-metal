@@ -173,8 +173,11 @@ def synchronize():
     global _pending
     if _pending and os.environ.get("ARWEN_METAL_SYNC_TRACE") == "1":
         _trace_sync()
+    seen = _GEN[0]
     rt().synchronize()
-    _pending = False
+    if _GEN[0] == seen:
+        # nothing was queued by another thread while we waited (free-threaded Python)
+        _pending = False
     if rt().status_take():
         raise RuntimeError("metal: a kernel executed a device-side trap (CUDA __trap() / asm(\"trap;\")) "
                            "since the last synchronization: its results are invalid")
@@ -199,8 +202,35 @@ def tg_memory_limit() -> int:
 
 _TG_LIMIT = None
 
-#: the work being captured into a CUDA graph (gpuwm.metal.xp.cuda.Stream.begin_capture)
-CAPTURE = None
+#: the work being captured into a CUDA graph (gpuwm.metal.xp.cuda.Stream.begin_capture),
+#: per thread: a capture records its own stream's work, not other threads'.
+#: Read as ``runtime.CAPTURE`` (module __getattr__) or capture(); set by set_capture().
+_CAP = threading.local()
+
+
+def capture():
+    return getattr(_CAP, "ops", None)
+
+
+def set_capture(ops):
+    _CAP.ops = ops
+
+
+def __getattr__(name):
+    if name == "CAPTURE":
+        return capture()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+#: bumped after every dispatch; synchronize() leaves _pending set when another
+#: thread queued work while it waited
+_GEN = [0]
+
+
+def _mark_pending():
+    global _pending
+    _GEN[0] += 1
+    _pending = True
 
 
 def replay(ops):
@@ -208,8 +238,8 @@ def replay(ops):
     global _pending
     for op in ops:
         if op[0] == "dispatch":
-            _pending = True
             rt().dispatch(*op[1])
+            _mark_pending()
         else:
             synchronize()            # a host step reads what the GPU work before it wrote
             op[1]()
@@ -336,9 +366,8 @@ class Module:
             ctypes.memset(self.globals.cpu, 0, gsize)          # CUDA zero-initialises __device__ data
             if "__arwen_init_globals" in self.library.function_names():
                 p = self.pipeline("__arwen_init_globals")       # same -O3 / -Os policy as kernels
-                global _pending
-                _pending = True
                 rt().dispatch(p, b"", _launch(1, 1, 1, 1, 1, 1, 1), self.globals.buf, 1, 1, 1, 1, 1, 1, 0)
+                _mark_pending()
 
     def pipeline(self, name):
         p = self._pipelines.get(name)
@@ -562,12 +591,13 @@ class Kernel:
             self.module.heap_reset.launch((1, 1, 1), (1, 1, 1), ())
         call = (self.pso, self.pack(args), _launch(grid[0], grid[1], grid[2], block[0], block[1], block[2], split),
                 g, gx, gy, gz, bx, by, bz, int(shared_mem))
-        if CAPTURE is not None:
+        cap = capture()
+        if cap is not None:
             # CUDA-graph capture: recorded with its arguments, run by Graph.launch
-            CAPTURE.append(("dispatch", call, self, args))   # args keep the operands' memory alive
+            cap.append(("dispatch", call, self, args))   # args keep the operands' memory alive
             return
-        _pending = True
         rt().dispatch(*call)
+        _mark_pending()
         if _SYNC_EACH:
             synchronize()
         if check:

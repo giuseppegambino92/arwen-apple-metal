@@ -297,15 +297,15 @@ def isclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):
 
 @implements(np.allclose)
 def allclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):
-    return bool(U.reduce("logical_and", isclose(a, b, rtol, atol, equal_nan)))
+    return U.reduce("logical_and", isclose(a, b, rtol, atol, equal_nan))      # a 0-d array, as CuPy
 
 
 @implements(np.array_equal)
 def array_equal(a1, a2, equal_nan=False):
     a1, a2 = _dev(a1), _dev(a2)
     if a1.shape != a2.shape:
-        return False
-    return bool(U.reduce("logical_and", U.call(np.equal, (a1, a2))))
+        return asarray(np.bool_(False))
+    return U.reduce("logical_and", U.call(np.equal, (a1, a2)))                 # a 0-d array, as CuPy
 
 
 @implements(np.diff)
@@ -365,7 +365,7 @@ def count_nonzero(a, axis=None, keepdims=False):
     a = _dev(a)
     nz = U.call(np.not_equal, (a, a.dtype.type(0)))
     r = U.reduce("add", nz, axis=axis, dtype=np.int64, keepdims=keepdims)
-    return int(r) if axis is None and not keepdims else r
+    return r                                                                   # a 0-d array, as CuPy
 
 
 @implements(np.argmax)

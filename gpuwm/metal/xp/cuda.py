@@ -313,11 +313,12 @@ class Stream:
         recorded with their arguments instead of run (as on CUDA)."""
         if _rt_module.CAPTURE is not None:
             raise CUDARuntimeError(900, "a stream is already capturing")
-        _rt_module.CAPTURE = []
+        _rt_module.set_capture([])
         self._capturing = True
 
     def end_capture(self):
-        ops, _rt_module.CAPTURE = _rt_module.CAPTURE or [], None
+        ops = _rt_module.CAPTURE or []
+        _rt_module.set_capture(None)
         self._capturing = False
         return Graph(ops)
 
