@@ -213,6 +213,7 @@ python tests/metal/translator_features_check.py      # and the other tests/metal
 | `ARWEN_METAL_OPT=-Os` | build every kernel from `-Os` AIR |
 | `ARWEN_METAL_KEEP_FAILED=dir` | keep the MSL of a module that failed to compile |
 | `ARWEN_METAL_CACHE=dir` | cache directory (default `~/.cache/arwen-metal`) |
+| `ARWEN_METAL_STRICT_GLIBC=1` | default forecasts keep ArWen's glibc-exact libm copies in KF-CuP, SSiB, NSSL2 and the 2-D Smagorinsky exp instead of Metal's native float math: word-exact against WRF's oracles (KF 5/5 configurations), about 2.4x slower in KF |
 | `ARWEN_METAL_NVRTC_VERSION=13.4` | the NVRTC version reported to code that selects CUDA-toolchain-measured tables (default 13.4, with compute capability 12.0: Metal is gated by the RTX 5090 rows) |
 
 ## Known limitations
@@ -240,8 +241,10 @@ python tests/metal/translator_features_check.py      # and the other tests/metal
     anything), Linux-only tools (`troute_mc_replay`, a ptrace tracer), data
     recorded on the CUDA machine (`HYDRO_CLOCK_BASELINE`);
   - ArWen's default (non-exact) numerics in Kain-Fritsch: with the GPU's own
-    `expf`/`powf` and FMA, KF's thresholds amplify last-bit differences past the
-    tolerance measured for CUDA (in exact mode it is word for word).
+    `expf`/`powf`, KF's thresholds amplify Metal-vs-CUDA last-bit differences
+    past the tolerance measured for CUDA.  This is the deliberate default (the
+    native math is 2.4x faster); `ARWEN_METAL_STRICT_GLIBC=1` or
+    `GPUWM_WRF_EXACT=1` make KF word-exact against WRF's Fortran oracle.
 * **Some NumPy functions run on the CPU.**  Functions the array layer has no
   Metal kernel for (`sort`, `unique`, `median`, `linalg`, …) run in NumPy on
   the same unified memory, declared on first use; none is on the forecast's
