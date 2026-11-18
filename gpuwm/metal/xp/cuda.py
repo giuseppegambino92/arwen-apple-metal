@@ -115,7 +115,7 @@ def _pointer_attributes(ptr):
     p = int(ptr)
     for m in list(_PINNED):
         if m.ptr <= p < m.ptr + max(m.size, 1):
-            return types.SimpleNamespace(type=1, device=0, devicePointer=p, hostPointer=p)
+            return types.SimpleNamespace(type=1, device=0, devicePointer=m._dm.gpu + (p - m.ptr), hostPointer=p)
     for mem in _rt_module.live_memories():
         if mem.gpu <= p < mem.gpu + mem.nbytes:
             return types.SimpleNamespace(type=2, device=0, devicePointer=p, hostPointer=mem.cpu + (p - mem.gpu))
@@ -167,7 +167,8 @@ class _HostBlock:
     reports it as host (pinned) memory, as CUDA does."""
 
     def __init__(self, size):
-        self._a = np.empty(max(int(size), 1), dtype=np.uint8)
+        self._dm = _rt_module.DeviceMemory(max(int(size), 1))   # shared storage: GPU-mapped as well
+        self._a = np.frombuffer(self._dm, dtype=np.uint8)
         self.ptr, self.size = self._a.ctypes.data, int(size)
 
 
@@ -550,7 +551,10 @@ class PinnedMemoryPointer:
     usable; this keeps CuPy's interface (buffer protocol, .ptr, .size)."""
 
     def __init__(self, size):
-        self._a = np.empty(max(int(size), 1), dtype=np.uint8)
+        # a shared-storage Metal buffer: on Apple silicon "pinned host memory" is
+        # device-accessible as is (CUDA's mapped pinned memory), at its GPU address
+        self._dm = _rt_module.DeviceMemory(max(int(size), 1))
+        self._a = np.frombuffer(self._dm, dtype=np.uint8)
         self.size = int(size)
         self.ptr = self._a.ctypes.data
         self.mem = self
@@ -581,6 +585,10 @@ class UnownedMemory:
         from ._core import MemoryPointer as _MP
         self.buffer = ptr.mem if isinstance(ptr, _MP) else getattr(owner, "_gpuwm_mem", None)
         self.ptr = int(ptr.ptr) if isinstance(ptr, _MP) else ptr
+        if self.buffer is None:
+            # a GPU address inside a live Metal buffer (mapped pinned memory, a pool block, ...)
+            p = int(self.ptr)
+            self.buffer = next((m for m in _rt_module.live_memories() if m.gpu <= p < m.gpu + max(m.nbytes, 1)), None)
         if self.buffer is not None and not (self.buffer.gpu <= int(self.ptr) <= self.buffer.gpu + self.buffer.nbytes):
             raise ValueError("UnownedMemory: the address is not inside its owner's Metal buffer")
         self.size, self.owner = size, owner
