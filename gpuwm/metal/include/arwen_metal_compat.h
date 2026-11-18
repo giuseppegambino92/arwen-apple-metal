@@ -11,6 +11,16 @@
 // exactly one definition, so no call can silently bind to a Metal function
 // with different semantics.
 #pragma once
+#ifndef NULL
+#define NULL 0
+#endif
+#define __ARWEN_AS_BASE_REF(...)
+#define __align__(n) __attribute__((aligned(n)))
+// flatten_inheritance's by-value base conversion: array members element by element
+template <typename T> inline void __arwen_acopy(thread T& d, thread const T& s) { d = s; }
+template <typename T, int N> inline void __arwen_acopy(thread T (&d)[N], thread const T (&s)[N]) {
+    for (int i = 0; i < N; ++i) __arwen_acopy(d[i], s[i]);
+}
 #include <metal_stdlib>
 
 // ------------------------------------------------------------------ keywords
@@ -65,14 +75,17 @@ struct __arwen_ctx_t {
     uint lane;
     bool inactive;
     device uchar* g;
+    device metal::atomic_uint* status; // device-side abort word (CUDA __trap), checked by the host after a sync
     threadgroup uchar* dsmem;   // extern __shared__ (dynamic size)
     threadgroup uchar* ssmem;   // static __shared__ declared inside __device__ functions
 };
 inline __arwen_ctx_t __arwen_make_ctx(constant __arwen_launch_t& L, uint3 tid, uint3 bid, uint3 bdim, uint3 gdim,
-                                      uint lane, device uchar* g, threadgroup uchar* dsmem, threadgroup uchar* ssmem) {
+                                      uint lane, device uchar* g, device metal::atomic_uint* status,
+                                      threadgroup uchar* dsmem, threadgroup uchar* ssmem) {
     __arwen_ctx_t c;
     c.lane = lane;
     c.g = g;
+    c.status = status;
     c.dsmem = dsmem;
     c.ssmem = ssmem;
     if (L.split <= 1) {
@@ -243,6 +256,35 @@ inline uint __ballot_sync(thread const __arwen_ctx_t&, uint mask, int pred) {
     return (uint)((ulong)(metal::simd_vote::vote_t)metal::simd_ballot(pred != 0)) & mask;
 }
 inline int __any_sync(thread const __arwen_ctx_t&, uint, int pred) { return metal::simd_any(pred != 0); }
+inline uint __activemask(thread const __arwen_ctx_t&) {
+    return (uint)((ulong)(metal::simd_vote::vote_t)metal::simd_active_threads_mask());
+}
+// CUDA __trap(): Metal has no abort, so the kernel raises the abort word and the
+// host turns it into an error at the next synchronization (as CUDA reports a trap).
+inline void __trap(thread const __arwen_ctx_t& c) {
+    metal::atomic_fetch_or_explicit(c.status, 1u, metal::memory_order_relaxed);
+}
+#ifdef ARWEN_SYNCRED_OFF
+// __syncthreads_or/and/count: a block-wide vote through one threadgroup word
+inline int __arwen_syncthreads_vote(thread const __arwen_ctx_t& c, int pred, int op) {
+    threadgroup metal::atomic_uint* w = (threadgroup metal::atomic_uint*)(c.ssmem + ARWEN_SYNCRED_OFF);
+    if ((c.tid.x | c.tid.y | c.tid.z) == 0)
+        metal::atomic_store_explicit(w, op == 1 ? 1u : 0u, metal::memory_order_relaxed);
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup | metal::mem_flags::mem_device);
+    if (op == 0 && pred) metal::atomic_fetch_or_explicit(w, 1u, metal::memory_order_relaxed);
+    if (op == 1 && !pred) metal::atomic_store_explicit(w, 0u, metal::memory_order_relaxed);
+    if (op == 2 && pred) metal::atomic_fetch_add_explicit(w, 1u, metal::memory_order_relaxed);
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup | metal::mem_flags::mem_device);
+    uint r = metal::atomic_load_explicit(w, metal::memory_order_relaxed);
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    return op == 2 ? (int)r : (r != 0u ? 1 : 0);
+}
+inline int __syncthreads_or(thread const __arwen_ctx_t& c, int pred) { return __arwen_syncthreads_vote(c, pred, 0); }
+inline int __syncthreads_and(thread const __arwen_ctx_t& c, int pred) { return __arwen_syncthreads_vote(c, pred, 1); }
+inline int __syncthreads_count(thread const __arwen_ctx_t& c, int pred) { return __arwen_syncthreads_vote(c, pred, 2); }
+#endif
+// device printf: Metal kernels cannot print; CUDA's diagnostic prints are dropped
+template <typename... A> inline int printf(constant char*, A...) { return 0; }
 inline int __all_sync(thread const __arwen_ctx_t&, uint, int pred) { return metal::simd_all(pred != 0); }
 
 // ------------------------------------------------------------------ atomics
@@ -341,6 +383,13 @@ inline float __fdividef(float a, float b) { return metal::fast::divide(a, b); }
 inline float __expf(float a) { return metal::fast::exp(a); }
 inline float __logf(float a) { return metal::fast::log(a); }
 inline float __powf(float a, float b) { return metal::fast::pow(a, b); }
+// PTX ``setp.<op>.f32`` written in inline asm without ``.ftz``: subnormal operands
+// compare exactly whatever the module's --ftz, and every one of these comparison
+// operators is ORDERED (false when either operand is NaN), ``ne`` included
+// (``neu`` would be the unordered one).
+#define ARWEN_FCMPU(op) inline uint __arwen_fcmp_u32_##op(float a, float b) { return __arwen_f##op(a, b) ? 1u : 0u; }
+ARWEN_FCMPU(lt) ARWEN_FCMPU(le) ARWEN_FCMPU(gt) ARWEN_FCMPU(ge) ARWEN_FCMPU(eq)
+inline uint __arwen_fcmp_u32_ne(float a, float b) { return (!metal::isnan(a) && !metal::isnan(b) && __arwen_fne(a, b)) ? 1u : 0u; }
 inline uint __arwen_fgt_u32(float a, float b) {
 #if ARWEN_FTZ
     return a > b ? 1u : 0u;
@@ -624,18 +673,47 @@ ARWEN_ATOMIC_BIT64(atomicXor, atomic_fetch_xor_explicit)
 // A read-only pointer that CUDA code re-points between global and shared
 // memory (e.g. a tile staged in shared memory).  The space is a run-time tag;
 // the branch is uniform across the SIMD-group in the code that uses it.
+// A pointer to const data re-pointed at run time between objects in different
+// address spaces (device / threadgroup / constant / thread): reads only.
 template <typename T> struct __arwen_gptr {
+    typedef metal::remove_cv_t<T> V;
     device T* d;
     threadgroup T* t;
-    __arwen_gptr() : d(nullptr), t(nullptr) {}
-    __arwen_gptr(metal::nullptr_t) : d(nullptr), t(nullptr) {}
-    __arwen_gptr(device T* p) : d(p), t(nullptr) {}
-    __arwen_gptr(threadgroup T* p) : d(nullptr), t(p) {}
-    T operator[](long i) const { return t ? t[i] : d[i]; }
-    T operator*() const { return t ? t[0] : d[0]; }
-    __arwen_gptr operator+(long n) const { __arwen_gptr r = *this; if (t) r.t = t + n; else r.d = d + n; return r; }
-    bool operator==(metal::nullptr_t) const { return !t && !d; }
-    bool operator!=(metal::nullptr_t) const { return t || d; }
+    constant T* c;
+    thread T* h;
+    struct arrow {
+        V v;
+        thread const V* operator->() const thread { return &v; }
+    };
+    __arwen_gptr() : d(nullptr), t(nullptr), c(nullptr), h(nullptr) {}
+    __arwen_gptr(metal::nullptr_t) : d(nullptr), t(nullptr), c(nullptr), h(nullptr) {}
+    __arwen_gptr(device T* p) : d(p), t(nullptr), c(nullptr), h(nullptr) {}
+    __arwen_gptr(threadgroup T* p) : d(nullptr), t(p), c(nullptr), h(nullptr) {}
+    __arwen_gptr(constant T* p) : d(nullptr), t(nullptr), c(p), h(nullptr) {}
+    __arwen_gptr(thread T* p) : d(nullptr), t(nullptr), c(nullptr), h(p) {}
+    V operator[](long i) const { return t ? V(t[i]) : c ? V(c[i]) : h ? V(h[i]) : V(d[i]); }
+    V operator*() const { return (*this)[0]; }
+    arrow operator->() const { return arrow{(*this)[0]}; }
+    __arwen_gptr operator+(long n) const {
+        __arwen_gptr r = *this;
+        if (t) r.t = t + n; else if (c) r.c = c + n; else if (h) r.h = h + n; else r.d = d + n;
+        return r;
+    }
+    __arwen_gptr operator-(long n) const { return *this + (-n); }
+    bool operator==(metal::nullptr_t) const { return !t && !d && !c && !h; }
+    bool operator!=(metal::nullptr_t) const { return t || d || c || h; }
 };
+
+// Overloads on pointee type (``f(float*)`` / ``f(double*)``) whose pointer parameters
+// the translator made generic: P must point to T (address space and cv aside).
+// ``(c ? a : b) = v`` with a, b in different address spaces (see edit_conditional_lvalues)
+template <typename F, typename G, typename V> inline void __arwen_sel_assign(bool c, F f, G g, V v) {
+    if (c) f(v); else g(v);
+}
+// ``template <class R> f(const R* p)`` with p made generic: R is p's pointee.
+template <typename P> using __arwen_pointee_t = metal::remove_cv_t<metal::remove_addrspace_t<metal::remove_pointer_t<P>>>;
+template <typename P, typename T> constexpr bool __arwen_points_to() {
+    return metal::is_same_v<metal::remove_cv_t<metal::remove_addrspace_t<metal::remove_pointer_t<P>>>, T>;
+}
 
 #include "arwen_fastlibm.h"

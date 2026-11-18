@@ -366,13 +366,27 @@ def alloc_pinned_memory(size):
 
 
 class UnownedMemory:
+    """CuPy's view of memory owned elsewhere.  On Metal ``ptr`` may be the
+    MemoryPointer a module's get_global_var returned: the buffer it lives in is
+    kept, so arrays built on it are real views of the module's globals."""
     def __init__(self, ptr, size, owner, device_id=None):
-        self.ptr, self.size, self.owner = ptr, size, owner
+        from ._core import MemoryPointer as _MP
+        self.buffer = ptr.mem if isinstance(ptr, _MP) else getattr(owner, "_gpuwm_mem", None)
+        self.ptr = int(ptr.ptr) if isinstance(ptr, _MP) else ptr
+        if self.buffer is not None and not (self.buffer.gpu <= int(self.ptr) <= self.buffer.gpu + self.buffer.nbytes):
+            raise ValueError("UnownedMemory: the address is not inside its owner's Metal buffer")
+        self.size, self.owner = size, owner
 
 
-class MemoryPointer:
-    def __init__(self, mem, offset):
-        self.mem, self.ptr = mem, getattr(mem, "ptr", 0) + offset
+def MemoryPointer(mem, offset):
+    """``cupy.cuda.MemoryPointer(mem, offset)``: over a Metal buffer (or an
+    UnownedMemory wrapping one) it is the array-capable pointer of _core."""
+    from ._core import MemoryPointer as _MP
+    buf = getattr(mem, "buffer", None) if isinstance(mem, UnownedMemory) else mem
+    if buf is None or not hasattr(buf, "gpu"):
+        raise TypeError("cupy.cuda.MemoryPointer on Metal needs memory backed by a Metal buffer")
+    base = mem.ptr if isinstance(mem, UnownedMemory) else buf.gpu
+    return _MP(buf, int(base) + int(offset))
 
 
 memory = types.SimpleNamespace(OutOfMemoryError=OutOfMemoryError, MemoryPool=_Pool, UnownedMemory=UnownedMemory,

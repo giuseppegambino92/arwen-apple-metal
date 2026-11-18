@@ -17,6 +17,16 @@ typedef long ptrdiff_t;
 typedef signed char int8_t; typedef short int16_t; typedef int int32_t; typedef long long int64_t;
 typedef unsigned char uint8_t; typedef unsigned short uint16_t; typedef unsigned int uint32_t; typedef unsigned long long uint64_t;
 #define warpSize 32
+#ifndef NULL
+#define NULL 0
+#endif
+#define __align__(n) __attribute__((aligned(n)))
+template <typename T> __device__ inline void __arwen_acopy(T& d, const T& s) { d = s; }
+template <typename T, int N> __device__ inline void __arwen_acopy(T (&d)[N], const T (&s)[N]) {
+    for (int i = 0; i < N; ++i) __arwen_acopy(d[i], s[i]);
+}
+// flatten_inheritance: a derived struct still binds to ``Base&`` for the parser
+#define __ARWEN_AS_BASE_REF(...) __device__ operator __VA_ARGS__&();
 #define FLT_MIN 1.17549435e-38f
 #define FLT_MAX 3.40282347e+38f
 #define FLT_EPSILON 1.19209290e-7f
@@ -109,3 +119,15 @@ ARWEN_MMX(double, float, double) ARWEN_MMX(double, double, float)
 // called only by wrappers gpuwm.metal.fastlibm inserts for verified copies.
 __device__ float __arwen_fast_glibc_logf(float); __device__ float __arwen_fast_glibc_expf(float);
 __device__ float __arwen_fast_glibc_powf(float, float);
+
+// ArWen Metal: further CUDA device intrinsics
+__device__ void __trap(); __device__ unsigned __activemask();
+__device__ int __syncthreads_or(int); __device__ int __syncthreads_and(int); __device__ int __syncthreads_count(int);
+__device__ float __double2float_ru(double); __device__ float __double2float_rd(double);
+__device__ int __double2int_ru(double); __device__ int __double2int_rd(double);
+__device__ int __float2int_ru(float); __device__ int __float2int_rd(float);
+__device__ long long llround(double); __device__ long long llround(float); __device__ long long llroundf(float);
+__device__ float erfcf(float); __device__ float erff(float); __device__ float tgammaf(float); __device__ float lgammaf(float);
+__device__ float remainderf(float, float); __device__ float nextafterf(float, float); __device__ float scalbnf(float, int);
+__device__ double scalbn(double, int);
+extern "C" __device__ int printf(const char*, ...);

@@ -18,7 +18,26 @@
 
 #if defined(ARWEN_F64_MODE_SF64)
 
+#ifdef __METAL_VERSION__
+#define __ARWEN_F64_INT_ASSIGN(AS)                                                              \
+    template <typename I, typename = metal::enable_if_t<metal::is_integral_v<I>>>               \
+    AS __f64& operator=(I x) AS {                                                               \
+        v = metal::is_signed_v<I> ? sf_from_i64((long)x) : sf_from_u64((ulong)x);               \
+        return *this;                                                                           \
+    }
+// Integer assignment, exact as in C: only for template bodies whose element type is
+// dependent (``T* p; p[i] = 0;`` with T = double), where the translator sees no
+// implicit conversion to spell out.  Templates never replace the copy assignment.
+struct __f64 {
+    ulong v;
+    __ARWEN_F64_INT_ASSIGN(thread)
+    __ARWEN_F64_INT_ASSIGN(device)
+    __ARWEN_F64_INT_ASSIGN(threadgroup)
+};
+#undef __ARWEN_F64_INT_ASSIGN
+#else
 struct __f64 { ulong v; };
+#endif
 typedef __f64 __f64m;
 #define __F64_LIT(bits, hi, lo) (__f64{bits})
 #define __F64M_LIT(bits, hi, lo) (__f64{bits})
@@ -256,3 +275,21 @@ inline __f64 fmod(__f64 x, __f64 y) {
 #endif
 
 #include "arwen_f64_math.h"
+#include "arwen_f64_math2.h"
+
+// ---- conditional operator in template code: ``c ? a : b`` with one double and one
+// other arithmetic operand has type double (usual arithmetic conversions); the
+// translator emits __arwen_csel(c, [&]{ return a; }, [&]{ return b; }): only the
+// chosen branch runs; __arwen_tsel<A, B>::f converts it to double exactly when either
+// branch is double and is the identity otherwise.
+#ifdef __METAL_VERSION__
+template <typename A, typename B> struct __arwen_tsel { template <typename X> static X f(X x) { return x; } };
+template <typename B> struct __arwen_tsel<__f64, B> { template <typename X> static __f64 f(X x) { return __arwen_cvt<__f64>(x); } };
+template <typename A> struct __arwen_tsel<A, __f64> { template <typename X> static __f64 f(X x) { return __arwen_cvt<__f64>(x); } };
+template <> struct __arwen_tsel<__f64, __f64> { static __f64 f(__f64 x) { return x; } };
+template <typename FA, typename FB> inline auto __arwen_csel(bool c, FA fa, FB fb) {
+    typedef decltype(fa()) A;
+    typedef decltype(fb()) B;
+    return c ? __arwen_tsel<A, B>::f(fa()) : __arwen_tsel<A, B>::f(fb());   // one branch runs
+}
+#endif

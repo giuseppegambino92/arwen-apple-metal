@@ -98,9 +98,14 @@ the AST → MSL.
 | `__shared__` in kernels / in device functions / `extern` | `threadgroup` / a static block in each kernel that reaches the function / `[[threadgroup(0)]]` |
 | mutable `__device__` globals | per-module globals buffer (initialiser kernel generated) |
 | `__constant__` / `const __device__` tables | MSL `constant` data |
-| inline PTX | only the 7 patterns present in ArWen (`add/sub/mul/div.rn.f32`, `setp.gt`+`selp`, compiler barrier); anything else is a `TranslationError` |
-| `goto` (HAILCAST's translated Fortran) | forward gotos only: `break` when the label follows the loop, else a skip flag; others are a `TranslationError` |
-| inheritance | flattened (base members copied, conversion to the base kept for the CUDA parse) |
+| inline PTX | the patterns present in ArWen: `add/sub/mul/div.rn.f32`, `min/max.f32`, `setp.<op>.f32` + `selp` (ORDERED compares: false on NaN, `ne` included), `cvt.rn.f32.f64`, `trap`, compiler barrier, `%globaltimer` (reads 0: MSL has no clock; only GPU-side timing receipts use it); operands must be plain variables; anything else is a `TranslationError` |
+| `goto` (translated Fortran: HAILCAST, SSiB, GFDL-eta, CAM, GBM …) | forward gotos: skip flags, `break` chains out of crossed loops, guards up to the label; backward gotos: a synthesized `for (;;)` (`continue` = jump), restarts from inside loop nests via a flag and a `break` chain; backward regions of one block that intersect become ONE loop with a restart target (`__arwen_tgt`) so every jump reaches its own label; consecutive labels (`L160: L150:`) are one position.  Checked against native clang on 200 000 inputs per shape, SSiB's real NEWTON included (`tests/metal/goto_semantics_check.py`, 0 differing words) |
+| inheritance | flattened (base members copied, base constructors become `__arwen_init_<Base>` methods the derived constructors call; by-value conversion to the base with array members copied element-wise; a parse-only `operator Base&` keeps `Base&` binding for the CUDA parse) |
+| template code (dependent types) | `double(e)`, `T(e)`, `T r = 1`, `double q = p[i]` (p a `R*`) → `__arwen_cvt`; `c ? a : b` with a double and a non-double branch → `__arwen_csel` (lambdas: only the chosen branch runs); `template <class R> f(const R*)` → the pointer generic, `R = __arwen_pointee_t<P>`; overloads told apart by scalar pointee (`float*`/`double*`) → `enable_if` non-type parameter |
+| lambdas | generic: pointer parameters `auto`, reference parameters `thread auto&` (verified to bind device lvalues too) |
+| C/C++ odds | C brace elision; block-scope `extern` prototypes hoisted to file scope; function-scope `static constexpr` → plain `constexpr`; `T &a = x, &b = y;`; pointer tables (`T* v[] = {a, b}`) typed by their elements' space; `(c ? local : dev[i]) = v` across address spaces → `__arwen_sel_assign`; `__align__` |
+| constructors / destructors needing the launch context | ctx passed at `T x;` / `T x{...}`; a destructor reads a ctx pointer its constructors store; a struct whose member initialisers need the ctx holds a `thread` reference to it (all checked on the GPU: RAII destructors run, early returns included) |
+| program-scope `__shared__` | a slot in each kernel's static threadgroup block |
 | atomics | Metal atomics; float add in threadgroup memory and 64-bit OR/AND/XOR built from 32-bit operations |
 | warp shuffles/ballot | `simd_shuffle*`/`simd_ballot` (SIMD-group = 32 lanes, threadgroup-linear like warps), CUDA segment semantics for `width` < 32 |
 
@@ -336,3 +341,54 @@ Measured: `a += b` 45 → 17 µs, a RawKernel launch 9.5 → 5.5 µs, `a * 2.0 +
 d02 median 0.391 s/step, d01 0.227 s/step, sum of steps 134 s (first Metal
 hour: 408 s), 82,741 allocations of which 65,974 from the pool; 01:00 wrfout
 again bit-identical to the pre-optimization run.
+
+## Coverage of the whole kernel tree (measured)
+
+Two gates build every CUDA unit in the repository on Metal (`sf64`, `xcrun metal -O3`):
+
+* `tools/metal/compile_all_units.py`: each `gpuwm/core/kernels/*.cu` assembled the
+  generic way (`kernels.module_source` / `module_options`): **306 of 342 units,
+  1 427 kernels**.  Of the 36 others, 33 are composed by a scheme's own loader
+  (they do not parse alone: their loader prepends helpers or macros) and 3 fail
+  (below).
+* `tools/metal/compile_loader_units.py`: the units composed by production
+  loaders (`kernel_prewarm`'s composed/device/KF loaders, preflight's
+  production-loaded units, SFIRE, snow optics, P3 reflectivity, vortex
+  initialisation, integer tiers, `*_default` sources), called with
+  `GPUWM_BACKEND=metal`: **45 of 46** in the default numerics, **45 of 46** with
+  `GPUWM_WRF_EXACT=1`.
+
+Not yet translated (a `TranslationError` / MSL error, never a silent fallback):
+`flg_column`, `gsfcsw`, `goddard` — their array views (`FLGPtr<T>`,
+`gsfc_ptr<T>`, `GArray<T,R>`) wrap both thread-local storage arrays and device
+workspace in ONE struct type, and an MSL pointer member has one address space.
+
+Translator constructs added for this coverage are checked for exactness
+against native clang on the host: `tests/metal/translator_features_check.py`
+(18 constructs, 100 000–200 000 inputs each, plus per-instantiation
+`__shared__` layouts: 0 differing words) and `tests/metal/goto_semantics_check.py`
+(7 shapes incl. SSiB NEWTON, 0 differing words).  The SSiB check caught a real
+defect: two backward-goto regions that overlap had been turned into
+interleaved loops, so a `continue` reached the wrong label — code that compiled
+and was wrong.  ssib is the only unit with such regions (the gate counts them).
+
+### New 1 h baseline (2026-11-18)
+
+Three fixes in this round change production words, all toward CUDA's C semantics:
+
+* a `float` literal widened to `double` (`(double)NSIGMA` with
+  `NSIGMA 5.67e-8f`, Noah; Thompson; NWP hail) is the binary32 value widened,
+  not the decimal read as binary64;
+* inline-PTX `setp.<op>.f32` (MYNN) compares subnormals exactly even in
+  `--ftz=true` modules (inline asm without `.ftz`), and is ORDERED (`ne` is
+  false on NaN);
+* identities only elsewhere (negated literals folded, `__arwen_cvt` to the
+  same type) — checked by diffing the MSL of the 233 modules of the run.
+
+Against the RTX 5090 run at 01:00 the old and new Metal runs are equally close
+(e.g. T2 RMSE d01 0.0388 / 0.0385 K, d02 0.0540 / 0.0547 K; PSFC d02
+0.0753 / 0.0757 Pa).  The new run is the bitwise reference
+(`runs/metal_1h_r8`); a second run reproduced it word for word (142 775 319
+words, 0 differ).  Wall time of that warm-cache hour: 81.1 s (d02 median step
+0.226 s, d01 0.132 s); the earlier 150 s was measured while another process
+shared the GPU, so the difference is not attributed to this round.

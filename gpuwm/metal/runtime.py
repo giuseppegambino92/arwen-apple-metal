@@ -159,6 +159,9 @@ def synchronize():
         _trace_sync()
     rt().synchronize()
     _pending = False
+    if rt().status_take():
+        raise RuntimeError("metal: a kernel executed a device-side trap (CUDA __trap() / asm(\"trap;\")) "
+                           "since the last synchronization: its results are invalid")
     if _PROFILE is not None and getattr(_RT, "profile", False):
         _collect_profile()
 

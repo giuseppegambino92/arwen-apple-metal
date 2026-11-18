@@ -90,6 +90,8 @@ struct Runtime {
     id<MTLComputeCommandEncoder> enc = nil;
     id<MTLCommandBuffer> last_committed = nil;
     id<MTLBuffer> null_buf = nil;
+    // device-side abort word (CUDA __trap / asm("trap;")): bound at index 3 of every dispatch
+    id<MTLBuffer> status_buf = nil;
     id<MTLEvent> order_event = nil;          // serialises command buffers (resources are untracked)
     int order_mode = 0;                      // 0: MTLEvent (GPU-only), 1: MTLSharedEvent, 2: none (diagnostic, unsafe)
     uint64_t order_value = 0;
@@ -162,6 +164,9 @@ struct Runtime {
         order_event = [dev newEvent];
         null_buf = [dev newBufferWithLength:256 options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
         [residency addAllocation:null_buf];
+        status_buf = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+        memset([status_buf contents], 0, 16);
+        [residency addAllocation:status_buf];
         [residency commit];
         deferred = [NSMutableArray new];
     }
@@ -292,6 +297,7 @@ struct Runtime {
         [enc setBytes:(na ? args.c_str() : (const char*)zero) length:(na ? na : 16) atIndex:0];
         [enc setBytes:launch.c_str() length:launch.size() atIndex:1];
         [enc setBuffer:(globals ? globals->buf : null_buf) offset:0 atIndex:2];
+        [enc setBuffer:status_buf offset:0 atIndex:3];
         if (tg_mem) [enc setThreadgroupMemoryLength:((tg_mem + 15) / 16) * 16 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(bx, by, bz)];
         n_dispatch++;
@@ -388,6 +394,15 @@ struct Runtime {
         return nb::make_tuple(g, s, host_seconds());
     }
 
+    // the abort word, cleared on read (call after synchronize)
+    uint32_t status_take() {
+        std::lock_guard<std::recursive_mutex> g(mu);
+        volatile uint32_t* w = (volatile uint32_t*)[status_buf contents];
+        uint32_t v = w[0];
+        w[0] = 0;
+        return v;
+    }
+
     nb::dict stats() {
         nb::dict d;
         d["dispatches"] = n_dispatch;
@@ -438,6 +453,7 @@ NB_MODULE(_arwen_metal_rt, m) {
             r.order_value = 0;
         })
         .def("timeline_drain", &Runtime::timeline_drain)
+        .def("status_take", &Runtime::status_take)
         .def_rw("barrier_between", &Runtime::barrier_between)
         .def_rw("concurrent", &Runtime::concurrent)
         .def_rw("flush_on_alloc", &Runtime::flush_on_alloc)

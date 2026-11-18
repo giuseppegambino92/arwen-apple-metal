@@ -35,6 +35,13 @@ def compile_msl(msl: str, flags=(), *, out: Path, opt="-O3") -> Path:
         cmd = ["xcrun", "metal", f"-std={MSL_STD}", opt, *flags, "-I", str(INCLUDE), "-c", str(src), "-o", str(air)]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
+            keep = os.environ.get("ARWEN_METAL_KEEP_FAILED")      # diagnostics: keep the failing MSL
+            if keep:
+                import hashlib
+                Path(keep).mkdir(parents=True, exist_ok=True)
+                h = hashlib.sha256(msl.encode()).hexdigest()[:12]
+                (Path(keep) / f"{h}.metal").write_text(msl)
+                (Path(keep) / f"{h}.err").write_text(r.stderr)
             raise MetalCompileError(r.stderr)
         tmp = out.with_suffix(".tmp")
         r = subprocess.run(["xcrun", "metallib", str(air), "-o", str(tmp)], capture_output=True, text=True)
