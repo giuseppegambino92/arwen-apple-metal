@@ -346,8 +346,10 @@ class Event:
         self._done = True
 
     def record(self, stream=None):
-        _rt_module.rt().flush()
+        r = _rt_module.rt()
+        r.flush()
         self._t = None
+        self._ticket = r.committed()          # the work recorded so far ends with this command buffer
         self._done = False
 
     def synchronize(self):
@@ -357,8 +359,12 @@ class Event:
         self._done = True
 
     def query(self):
-        if not self._done and not _rt_module.rt().busy():
-            self.synchronize()
+        if not self._done:
+            r = _rt_module.rt()
+            if r.completed() >= getattr(self, "_ticket", 0):
+                self._done = True
+                if self._t is None:
+                    self._t = time.perf_counter()
         return self._done
 
     @property

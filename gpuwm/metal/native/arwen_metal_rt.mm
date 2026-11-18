@@ -95,6 +95,9 @@ struct Runtime {
     id<MTLEvent> order_event = nil;          // serialises command buffers (resources are untracked)
     int order_mode = 0;                      // 0: MTLEvent (GPU-only), 1: MTLSharedEvent, 2: none (diagnostic, unsafe)
     uint64_t order_value = 0;
+    // command buffers committed / completed (they complete in commit order:
+    // the order event chains them), for per-event completion queries
+    std::atomic<uint64_t> n_committed{0}, n_completed{0};
     bool flush_on_alloc = false;
     bool profile = false;                    // one command buffer per dispatch, GPU time per kernel
     std::vector<std::pair<id<MTLCommandBuffer>, std::string>> prof_pending;
@@ -281,6 +284,7 @@ struct Runtime {
             cb = [queue commandBufferWithUnretainedReferences];
             Runtime* self_ = this;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+                self_->n_completed.fetch_add(1);
                 if (self_->timeline) {
                     std::lock_guard<std::mutex> tg(self_->tl_mu);
                     self_->tl_gpu.push_back([c GPUStartTime]);
@@ -314,6 +318,7 @@ struct Runtime {
             }];
         }
         [cb commit];
+        n_committed.fetch_add(1);
         last_committed = cb;
         cb = nil;
         enc = nil;
@@ -505,5 +510,7 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def("flush", &Runtime::flush)
         .def("synchronize", &Runtime::synchronize, nb::call_guard<nb::gil_scoped_release>())
         .def("busy", &Runtime::busy)
+        .def("committed", [](Runtime& r) { return (uint64_t)r.n_committed.load(); })
+        .def("completed", [](Runtime& r) { return (uint64_t)r.n_completed.load(); })
         .def("stats", &Runtime::stats);
 }
