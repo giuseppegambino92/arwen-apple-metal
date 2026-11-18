@@ -10,6 +10,10 @@ from pathlib import Path
 
 INCLUDE = Path(__file__).resolve().parent / "include"
 MSL_STD = os.environ.get("ARWEN_METAL_STD", "metal4.0")
+# AIR optimisation level.  Apple's GPU back end (MTLCompilerService, run when a
+# pipeline is created) can spend tens of minutes on a large kernel built at -O3
+# (measured: HRRR Thompson fork column > 15 min, 7.7 s at -Os).
+MSL_OPT = os.environ.get("ARWEN_METAL_OPT", "-O3")
 
 
 class MetalCompileError(RuntimeError):
@@ -21,11 +25,12 @@ def toolchain_identity() -> str:
     r = subprocess.run(["xcrun", "metal", "--version"], capture_output=True, text=True)
     if r.returncode != 0:
         raise MetalCompileError("Metal toolchain unavailable (xcodebuild -downloadComponent MetalToolchain):\n" + r.stderr)
-    return r.stdout.strip()
+    return r.stdout.strip() + " " + MSL_STD + " " + MSL_OPT
 
 
-def compile_msl(msl: str, flags=(), *, out: Path, opt="-O3") -> Path:
+def compile_msl(msl: str, flags=(), *, out: Path, opt=None) -> Path:
     """MSL text -> metallib at ``out`` (written atomically)."""
+    opt = opt or MSL_OPT
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="arwen-msl-") as td:

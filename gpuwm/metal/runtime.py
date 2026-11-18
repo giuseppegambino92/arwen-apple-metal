@@ -173,6 +173,31 @@ def host_sync():
 
 
 # --------------------------------------------------------------------- modules
+_SLOW = None
+
+
+def _slow_pipelines() -> set:
+    global _SLOW
+    if _SLOW is None:
+        try:
+            _SLOW = set(json.loads((cache_dir() / "slow_pipelines.json").read_text()))
+        except (OSError, ValueError):
+            _SLOW = set()
+    return _SLOW
+
+
+def _remember_slow(ident: str) -> None:
+    s = _slow_pipelines()
+    s.add(ident)
+    path = cache_dir() / "slow_pipelines.json"
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(sorted(s)))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _key(source, options, f64_mode, raw):
     return transpile.cache_key(source, options, f64_mode, raw) + "-" + hashlib.sha256(toolchain_identity().encode()).hexdigest()[:8]
 
@@ -223,8 +248,49 @@ class Module:
     def pipeline(self, name):
         p = self._pipelines.get(name)
         if p is None:
-            p = self._pipelines[name] = self.library.pipeline(name)
+            p = self._pipelines[name] = self._make_pipeline(name)
         return p
+
+    def _make_pipeline(self, name):
+        """Pipeline for kernel ``name``.  Apple's GPU back end compiles the -O3 AIR
+        when the pipeline is created, and for a few very large kernels that takes
+        tens of minutes or fails (XPC interruption); the -Os AIR of the same MSL
+        compiles in seconds and computes the same words (checked on a 1 h
+        forecast).  So: -O3 within a time budget, else the -Os build, and the
+        kernel is remembered so later processes go straight to it."""
+        from .msl_compile import MSL_OPT
+        ident = f"{self.key}:{name}"
+        if MSL_OPT == "-Os":
+            return self.library.pipeline(name)
+        if ident in _slow_pipelines():
+            return self._os_library().pipeline(name)
+        budget = float(os.environ.get("ARWEN_METAL_PIPELINE_BUDGET", "90"))
+        result = {}
+
+        def build():
+            try:
+                result["p"] = self.library.pipeline(name)
+            except Exception as e:            # noqa: BLE001 - reported through the fallback
+                result["e"] = e
+        th = threading.Thread(target=build, name=f"pso-{name}", daemon=True)
+        th.start()
+        th.join(budget)
+        if "p" in result:
+            return result["p"]
+        why = f"failed ({result['e']})" if "e" in result else f"exceeded {budget:.0f} s"
+        print(f"[arwen-metal] pipeline {name}: -O3 back-end compile {why}; using the -Os build", file=sys.stderr)
+        _remember_slow(ident)
+        return self._os_library().pipeline(name)
+
+    def _os_library(self):
+        lib = getattr(self, "_lib_os", None)
+        if lib is None:
+            d = cache_dir() / "modules"
+            path = d / f"{self.key}-Os.metallib"
+            if not path.exists():
+                compile_msl((d / f"{self.key}.metal").read_text(), tuple(self.meta["metal_flags"]), out=path, opt="-Os")
+            lib = self._lib_os = rt().load_library(str(path))
+        return lib
 
     def get_function(self, name):
         if name not in self.meta["kernels"]:

@@ -392,3 +392,26 @@ Against the RTX 5090 run at 01:00 the old and new Metal runs are equally close
 words, 0 differ).  Wall time of that warm-cache hour: 81.1 s (d02 median step
 0.226 s, d01 0.132 s); the earlier 150 s was measured while another process
 shared the GPU, so the difference is not attributed to this round.
+
+## Pipeline creation: Apple's back-end compile time (measured)
+
+`xcrun metal` turns MSL into AIR in seconds even for the largest units; the
+GPU instruction set is produced later, by `MTLCompilerService`, when a
+pipeline is created.  For a few very large single kernels that step is the
+bottleneck: the HRRR-fork Thompson column (`thompson_fork_column`, one kernel,
+594 KB metallib) did not finish in more than 20 minutes from `-O3` AIR (the
+service also restarted itself — XPC interruption), and finished in **7.7 s**
+from `-Os` AIR.  `-Os` is not a free default: on the operational 1 h forecast
+it computes the same 142 775 319 words (0 differ) but runs 65 % slower
+(d02 median step 0.373 s vs 0.226 s).
+
+So `Module.pipeline` builds from `-O3` AIR within a budget
+(`ARWEN_METAL_PIPELINE_BUDGET`, default 90 s) and otherwise, or when the
+back end fails, from the `-Os` AIR of the same MSL; the kernel is recorded in
+`~/.cache/arwen-metal/slow_pipelines.json` so later processes go straight to
+`-Os`.  `ARWEN_METAL_OPT=-Os` forces it everywhere.
+
+With it the HRRR-fork Thompson column runs on Metal and reproduces the fork's
+Fortran oracle **word for word in every output cell**
+(`tests/test_thompson_fork_column_gpu.py::test_every_output_cell_is_the_forks_word`,
+4 cases).

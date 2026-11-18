@@ -84,6 +84,7 @@ def install():
         sys.modules[f"cupy.cuda.{sub}"] = mod
     for name in ("cupy._core", "cupy._core.core", "cupy.fft", "cupy.linalg", "cupy.random", "cupy.testing",
                  "cupy_backends", "cupy_backends.cuda", "cupy_backends.cuda.api", "cupy_backends.cuda.api.runtime",
+                 "cupy_backends.cuda.api.driver",
                  "cupyx", "cupyx.scipy", "cupyx.scipy.fft", "cupyx.scipy.ndimage", "cupyx.scipy.special",
                  "cupyx.jit", "cupyx.profiler"):
         if name == "cupy._core":
@@ -97,6 +98,13 @@ def install():
         else:
             m = _stub(name)
         sys.modules[name] = m
+    # ``from cupy_backends.cuda.api import driver``: children are attributes of their
+    # parents (a stub's __getattr__ would raise for them otherwise)
+    for name in list(sys.modules):
+        if name.startswith(("cupy.", "cupyx.", "cupy_backends.")) and "." in name:
+            parent, _, child = name.rpartition(".")
+            if parent in sys.modules and child not in vars(sys.modules[parent]):
+                setattr(sys.modules[parent], child, sys.modules[name])
     return xp
 
 

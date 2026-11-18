@@ -223,6 +223,10 @@ Changelog = "https://github.com/recastsystems/arwen/blob/main/CHANGELOG.md"
 # requested extra.  Kept at >=13.0/>=13.6, a box already holding CuPy
 # 13.x would resolve, print a warning nobody reads, install no toolkit,
 # and sit in exactly the broken state this line closes.
+# Apple Silicon (Metal backend, docs/metal-backend.md): no CuPy.  libclang parses
+# the CUDA kernels for the CUDA -> MSL translator; nanobind builds the native
+# Metal runtime on first use (Xcode's command line tools and Metal toolchain).
+metal = ["libclang>=18.1", "nanobind>=2.0"]
 gpu-cu12 = ["cupy-cuda12x[ctk]>=14.0"]
 # NVRTC stays below 13.5: 13.5.37 reached PyPI on 2026-11-04 and no kernel ULP row, prebuilt image or strict
 # receipt is recorded for it (the 2.9.13 GPU gate refused it: tests/_toolchain_rows.py "no row for NVRTC 13.5
