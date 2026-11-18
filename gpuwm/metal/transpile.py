@@ -2763,7 +2763,7 @@ class _Module:
                 continue
             if i < len(params) and _canon(params[i].type).kind == T.POINTER and self._is_null(a):
                 space = self._null_arg_space(usr, i)
-                if self._dependent(params[i].type) or "__ARWEN_AP" in params[i].type.spelling:
+                if "__ARWEN_AP" in params[i].type.spelling:     # a parametrized view's own pointer
                     self.rw.replace(a.extent.start.offset, a.extent.end.offset, "nullptr", opaque=True)
                     continue
                 self.rw.replace(a.extent.start.offset, a.extent.end.offset,
