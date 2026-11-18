@@ -33,6 +33,20 @@ class MemoryPointer:
     def __int__(self):
         return int(self.ptr)
 
+    def __add__(self, offset):
+        """CuPy's ``MemoryPointer + n``: the same allocation, n bytes further."""
+        return MemoryPointer(self.mem, int(self.ptr) + int(offset))
+
+    def __radd__(self, offset):
+        return self.__add__(offset)
+
+    def __sub__(self, offset):
+        return MemoryPointer(self.mem, int(self.ptr) - int(offset))
+
+    @property
+    def device_id(self):
+        return 0
+
 
 def _wrap(view: np.ndarray, mem) -> "ndarray":
     a = object.__new__(ndarray)
@@ -200,8 +214,11 @@ class ndarray:
             res = self._v[_keyv(key)]
             if isinstance(res, np.ndarray):
                 return _wrap(res, self._gpuwm_mem)
-            runtime.host_sync()                    # a scalar read: the element must be up to date
-            return self._v[_keyv(key)]
+            # an element, as CuPy: a 0-d device array (a view; float()/int()/bool()/.get()
+            # wait for the GPU)
+            k = _keyv(key)
+            k = k if isinstance(k, tuple) else (k,)
+            return _wrap(self._v[k + (Ellipsis,)], self._gpuwm_mem)
         from . import _functions
         return _functions.advanced_getitem(self, key)
 
@@ -547,6 +564,14 @@ def asnumpy(a, stream=None, order="C", out=None, blocking=True):
         out[...] = r
         return out
     return r
+
+
+def linspace(start, stop, num=50, endpoint=True, retstep=False, dtype=None, axis=0):
+    """numpy.linspace's values (computed on the host in binary64, as NumPy), on the device."""
+    vals = np.linspace(start, stop, num=num, endpoint=endpoint, retstep=retstep, dtype=dtype, axis=axis)
+    if retstep:
+        return asarray(vals[0]), vals[1]
+    return asarray(vals)
 
 
 def arange(start, stop=None, step=1, dtype=None):

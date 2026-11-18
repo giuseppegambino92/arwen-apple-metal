@@ -150,6 +150,26 @@ struct Runtime {
         }
     }
 
+    // CuPy's MemoryPool.free_all_blocks: retired buffers go back to the system
+    int64_t pool_release() {
+        std::lock_guard<std::recursive_mutex> g(mu);
+        int64_t freed = pooled_bytes;
+        if (!pool.empty()) {
+            for (auto& kv : pool) for (id<MTLBuffer> x : kv.second) [residency removeAllocation:x];
+            pool.clear();
+            pooled_bytes = 0;
+            [residency commit];
+        }
+        return freed;
+    }
+
+    int64_t pool_blocks() {
+        std::lock_guard<std::recursive_mutex> g(mu);
+        int64_t n = 0;
+        for (auto& kv : pool) n += (int64_t)kv.second.size();
+        return n;
+    }
+
     Runtime() {
         dev = MTLCreateSystemDefaultDevice();
         if (!dev) throw std::runtime_error("metal: no Metal device");
@@ -446,6 +466,8 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def_rw("batch", &Runtime::batch)
         .def_rw("eager", &Runtime::eager)
         .def_rw("pool_cap", &Runtime::pool_cap)
+        .def("pool_release", &Runtime::pool_release)
+        .def("pool_blocks", &Runtime::pool_blocks)
         .def_rw("timeline", &Runtime::timeline)
         .def("set_order_mode", [](Runtime& r, int m) {
             r.order_mode = m;

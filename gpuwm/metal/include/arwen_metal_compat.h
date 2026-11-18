@@ -648,7 +648,13 @@ inline uint4 make_uint4(uint x, uint y, uint z, uint w) { return uint4(x, y, z, 
 inline packed_float3 make_float3(float x, float y, float z) { return packed_float3(x, y, z); }
 inline packed_int3 make_int3(int x, int y, int z) { return packed_int3(x, y, z); }
 inline packed_uint3 make_uint3(uint x, uint y, uint z) { return packed_uint3(x, y, z); }
-struct __arwen_dim3 { uint x, y, z; };
+uint3 __arwen_idx3_decl();                          // threadIdx & co. in unevaluated operands at file scope
+struct __arwen_dim3 {                               // CUDA dim3 in device code
+    uint x, y, z;
+    constexpr __arwen_dim3(uint vx = 1, uint vy = 1, uint vz = 1) : x(vx), y(vy), z(vz) {}
+    constexpr __arwen_dim3(uint3 v) : x(v.x), y(v.y), z(v.z) {}
+    constexpr operator uint3() const { return uint3(x, y, z); }
+};
 #define ARWEN_VEC64(B, T)                                                                                         \
     struct __arwen_##B##1 { T x; };                                                                               \
     struct __arwen_##B##2 { T x, y; };                                                                            \

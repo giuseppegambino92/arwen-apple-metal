@@ -74,6 +74,16 @@ class DeviceMemory:
     """An MTLBuffer exporting its bytes through the buffer protocol."""
     __slots__ = ("buf", "cpu", "gpu", "nbytes", "_view", "__weakref__")
 
+    @property
+    def ptr(self) -> int:
+        """CuPy's ``Memory.ptr``: the allocation's base GPU address."""
+        return self.gpu
+
+    @property
+    def size(self) -> int:
+        """CuPy's ``Memory.size``: the allocation's byte count."""
+        return self.nbytes
+
     def __init__(self, nbytes: int):
         self.buf = rt().alloc(int(nbytes))
         self.cpu = self.buf.cpu_address
@@ -186,6 +196,16 @@ def _slow_pipelines() -> set:
     return _SLOW
 
 
+# kernels whose -O3 back-end compile exceeded the budget on the development machine
+# (M3 Max, macOS 27.2): built from -Os AIR straight away, every variant of the name
+_SEED_SLOW_KERNELS = frozenset({"thompson_fork_column", "cam_driver_stage", "nssl2_nucond_default",
+                                "flg_stream_driver"})
+
+
+def _slow_kernel_names() -> set:
+    return {i.rsplit(":", 1)[1] for i in _slow_pipelines()} | _SEED_SLOW_KERNELS
+
+
 def _remember_slow(ident: str) -> None:
     s = _slow_pipelines()
     s.add(ident)
@@ -262,7 +282,7 @@ class Module:
         ident = f"{self.key}:{name}"
         if MSL_OPT == "-Os":
             return self.library.pipeline(name)
-        if ident in _slow_pipelines():
+        if ident in _slow_pipelines() or name in _slow_kernel_names():
             return self._os_library().pipeline(name)
         budget = float(os.environ.get("ARWEN_METAL_PIPELINE_BUDGET", "90"))
         result = {}

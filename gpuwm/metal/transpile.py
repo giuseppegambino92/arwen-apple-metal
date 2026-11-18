@@ -2376,6 +2376,11 @@ class _Module:
                 if ref is None:
                     continue
                 if c.spelling in BUILTIN_VARS and not self._main(ref):
+                    if self.fn_of.get(c.hash) is None:
+                        # outside any function (``static_assert(... decltype(blockIdx.x) ...)``):
+                        # an unevaluated operand, typed like the context's uint3
+                        self.rw.replace(c.extent.start.offset, c.extent.end.offset, "__arwen_idx3_decl()")
+                        continue
                     self.rw.replace(c.extent.start.offset, c.extent.end.offset,
                                     f"__arwen_ctx.{BUILTIN_VARS[c.spelling]}")
                 elif ref.hash in self.ssmem_globals:

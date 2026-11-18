@@ -46,8 +46,6 @@ template <typename T, int N> __device__ inline void __arwen_acopy(T (&d)[N], con
 #define INT_MAX 2147483647
 #define INT_MIN (-INT_MAX - 1)
 #define UINT_MAX 4294967295U
-struct __cuda_idx3 { unsigned int x, y, z; };
-extern __device__ const __cuda_idx3 threadIdx, blockIdx, blockDim, gridDim;
 #define ARWEN_VEC2(T, N) struct N { T x, y; }; __device__ inline N make_##N(T a, T b) { return N{a, b}; }
 #define ARWEN_VEC3(T, N) struct N { T x, y, z; }; __device__ inline N make_##N(T a, T b, T c) { return N{a, b, c}; }
 #define ARWEN_VEC4(T, N) struct N { T x, y, z, w; }; __device__ inline N make_##N(T a, T b, T c, T d) { return N{a, b, c, d}; }
@@ -55,7 +53,18 @@ ARWEN_VEC2(float, float2) ARWEN_VEC3(float, float3) ARWEN_VEC4(float, float4)
 ARWEN_VEC2(double, double2) ARWEN_VEC2(int, int2) ARWEN_VEC3(int, int3) ARWEN_VEC4(int, int4)
 ARWEN_VEC2(unsigned int, uint2) ARWEN_VEC3(unsigned int, uint3) ARWEN_VEC4(unsigned int, uint4)
 ARWEN_VEC2(long long, longlong2) ARWEN_VEC4(double, double4) ARWEN_VEC3(double, double3)
-struct dim3 { unsigned int x, y, z; };
+struct dim3 {
+    unsigned int x, y, z;
+    __host__ __device__ constexpr dim3(unsigned int vx = 1, unsigned int vy = 1, unsigned int vz = 1) : x(vx), y(vy), z(vz) {}
+    __host__ __device__ constexpr dim3(uint3 v) : x(v.x), y(v.y), z(v.z) {}
+    __host__ __device__ constexpr operator uint3() const { return uint3{x, y, z}; }
+};
+struct __cuda_idx3 {
+    unsigned int x, y, z;
+    __device__ operator uint3() const;
+    __device__ operator dim3() const;
+};
+extern __device__ const __cuda_idx3 threadIdx, blockIdx, blockDim, gridDim;
 // synchronisation and warp-level primitives
 __device__ void __syncthreads(); __device__ void __syncwarp(unsigned m = 0xffffffffu);
 __device__ void __threadfence(); __device__ void __threadfence_block();

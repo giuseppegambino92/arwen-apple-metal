@@ -13,7 +13,7 @@ import numpy as _np
 
 from . import cuda  # noqa: F401
 from ._core import (ndarray, MemoryPointer, empty, zeros, ones, full, empty_like, zeros_like, ones_like,  # noqa: F401
-                    full_like, array, asarray, ascontiguousarray, asfortranarray, asnumpy, arange, is_device)
+                    full_like, array, asarray, ascontiguousarray, asfortranarray, asnumpy, arange, linspace, is_device)
 from ._custom import RawModule, RawKernel, ElementwiseKernel, ReductionKernel  # noqa: F401
 from . import _functions as _F
 from . import _ufuncs as _U
@@ -131,6 +131,30 @@ def _unimplemented_module(name):
 fft = _unimplemented_module("cupy.fft")
 linalg = _unimplemented_module("cupy.linalg")
 random = _unimplemented_module("cupy.random")
-testing = _unimplemented_module("cupy.testing")
+def _testing_module():
+    """cupy.testing's array assertions: device operands are read back (after the GPU
+    is done) and compared by numpy.testing, exactly as CuPy's own do."""
+    import numpy.testing as npt
+    m = _types.ModuleType("cupy.testing")
+
+    def _h(x):
+        return asnumpy(x) if is_device(x) else x
+
+    def wrap(fn):
+        def f(actual, desired, *a, **k):
+            return fn(_h(actual), _h(desired), *a, **k)
+        f.__name__ = fn.__name__
+        return f
+    for name in ("assert_array_equal", "assert_allclose", "assert_array_almost_equal",
+                 "assert_array_less", "assert_array_max_ulp", "assert_array_almost_equal_nulp"):
+        setattr(m, name, wrap(getattr(npt, name)))
+
+    def __getattr__(attr):
+        raise NotImplementedError(f"cupy.testing.{attr} on the Metal backend")
+    m.__getattr__ = __getattr__
+    return m
+
+
+testing = _testing_module()
 _core = _types.SimpleNamespace(core=_types.SimpleNamespace(ndarray=ndarray), ndarray=ndarray)
 _environment = _types.SimpleNamespace(get_cuda_path=lambda: None, get_nvcc_path=lambda: None)

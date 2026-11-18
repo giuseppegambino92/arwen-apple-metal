@@ -92,6 +92,55 @@ runtime_ns.memcpy = _memcpy
 runtime_ns.memcpyAsync = lambda dst, src, size, kind, stream=0: _memcpy(dst, src, size, kind)
 runtime_ns.memsetAsync = lambda ptr, value, size, stream=0: (_rt_module.synchronize(),
                                                             __import__("ctypes").memset(_host_ptr(ptr), int(value), int(size)))
+_PINNED = __import__("weakref").WeakSet()
+
+
+def _pointer_attributes(ptr):
+    """cudaPointerGetAttributes: memory from alloc_pinned_memory is page-locked host
+    memory (type 1), a Metal buffer is device memory (type 2, its CPU mapping the
+    host pointer: unified memory), anything else is unregistered host memory (0)."""
+    p = int(ptr)
+    for m in list(_PINNED):
+        if m.ptr <= p < m.ptr + max(m.size, 1):
+            return types.SimpleNamespace(type=1, device=0, devicePointer=p, hostPointer=p)
+    for mem in _rt_module.live_memories():
+        if mem.gpu <= p < mem.gpu + mem.nbytes:
+            return types.SimpleNamespace(type=2, device=0, devicePointer=p, hostPointer=mem.cpu + (p - mem.gpu))
+    return types.SimpleNamespace(type=0, device=-2, devicePointer=0, hostPointer=p)
+
+
+runtime_ns.pointerGetAttributes = _pointer_attributes
+
+
+class _HostBlock:
+    """cudaHostAlloc's page-locked host memory: on unified memory any host memory
+    is usable by the GPU path; the block is registered so pointerGetAttributes
+    reports it as host (pinned) memory, as CUDA does."""
+
+    def __init__(self, size):
+        self._a = np.empty(max(int(size), 1), dtype=np.uint8)
+        self.ptr, self.size = self._a.ctypes.data, int(size)
+
+
+_HOST_BLOCKS = {}
+
+
+def _host_alloc(size, flags=0):
+    b = _HostBlock(size)
+    _HOST_BLOCKS[b.ptr] = b
+    _PINNED.add(b)
+    return b.ptr
+
+
+def _free_host(ptr):
+    _HOST_BLOCKS.pop(int(ptr), None)
+
+
+runtime_ns.hostAlloc = _host_alloc
+runtime_ns.mallocHost = lambda size: _host_alloc(size)
+runtime_ns.freeHost = _free_host
+runtime_ns.hostAllocDefault, runtime_ns.hostAllocPortable, runtime_ns.hostAllocMapped = 0, 1, 2
+runtime_ns.memoryTypeUnregistered, runtime_ns.memoryTypeHost, runtime_ns.memoryTypeDevice = 0, 1, 2
 runtime = runtime_ns      # cupy.cuda.runtime
 
 
@@ -102,7 +151,8 @@ class Device:
         if self.id != 0:
             raise CUDARuntimeError(101, "invalid device ordinal (Metal backend exposes one GPU)")
 
-    compute_capability = "metal"
+    # CuPy's contract is a digit string; the translator targets __CUDA_ARCH__=1200
+    compute_capability = "120"
     pci_bus_id = "0000:00:00.0"
 
     @property
@@ -266,8 +316,10 @@ compiler = types.SimpleNamespace(
     compile_using_nvrtc=compile_using_nvrtc,
     _compile_with_cache_cuda=_compile_with_cache_cuda,
     _compile_using_nvrtc_no_warning=compile_using_nvrtc,
-    _get_arch=lambda: "metal",
-    _get_arch_for_options_for_nvrtc=lambda arch=None: ("-arch=metal", "metal"),
+    # the translator preprocesses with __CUDA_ARCH__=1200 (the reference RTX 5090's
+    # sm_120); answer the same so ArWen's architecture audits see a real target
+    _get_arch=lambda: "120",
+    _get_arch_for_options_for_nvrtc=lambda arch=None: ("-arch=sm_120", "cubin"),
     get_cache_dir=lambda: str(__import__("gpuwm.metal.native_build", fromlist=["cache_dir"]).cache_dir()),
     CompileException=RuntimeError,
 )
@@ -319,14 +371,19 @@ class _Pool:
     def used_bytes(self):
         return int(_rt_module.rt().stats()["live_bytes"])
 
+    def free_bytes(self):
+        """Bytes the pool holds for reuse (retired buffers waiting in size classes)."""
+        st = _rt_module.rt().stats()
+        return int(st.get("pooled_bytes", 0))
+
     def total_bytes(self):
         return self.used_bytes()
 
     def free_all_blocks(self, stream=None):
-        return None
+        _rt_module.rt().pool_release()
 
     def n_free_blocks(self):
-        return 0
+        return int(_rt_module.rt().pool_blocks())
 
     def set_limit(self, size=None, fraction=None):
         return None
@@ -347,6 +404,7 @@ class PinnedMemoryPointer:
         self.size = int(size)
         self.ptr = self._a.ctypes.data
         self.mem = self
+        _PINNED.add(self)
 
     def __int__(self):
         return self.ptr
