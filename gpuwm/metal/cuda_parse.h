@@ -21,6 +21,12 @@ typedef unsigned char uint8_t; typedef unsigned short uint16_t; typedef unsigned
 #define NULL 0
 #endif
 #define __align__(n) __attribute__((aligned(n)))
+// parametrize_views: the pointer type of an array view is a template parameter
+#define __ARWEN_DEVPTR(T) T*
+#define __ARWEN_THRPTR(T) T*
+template <typename P> struct __arwen_cptr;
+template <typename T> struct __arwen_cptr<T*> { typedef const T* type; };
+template <typename P> using __arwen_cptr_t = typename __arwen_cptr<P>::type;
 template <typename T> __device__ inline void __arwen_acopy(T& d, const T& s) { d = s; }
 template <typename T, int N> __device__ inline void __arwen_acopy(T (&d)[N], const T (&s)[N]) {
     for (int i = 0; i < N; ++i) __arwen_acopy(d[i], s[i]);

@@ -111,6 +111,34 @@ def _index():
     return ci.Index.create()
 
 
+def _install_cursor_identity():
+    """libclang's ``Cursor.hash`` (clang_hashCursor) is 32 bits: a translation unit
+    of 60 000-460 000 nodes has colliding hashes (measured: thompson 1, goddard 10,
+    cam3_emissivity 44), and the translator keys parents, enclosing functions and
+    "already edited" sets by it.  The identity used here adds the node kind and its
+    location, which tells colliding nodes apart."""
+    import clang.cindex as ci
+    if getattr(ci.Cursor, "_arwen_identity", False):
+        return
+
+    def key(self):
+        k = getattr(self, "_arwen_key", None)
+        if k is None:
+            # the location, not the extent: a declaration reached through
+            # ``referenced`` can report another extent (measured: 101 of 9 273
+            # references in thompson), never another location
+            loc = ci.conf.lib.clang_getCursorLocation(self)
+            k = (ci.conf.lib.clang_hashCursor(self), self._kind_id, loc.offset)
+            self._arwen_key = k
+        return k
+    ci.Cursor.hash = property(key)
+    ci.Cursor.__hash__ = lambda self: hash(key(self))
+    ci.Cursor._arwen_identity = True
+
+
+_install_cursor_identity()
+
+
 def parse(pp_text: str, filename="kernel.cu"):
     """Parse preprocessed CUDA device code; return (translation unit, error list)."""
     import clang.cindex as ci

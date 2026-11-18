@@ -16,6 +16,14 @@
 #endif
 #define __ARWEN_AS_BASE_REF(...)
 #define __align__(n) __attribute__((aligned(n)))
+// parametrize_views (transpile.py): array views over device or thread storage
+#define __ARWEN_DEVPTR(T) device T*
+#define __ARWEN_THRPTR(T) thread T*
+template <typename P> struct __arwen_cptr;
+template <typename T> struct __arwen_cptr<device T*> { typedef device const T* type; };
+template <typename T> struct __arwen_cptr<thread T*> { typedef thread const T* type; };
+template <typename T> struct __arwen_cptr<threadgroup T*> { typedef threadgroup const T* type; };
+template <typename P> using __arwen_cptr_t = typename __arwen_cptr<P>::type;
 // flatten_inheritance's by-value base conversion: array members element by element
 template <typename T> inline void __arwen_acopy(thread T& d, thread const T& s) { d = s; }
 template <typename T, int N> inline void __arwen_acopy(thread T (&d)[N], thread const T (&s)[N]) {

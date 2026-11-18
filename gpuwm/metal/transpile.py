@@ -82,6 +82,8 @@ class Rewriter:
         if self.in_opaque(start, end) and (start, end) not in self.opaque:
             return
         old = self.repl.get(start)
+        if old is not None and old != (end, new) and (start, end) in self.opaque and old[0] == end:
+            return          # an opaque rewrite of exactly this expression came first (the outer edit)
         if old is not None and old != (end, new):
             raise TranslationError(f"conflicting rewrites at offset {start}: {self.text[start:end]!r}")
         self.repl[start] = (end, new)
@@ -1890,6 +1892,8 @@ class _Module:
             fk = _canon(f.type).kind
             if fk == T.POINTER or (fk == T.RECORD and self._record_has_pointers(f.type)):
                 return True
+            if "__ARWEN_AP" in f.type.spelling:       # a parametrized view (parametrize_views)
+                return True
         return False
 
     def _deducing_type_param(self, fn, usr, pointee):
@@ -2519,6 +2523,23 @@ class _Module:
                     self.rw.insert(c.extent.end.offset, ")", order=c.extent.end.offset - c.extent.start.offset)
 
     def edit_explicit_cast(self, c):
+        if c.kind == K.CXX_CONST_CAST_EXPR and self._dependent(c.type):
+            # const_cast<P>(x) in a template changes no value: a template-parameter P is
+            # spelled as is; a pointer ``T*`` (pointee dependent) gets device memory, the
+            # space of the pointer members it initialises
+            toks = _tokens(c)
+            lt = next((t for t in toks if t.spelling == "<"), None)
+            if lt is not None and _canon(c.type).kind == T.POINTER:
+                depth, gt = 0, None
+                for t in toks[toks.index(lt):]:
+                    depth += {"<": 1, ">": -1}.get(t.spelling, 0)
+                    if depth == 0:
+                        gt = t
+                        break
+                if gt is not None:
+                    self.rw.replace(lt.extent.end.offset, gt.extent.start.offset,
+                                    self.msl_type(c.type, space="device"))
+            return
         ops = [ch for ch in c.get_children() if ch.kind.is_expression()]
         if not ops:
             return
@@ -2635,6 +2656,29 @@ class _Module:
                        "constant" if not self._is_mutable_global(r) else "device")
         return spaces.pop() if len(spaces) == 1 and "device" not in spaces else None
 
+    def _view_rank_conversion(self, a, ptype):
+        """Rank of the view parameter when argument ``a`` reaches it through the
+        view's own conversion operator (``V<T,2>`` passed for ``V<T,1>``), else None."""
+        x = a
+        while x.kind == K.UNEXPOSED_EXPR and len([k for k in x.get_children() if k.kind.is_expression()]) == 1:
+            ch = [k for k in x.get_children() if k.kind.is_expression()][0]
+            if ch.kind == K.CALL_EXPR and ch.referenced is not None and ch.referenced.kind == K.CONVERSION_FUNCTION:
+                m = re.match(r"\s*(?:const\s+)?\w+\s*<\s*[^,<>]+,\s*(\d+)\s*>", ptype.spelling)
+                return m.group(1) if m else None
+            x = ch
+        return None
+
+    def _is_null_view_arg(self, a) -> bool:
+        """A null literal converted to a view by its constructor (``V<T>(nullptr)`` implicitly)."""
+        def written(k):     # default arguments have an empty extent
+            return k.kind.is_expression() and k.extent.end.offset > k.extent.start.offset
+        x = a
+        while x.kind in (K.UNEXPOSED_EXPR, K.CALL_EXPR) and len([k for k in x.get_children() if written(k)]) == 1:
+            if x.kind == K.CALL_EXPR and (x.referenced is None or x.referenced.kind != K.CONSTRUCTOR):
+                return False
+            x = [k for k in x.get_children() if written(k)][0]
+        return self._is_null(x)
+
     def _null_arg_space(self, usr, i) -> str:
         """Address space for a null pointer argument: thread when every non-null
         argument at that position, across the module's calls, is the address of a
@@ -2703,8 +2747,25 @@ class _Module:
             self.rw.insert(lp, "__arwen_ctx" + (", " if nargs else ""), order=-100)
         params = self._params(ref)
         for i, a in enumerate(self.call_args(c)):
+            if i < len(params) and _canon(params[i].type).kind == T.RECORD and self._record_has_pointers(params[i].type):
+                conv = self._view_rank_conversion(a, params[i].type)
+                if conv is not None:
+                    n_ = a.extent.end.offset - a.extent.start.offset
+                    self.rw.insert(a.extent.start.offset, "(", order=-n_ - 0.75)
+                    self.rw.insert(a.extent.end.offset, f").template __arwen_rank<{conv}>()", order=n_ + 0.75)
+                    continue
+            if i < len(params) and self._is_null_view_arg(a) and _canon(params[i].type).kind == T.RECORD \
+                    and self._record_has_pointers(params[i].type):
+                # a null view argument (``f(..., nullptr)`` with ``V<T> v`` built implicitly):
+                # the parameter is generic, so construct the view explicitly
+                ty = self.msl_type(params[i].type).replace("const ", "")
+                self.rw.replace(a.extent.start.offset, a.extent.end.offset, f"{ty}(nullptr)", opaque=True)
+                continue
             if i < len(params) and _canon(params[i].type).kind == T.POINTER and self._is_null(a):
                 space = self._null_arg_space(usr, i)
+                if self._dependent(params[i].type) or "__ARWEN_AP" in params[i].type.spelling:
+                    self.rw.replace(a.extent.start.offset, a.extent.end.offset, "nullptr", opaque=True)
+                    continue
                 self.rw.replace(a.extent.start.offset, a.extent.end.offset,
                                 f"(({self.msl_type(params[i].type, space=space)})nullptr)", opaque=True)
         refs = self.ref_params.get(usr)
@@ -3267,6 +3328,186 @@ def _derived_ctor_calls_init(text, rw, m, bases):
     rw.replace(rp + 1, bo + 1, (" : " + ", ".join(keep) if keep else "") + " { " + " ".join(calls))
 
 
+_VIEW_HINT = re.compile(r"template\s*<\s*(?:class|typename)\s+(\w+)[^>]*>\s*struct\s+\w+\s*\{[^{}]*?\b\1\s*\*")
+
+
+def parametrize_views(text: str, filename: str) -> str:
+    """Array views (``template <class T> struct V { T* p; ... }``) that wrap BOTH
+    thread-local storage arrays and device workspace: an MSL pointer member has
+    one address space, so the pointer type becomes a template parameter,
+    ``template <class T, ..., class __ARWEN_AP = device T*>``, and every view
+    built over local storage (``V<float> c(c_local, 1)``, ``V<R,1> a = {a_st, ...}``,
+    ``V<real> s = V<real>(s_local)`` and views derived from those) is spelled
+    with ``thread T*``.  Views over device memory keep the default, so their
+    code is unchanged."""
+    if not _VIEW_HINT.search(text):
+        return text
+    tu, errors = parse(text, filename)
+    if errors:
+        return text
+    tu._arwen_text, tu._arwen_filename = text, filename
+    nodes, parent = [], {}
+    stack = [(tu.cursor, None)]
+    while stack:
+        c, par = stack.pop()
+        if par is not None and (c.location.file is None or c.location.file.name != filename):
+            continue
+        if par is not None:
+            nodes.append(c)
+            parent[c.hash] = par
+        for ch in reversed(list(c.get_children())):
+            stack.append((ch, c))
+    views = {}
+    for c in nodes:
+        if c.kind != K.CLASS_TEMPLATE:
+            continue
+        tps = [ch for ch in c.get_children() if ch.kind in (K.TEMPLATE_TYPE_PARAMETER, K.TEMPLATE_NON_TYPE_PARAMETER)]
+        if not tps or tps[0].kind != K.TEMPLATE_TYPE_PARAMETER:
+            continue
+        T_ = tps[0].spelling
+        fields = [f for f in c.get_children() if f.kind == K.FIELD_DECL]
+        ptrs = [f for f in fields if re.fullmatch(r"%s\s*\*" % re.escape(T_), f.type.spelling.strip())]
+        if ptrs and not [f for f in fields if "*" in f.type.spelling and f not in ptrs]:
+            views[c.spelling] = (c, T_, len(tps))
+    if not views:
+        return text
+
+    def view_of(t):
+        sp = t.spelling.replace("const ", "").strip()
+        m = re.match(r"(\w+)\s*<", sp)
+        return m.group(1) if m and m.group(1) in views else None
+
+    def strip(e):
+        while e.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len([k for k in e.get_children() if k.kind.is_expression()]) == 1:
+            e = [k for k in e.get_children() if k.kind.is_expression()][0]
+        return e
+
+    thread_vars = set()
+
+    def is_thread(e, depth=0):
+        if e is None or depth > 6:
+            return False
+        e = strip(e)
+        if e.kind == K.DECL_REF_EXPR and e.referenced is not None and e.referenced.kind == K.VAR_DECL:
+            r = e.referenced
+            if r.hash in thread_vars:
+                return True
+            p = parent.get(r.hash)
+            local = p is not None and p.kind == K.DECL_STMT
+            return local and _canon(r.type).kind == T.CONSTANTARRAY
+        if e.kind == K.UNARY_OPERATOR and _tokens(e) and _tokens(e)[0].spelling == "&":
+            ch = [k for k in e.get_children() if k.kind.is_expression()]
+            r = strip(ch[0]).referenced if ch and strip(ch[0]).kind == K.DECL_REF_EXPR else None
+            return r is not None and r.kind == K.VAR_DECL and parent.get(r.hash) is not None \
+                and parent.get(r.hash).kind == K.DECL_STMT
+        kids = [k for k in e.get_children() if k.kind.is_expression()]
+        if e.kind in (K.BINARY_OPERATOR, K.CALL_EXPR, K.CXX_FUNCTIONAL_CAST_EXPR, K.INIT_LIST_EXPR,
+                      K.CSTYLE_CAST_EXPR, K.UNEXPOSED_EXPR) and kids:
+            # a view built or derived from thread storage: its first operand decides
+            if e.kind == K.CALL_EXPR and e.referenced is not None and e.referenced.kind == K.CXX_METHOD:
+                return is_thread(kids[0], depth + 1)
+            return is_thread(kids[0], depth + 1)
+        return False
+
+    rw = Rewriter(text)
+    retyped = set()
+    changed = True
+    while changed:
+        changed = False
+        for v in nodes:
+            if v.kind != K.VAR_DECL or v.hash in retyped or view_of(v.type) is None:
+                continue
+            p = parent.get(v.hash)
+            if p is None or p.kind != K.DECL_STMT:
+                continue
+            init = [k for k in v.get_children() if k.kind.is_expression()]
+            if not init or not is_thread(init[-1]):
+                continue
+            thread_vars.add(v.hash)
+            retyped.add(v.hash)
+            changed = True
+    if not retyped:
+        return text
+
+    def close_angle(start, end):
+        depth = 0
+        for i in range(start, end):
+            ch = text[i]
+            if ch == "<":
+                depth += 1
+            elif ch == ">":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return None
+
+    def thr_arg(tid_start, tid_end):
+        """Insert the thread pointer argument into the template-id text[tid_start:tid_end]."""
+        lt = text.find("<", tid_start, tid_end)
+        gt = close_angle(lt, tid_end) if lt >= 0 else None
+        if gt is None:
+            raise TranslationError(f"view type spelling not found in {text[tid_start:tid_end]!r}")
+        first = _split_top(text[lt + 1:gt])[0]
+        rw.insert(gt, f", __ARWEN_THRPTR({first})")
+
+    for v in nodes:
+        if v.hash not in retyped:
+            continue
+        name_tok = next(t for t in _tokens(v) if t.spelling == v.spelling and t.extent.start.offset >= v.location.offset)
+        st = parent.get(v.hash)
+        decls = [k for k in st.get_children() if k.kind == K.VAR_DECL]
+        if len(decls) > 1:
+            if any(d.hash not in retyped for d in decls):
+                raise TranslationError(f"view {v.spelling}: declared together with views of another storage")
+            if decls[0].hash != v.hash:
+                continue            # one type for the whole statement, edited at the first declarator
+            first = next(t for t in _tokens(decls[0]) if t.spelling == decls[0].spelling)
+            thr_arg(st.extent.start.offset, first.extent.start.offset)
+        else:
+            thr_arg(v.extent.start.offset, name_tok.extent.start.offset)
+        # an explicit view construction in the initialiser: V<...>(storage)
+        for d in v.walk_preorder():
+            if d.kind in (K.CXX_FUNCTIONAL_CAST_EXPR, K.CALL_EXPR, K.UNEXPOSED_EXPR) and d.hash != v.hash:
+                toks = _tokens(d)
+                if len(toks) > 2 and toks[0].spelling in views and toks[1].spelling == "<" \
+                        and toks[0].extent.start.offset > name_tok.extent.start.offset:
+                    thr_arg(toks[0].extent.start.offset, d.extent.end.offset)
+                    break
+    # the view templates: pointer type as a parameter
+    for name, (c, T_, ntp) in views.items():
+        toks = _tokens(c)
+        if toks[0].spelling != "template":
+            continue
+        gt = close_angle(toks[1].extent.start.offset, c.extent.end.offset)
+        rw.insert(gt, f", class __ARWEN_AP = __ARWEN_DEVPTR({T_})")
+        bopen = text.find("{", gt)
+        body_end = c.extent.end.offset
+        body = text[bopen:body_end]
+        nb = re.sub(r"\bconst\s+%s\s*\*" % re.escape(T_), "__arwen_cptr_t<__ARWEN_AP> ", body)
+        nb = re.sub(r"(?<![\w:])%s\s*\*" % re.escape(T_), "__ARWEN_AP ", nb)
+        nb = re.sub(r"const_cast<\s*__ARWEN_AP\s*>", "const_cast<__ARWEN_AP>", nb)
+        # self references: same element type -> same pointer type; another element
+        # type (a converting constructor) -> a fresh pointer parameter
+        def self_ref(m):
+            args = _split_top(m.group(1))
+            if len(args) != ntp:
+                return m.group(0)
+            extra = "__ARWEN_AP" if args[0].strip() == T_ else "__ARWEN_AQ"
+            return f"{name}<{m.group(1)}, {extra}>"
+        nb = re.sub(r"\b%s<([^<>]*(?:<[^<>]*>[^<>]*)*)>" % re.escape(name), self_ref, nb)
+        nb = re.sub(r"template\s*<\s*class\s+(\w+)\s*>(?=[^;{]*__ARWEN_AQ)", r"template<class \1, class __ARWEN_AQ>", nb)
+        m = re.search(r"template\s*<\s*int\s+(\w+)\s*>\s*__device__\s*operator\s+%s<\s*%s\s*,\s*\1\s*,\s*__ARWEN_AP\s*>" %
+                      (re.escape(name), re.escape(T_)), nb)
+        if m:
+            # rank conversion made explicit at call sites (the callee's view parameter is
+            # generic, so the implicit conversion would not happen): keeps the pointer type
+            nb = nb[:1] + (f" template<int __S> __device__ {name}<{T_},__S,__ARWEN_AP> __arwen_rank() const "
+                           f"{{ return *this; }} ") + nb[1:]
+        if nb != body:
+            rw.replace(bopen, body_end, nb)
+    return rw.apply()
+
+
 def hoist_block_prototypes(text: str, filename: str) -> str:
     """f2c-style block-scope prototypes (``extern int f_(...), g_(...);`` inside a
     function body) move to file scope, just before the enclosing top-level
@@ -3404,6 +3645,7 @@ def translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str 
     pp = preprocess(source, opts, filename)
     pp = flatten_inheritance(pp, filename)
     pp = hoist_block_prototypes(pp, filename)
+    pp = parametrize_views(pp, filename)
     from . import fastlibm
     pp = fastlibm.apply(pp, opts, source=source, options=options, cupy_raw_module=cupy_raw_module)
     if os.environ.get("ARWEN_METAL_DIAG_FASTLIBM") == "1" and not (

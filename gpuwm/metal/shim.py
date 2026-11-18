@@ -36,6 +36,27 @@ def _stub(name):
     return m
 
 
+PTH_NAME = "gpuwm_metal_cupy.pth"
+PTH_LINE = ('import os; os.environ.get("GPUWM_BACKEND", "").strip().lower() == "metal" '
+            'and __import__("gpuwm")\n')
+
+
+def ensure_startup_hook():
+    """Child processes and scripts that ``import cupy`` before gpuwm (ArWen's
+    runners, the pre-warm pool) get the Metal array module too: a ``.pth`` file in
+    this interpreter's site-packages imports gpuwm at startup when
+    GPUWM_BACKEND=metal (which install() exports to children).  Written once;
+    without the variable it does nothing."""
+    import sysconfig
+    from pathlib import Path
+    try:
+        target = Path(sysconfig.get_paths()["purelib"]) / PTH_NAME
+        if not target.exists() or target.read_text() != PTH_LINE:
+            target.write_text(PTH_LINE)
+    except OSError:
+        pass
+
+
 def install():
     if getattr(sys.modules.get("cupy"), "_gpuwm_metal", False):
         return sys.modules["cupy"]
@@ -43,6 +64,7 @@ def install():
         raise RuntimeError("the metal backend must be selected before cupy is imported")
     os.environ["GPUWM_BACKEND"] = "metal"
     os.environ["GPUWM_AOT"] = "off"
+    ensure_startup_hook()
     from gpuwm.metal import xp
     # gpuwm recognises device arrays by their type's module, as CuPy's is "cupy"
     xp.ndarray.__module__ = "cupy"
