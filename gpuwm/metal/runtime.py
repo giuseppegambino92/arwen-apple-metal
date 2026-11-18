@@ -292,10 +292,10 @@ class KernelError(RuntimeError):
     pass
 
 
-#: libraries above this size create their pipelines one process at a time: Apple's
+#: libraries above this size (256 KiB) create their pipelines one process at a time: Apple's
 #: compiler service drops its XPC connection when several processes back-end
 #: compile very large libraries at once (Goddard, under a parallel test run)
-HEAVY_LIBRARY_BYTES = int(os.environ.get("ARWEN_METAL_HEAVY_LIBRARY", str(1 << 20)))
+HEAVY_LIBRARY_BYTES = int(os.environ.get("ARWEN_METAL_HEAVY_LIBRARY", str(256 << 10)))
 
 
 @contextlib.contextmanager
