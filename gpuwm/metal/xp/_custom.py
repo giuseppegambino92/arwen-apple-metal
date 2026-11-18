@@ -14,12 +14,18 @@ from . import _ufuncs as U
 # ------------------------------------------------------------------ RawModule / RawKernel / driver Function
 
 
+import weakref
+
+_BY_PTR = weakref.WeakValueDictionary()
+
+
 class Function:
     """A loaded kernel, callable like cupy.RawKernel / cupy.cuda.Function."""
 
     def __init__(self, kernel: runtime.Kernel):
         self._k = kernel
         self.kernel = kernel
+        _BY_PTR[id(kernel)] = kernel      # driver.funcGetAttribute(attr, function.ptr)
 
     def __call__(self, grid, block, args, shared_mem=0, stream=None, enable_cooperative_groups=False):
         if enable_cooperative_groups:

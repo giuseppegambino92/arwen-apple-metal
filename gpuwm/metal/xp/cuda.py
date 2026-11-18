@@ -557,4 +557,22 @@ def _nvrtc_version():
 
 
 nvrtc = types.SimpleNamespace(getVersion=_nvrtc_version)
-driver = types.SimpleNamespace(occupancyMaxActiveBlocksPerMultiprocessor=lambda f, b, s: 1)
+_FUNC_ATTRS = ("max_threads_per_block", "shared_size_bytes", "const_size_bytes", "local_size_bytes",
+               "num_regs", "ptx_version", "binary_version", "cache_mode_ca", "max_dynamic_shared_size_bytes",
+               "preferred_shared_memory_carveout")
+
+
+def _func_get_attribute(attribute, ptr):
+    """cuFuncGetAttribute over a Metal pipeline.  Metal reserves no per-thread
+    local frame the way CUDA does, so LOCAL_SIZE_BYTES (like num_regs) reads 0:
+    CUDA frame-size budgets are vacuous on this backend (docs/metal-README.md)."""
+    from ._custom import Function, _BY_PTR
+    k = _BY_PTR.get(int(ptr))
+    if k is None:
+        raise CUDARuntimeError(400, "funcGetAttribute: not a Metal kernel handle")
+    return Function(k).attributes[_FUNC_ATTRS[int(attribute)]]
+
+
+driver = types.SimpleNamespace(occupancyMaxActiveBlocksPerMultiprocessor=lambda f, b, s: 1,
+                               funcGetAttribute=_func_get_attribute,
+                               **{"CU_FUNC_ATTRIBUTE_" + n.upper(): i for i, n in enumerate(_FUNC_ATTRS)})

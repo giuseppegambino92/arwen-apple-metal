@@ -334,6 +334,7 @@ pub struct WindState {pub ru:Vec<Vec<f32>>,pub rw:Vec<Vec<f32>>,pub w:Vec<Vec<f3
 #[allow(clippy::too_many_arguments)]
 /// RRFSx/MPAS-Model src/core_init_atmosphere/mpas_init_atm_cases.F:7670-7721 at 1d6e370e.
 /// Preserve the pinned strict GNU scalar instruction's destination operand.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn wind_add(mut destination:f32, source:f32)->f32 {
     unsafe { core::arch::asm!("addss {destination}, {source}",
@@ -342,8 +343,15 @@ fn wind_add(mut destination:f32, source:f32)->f32 {
     destination
 }
 
+/// Other targets: the same correctly rounded binary32 operation (identical
+/// words; a NaN result's payload follows the target's propagation rule).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn wind_add(destination:f32, source:f32)->f32 { destination + source }
+
 /// RRFSx/MPAS-Model src/core_init_atmosphere/mpas_init_atm_cases.F:7670-7721 at 1d6e370e.
 /// Preserve the pinned strict GNU scalar instruction's destination operand.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn wind_mul(mut destination:f32, source:f32)->f32 {
     unsafe { core::arch::asm!("mulss {destination}, {source}",
@@ -352,8 +360,15 @@ fn wind_mul(mut destination:f32, source:f32)->f32 {
     destination
 }
 
+/// Other targets: the same correctly rounded binary32 operation (identical
+/// words; a NaN result's payload follows the target's propagation rule).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn wind_mul(destination:f32, source:f32)->f32 { destination * source }
+
 /// RRFSx/MPAS-Model src/core_init_atmosphere/mpas_init_atm_cases.F:7670-7721 at 1d6e370e.
 /// Preserve the pinned strict GNU scalar instruction's destination operand.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn wind_sub(mut destination:f32, source:f32)->f32 {
     unsafe { core::arch::asm!("subss {destination}, {source}",
@@ -362,8 +377,15 @@ fn wind_sub(mut destination:f32, source:f32)->f32 {
     destination
 }
 
+/// Other targets: the same correctly rounded binary32 operation (identical
+/// words; a NaN result's payload follows the target's propagation rule).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn wind_sub(destination:f32, source:f32)->f32 { destination - source }
+
 /// RRFSx/MPAS-Model src/core_init_atmosphere/mpas_init_atm_cases.F:7670-7721 at 1d6e370e.
 /// Preserve the pinned strict GNU scalar instruction's destination operand.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn wind_div(mut destination:f32, source:f32)->f32 {
     unsafe { core::arch::asm!("divss {destination}, {source}",
@@ -371,6 +393,12 @@ fn wind_div(mut destination:f32, source:f32)->f32 {
         options(pure,nomem,nostack,preserves_flags)); }
     destination
 }
+
+/// Other targets: the same correctly rounded binary32 operation (identical
+/// words; a NaN result's payload follows the target's propagation rule).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn wind_div(destination:f32, source:f32)->f32 { destination / source }
 
 /// RRFSx/MPAS-Model src/core_init_atmosphere/mpas_init_atm_cases.F:7499-7742,10305-10365 at 1d6e370e.
 pub fn diagnose_winds(u_edge:&[Vec<f32>],rho_zz:&[&[f32]],owners:&[[usize;2]],
