@@ -471,7 +471,7 @@ class Kernel:
         self.module = module
         self.name = name
         self.info = module.meta["kernels"][name]
-        self.pso = module.pipeline(name)
+        self.pso = module.pipeline(self.info.get("msl_name") or name)
         self.max_threads = self.pso.max_threads
         self.static_tg = int(self.pso.static_threadgroup_memory)
         self.splittable = not (self.info["uses_barrier"] or self.info["uses_shared"] or self.info["uses_warp"]

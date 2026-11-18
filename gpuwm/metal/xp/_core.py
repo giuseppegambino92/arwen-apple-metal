@@ -172,6 +172,15 @@ class ndarray:
         assign(self.imag, value)
 
     @property
+    def flat(self):
+        """A flat view (contiguous arrays) or NumPy's flat iterator over the same
+        unified memory, after the GPU is done with the array."""
+        if self.flags.c_contiguous:
+            return self.ravel()
+        runtime.host_sync()
+        return self._v.flat
+
+    @property
     def data(self):
         return MemoryPointer(self._gpuwm_mem, runtime.device_address(self))
 

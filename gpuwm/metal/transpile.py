@@ -374,6 +374,20 @@ class KernelInfo:
     uses_shared: bool
     uses_warp: bool
     dyn_shared: bool
+    msl_name: str = ""   # the Metal symbol when the CUDA name is reserved in MSL
+
+
+#: identifiers MSL reserves (types, address spaces, function qualifiers): a CUDA
+#: kernel with one of these names gets a prefixed Metal symbol
+_MSL_RESERVED = ({"half", "uint", "uchar", "ushort", "ulong", "kernel", "vertex", "fragment", "device",
+                  "constant", "threadgroup", "thread", "sampler", "texture", "metal", "bfloat", "visible"}
+                 | {f"{t}{n}" for t in ("float", "half", "int", "uint", "short", "ushort", "char", "uchar",
+                                       "long", "ulong", "bool", "bfloat") for n in (2, 3, 4)}
+                 | {f"{t}{r}x{c}" for t in ("float", "half") for r in (2, 3, 4) for c in (2, 3, 4)})
+
+
+def msl_kernel_symbol(name: str) -> str:
+    return f"__arwen_k_{name}" if name in _MSL_RESERVED else name
 
 
 @dataclasses.dataclass
@@ -1852,7 +1866,7 @@ class _Module:
         extra.append("device uchar* __arwen_g [[buffer(2)]]")
         extra.append("device metal::atomic_uint* __arwen_status [[buffer(3)]]")
         extra.append("threadgroup uchar* __arwen_dsmem [[threadgroup(0)]]" if self.dyn_shared_used else "")
-        sig_new = (f"{struct_def}{attr}kernel void {name}(constant __arwen_args_{name}& __arwen_a [[buffer(0)]], "
+        sig_new = (f"{struct_def}{attr}kernel void {msl_kernel_symbol(name)}(constant __arwen_args_{name}& __arwen_a [[buffer(0)]], "
                    f"constant __arwen_launch_t& __arwen_L [[buffer(1)]], "
                    + ", ".join(x for x in extra if x) +
                    ", uint3 __arwen_tid [[thread_position_in_threadgroup]], uint3 __arwen_bid [[threadgroup_position_in_grid]], "
@@ -1873,7 +1887,8 @@ class _Module:
             uses_barrier=bool(re.search(r"__syncthreads|__syncwarp", text)),
             uses_shared=bool(re.search(r"__shared__", text)),
             uses_warp=bool(re.search(r"__shfl|__ballot|__any_sync|__all_sync", text)),
-            dyn_shared=self.dyn_shared_used)
+            dyn_shared=self.dyn_shared_used,
+            msl_name=msl_kernel_symbol(name))
 
     def _record_has_pointers(self, t) -> bool:
         ct = _canon(t)
