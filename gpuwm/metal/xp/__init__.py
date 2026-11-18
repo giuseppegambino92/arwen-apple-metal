@@ -195,3 +195,17 @@ def _testing_module():
 testing = _testing_module()
 _core = _types.SimpleNamespace(core=_types.SimpleNamespace(ndarray=ndarray), ndarray=ndarray)
 _environment = _types.SimpleNamespace(get_cuda_path=lambda: None, get_nvcc_path=lambda: None)
+
+
+
+def __getattr__(name):
+    """``cupy.<numpy function>`` without a Metal kernel: NumPy's function, run on the
+    CPU over unified memory by _functions.host_call (declared on first use)."""
+    fn = getattr(_np, name, None)
+    if callable(fn) and not isinstance(fn, type) and not name.startswith("_"):
+        def f(*args, **kw):
+            return _F.host_call(fn, args, kw)
+        f.__name__ = name
+        globals()[name] = f
+        return f
+    raise AttributeError(f"module 'cupy' (Metal backend) has no attribute {name!r}")

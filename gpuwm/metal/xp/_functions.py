@@ -29,8 +29,58 @@ def implements(*funcs):
 def dispatch(func, args, kwargs):
     impl = _IMPL.get(func)
     if impl is None:
-        raise NotImplementedError(f"numpy.{func.__name__} on device arrays is not implemented on the Metal backend")
+        return host_call(func, args, kwargs)
     return impl(*args, **kwargs)
+
+
+_TOLD = set()
+
+
+def host_call(func, args, kwargs):
+    """A NumPy function with no Metal kernel: NumPy runs it on the CPU over the
+    SAME unified memory (device arrays are passed as views, no copy in; an
+    ``out=`` device array is written in place), after the GPU has finished with
+    the operands.  Results that are views of a device array stay views; others
+    become device arrays (scalars as 0-d arrays, as CuPy returns).  Declared:
+    the first use of each function in a process is printed."""
+    import sys
+    from .. import runtime
+    name = getattr(func, "__name__", str(func))
+    if name not in _TOLD:
+        _TOLD.add(name)
+        print(f"[arwen-metal] numpy.{name}: computed on the CPU over unified memory (no Metal kernel)",
+              file=sys.stderr)
+    runtime.host_sync()
+    mems = []
+
+    def down(x):
+        if isinstance(x, ndarray):
+            mems.append((x._v, x._gpuwm_mem))
+            return x._v
+        if isinstance(x, (list, tuple)) and any(isinstance(y, ndarray) for y in x):
+            return type(x)(down(y) for y in x)
+        return x
+    hargs = [down(x) for x in args]
+    hkw = {k: down(v) for k, v in kwargs.items()}
+    res = func(*hargs, **hkw)
+    out = kwargs.get("out")
+    if isinstance(out, ndarray):
+        return out
+
+    def up(r):
+        if isinstance(r, np.ndarray):
+            for v, mem in mems:
+                if r.size and np.shares_memory(r, v):
+                    return _wrap(r, mem)          # a view of device memory stays one
+            return asarray(r)
+        if isinstance(r, np.generic):
+            return asarray(r)
+        if isinstance(r, tuple):
+            return type(r)(*(up(y) for y in r)) if hasattr(r, "_fields") else tuple(up(y) for y in r)
+        if isinstance(r, list):
+            return [up(y) for y in r]
+        return r
+    return up(res)
 
 
 def _dev(a):

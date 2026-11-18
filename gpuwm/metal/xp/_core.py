@@ -204,6 +204,18 @@ class ndarray:
         from . import _ufuncs
         return _ufuncs.dispatch(ufunc, method, inputs, kwargs)
 
+    def __getattr__(self, name):
+        """A NumPy ndarray method with no Metal implementation: run on the CPU over the
+        same unified memory (declared on first use; see _functions.host_call)."""
+        meth = getattr(np.ndarray, name, None)
+        if name.startswith("_") or not callable(meth):
+            raise AttributeError(f"'cupy.ndarray' (Metal backend) has no attribute {name!r}")
+        from . import _functions
+
+        def call(*args, **kw):
+            return _functions.host_call(meth, (self,) + args, kw)
+        return call
+
     def __array_function__(self, func, types, args, kwargs):
         from . import _functions
         return _functions.dispatch(func, args, kwargs)
