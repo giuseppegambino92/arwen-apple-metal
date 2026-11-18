@@ -301,8 +301,10 @@ class ReductionKernel:
                  reduce_type=None, reduce_dims=True, preamble="", options=()):
         self.in_params = _params(in_params, True)
         self.out_params = _params(out_params, False)
-        if len(self.out_params) != 1 or len(self.in_params) > 3:
-            raise NotImplementedError("ReductionKernel with several outputs or more than 3 inputs on Metal")
+        if len(self.out_params) != 1:
+            raise NotImplementedError("ReductionKernel with several outputs on Metal")
+        if len(self.in_params) + 1 > K.MAXOPS:
+            raise NotImplementedError(f"ReductionKernel with more than {K.MAXOPS - 1} inputs on Metal")
         self.map_expr, self.reduce_expr, self.post_map_expr = map_expr, reduce_expr, post_map_expr
         self.identity, self.name, self.reduce_type, self.preamble = identity, name, reduce_type, preamble
 
@@ -335,7 +337,7 @@ class ReductionKernel:
 {K._OFFSETS}
 {pre_t}{self.preamble}
 __device__ __forceinline__ {red_t} __red({red_t} a, {red_t} b) {{ return ({self.reduce_expr}); }}
-extern "C" __global__ void __launch_bounds__(256) rk({", ".join(f"const char* p{j}" for j in range(np_))}, char* out, Lay LO, Lay LR) {{
+extern "C" __global__ void __launch_bounds__(256) rk({", ".join(f"const char* p{j}" for j in range(np_))}, char* __rk_out, Lay LO, Lay LR) {{
     __shared__ {red_t} s[256];
     long long o = blockIdx.x;
     long long oo[{np_ + 1}];
@@ -356,7 +358,7 @@ extern "C" __global__ void __launch_bounds__(256) rk({", ".join(f"const char* p{
     }}
     if (threadIdx.x == 0) {{
         a = s[0];
-        {K.ctype(out_dt)}& {on_name} = *({K.ctype(out_dt)}*)(out + oo[0]);
+        {K.ctype(out_dt)}& {on_name} = *({K.ctype(out_dt)}*)(__rk_out + oo[0]);
         {self.post_map_expr};
     }}
 }}
