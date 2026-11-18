@@ -108,6 +108,9 @@ class RawKernel(Function):
         object.__setattr__(self, "code", code)
         object.__setattr__(self, "name", name)
 
+    def compile(self, log_stream=None):
+        return None          # compiled (translated and built) at construction
+
     def __setattr__(self, name, value):
         if name in ("_k", "kernel", "_module", "code", "name"):
             object.__setattr__(self, name, value)

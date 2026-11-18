@@ -2,7 +2,8 @@
 
 Installed as ``cupy`` (see gpuwm.metal.shim) when ``--backend metal`` is
 selected.  Arrays live in unified GPU memory; computation is GPU kernels; a
-function without a GPU implementation raises NotImplementedError naming it.
+NumPy function without a Metal kernel runs NumPy on the CPU over the same
+memory, declared on first use (_functions.host_call).
 """
 from __future__ import annotations
 
@@ -58,6 +59,9 @@ def _ufunc_wrapper(uf):
     f.__name__ = uf.__name__
     f.reduce = uf.reduce
     f.accumulate = uf.accumulate
+    f.reduceat = lambda *a, **k: _F.host_call(uf.reduceat, a, k)
+    f.outer = lambda *a, **k: _F.host_call(uf.outer, a, k)
+    f.at = lambda *a, **k: _F.host_call(uf.at, a, k)
     f.nin, f.nout, f.ufunc = uf.nin, uf.nout, uf
     return f
 

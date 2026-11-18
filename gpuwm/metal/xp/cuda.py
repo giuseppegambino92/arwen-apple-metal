@@ -11,6 +11,7 @@ import contextlib
 import json
 import threading
 import time
+import os
 import types
 
 import numpy as np
@@ -539,5 +540,16 @@ def using_allocator(allocator=None):
     yield
 
 
-nvrtc = types.SimpleNamespace(getVersion=lambda: (0, 0))
+def _nvrtc_version():
+    """No NVRTC runs on Metal.  Code that picks a CUDA-toolchain-measured table
+    by (compute capability, NVRTC version) gets sm_120 / NVRTC 13.4: the
+    translator reproduces the CUDA source semantics those rows were recorded
+    under, so Metal is gated by CUDA's measured budgets (it does not reproduce
+    ptxas' FMA contraction under --fmad=true, so hash pins of CUDA's output
+    words can differ).  ARWEN_METAL_NVRTC_VERSION overrides it."""
+    v = os.environ.get("ARWEN_METAL_NVRTC_VERSION", "13.4")
+    return tuple(int(x) for x in v.split(".")[:2])
+
+
+nvrtc = types.SimpleNamespace(getVersion=_nvrtc_version)
 driver = types.SimpleNamespace(occupancyMaxActiveBlocksPerMultiprocessor=lambda f, b, s: 1)

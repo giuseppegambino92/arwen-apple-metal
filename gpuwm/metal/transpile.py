@@ -3527,6 +3527,144 @@ def parametrize_views(text: str, filename: str) -> str:
     return rw.apply()
 
 
+def hoist_branch_labels(text: str, filename: str) -> str:
+    """A forward ``goto L`` into another branch of an enclosing ``if`` (f2c output:
+    ``if (a) { ... goto L; } else { ...; L: tail }``) has no structured form in
+    place.  When the label's tail only falls out of that ``if`` (no loop between,
+    each level the last statement of its block, no use of the branch's locals),
+    the tail moves to just after the ``if``, run under a flag the gotos and the
+    fall-through path both set: ``L: if (f) { f = false; tail }``.  The gotos
+    then target an enclosing block, which eliminate_gotos handles."""
+    if "goto" not in text:
+        return text
+    for n in range(64):
+        tu, errors = parse(text, filename)
+        if errors:
+            return text
+        new = _hoist_one_branch_label(tu, text, filename, n)
+        if new is None:
+            return text
+        text = new
+    raise TranslationError("hoist_branch_labels: no fixed point")
+
+
+def _hoist_one_branch_label(tu, text, filename, n):
+    parent, fn_of, labels, gotos = {}, {}, {}, []
+    stack = [(tu.cursor, None, None)]
+    while stack:
+        c, par, fn = stack.pop()
+        if c.location.file is not None and c.location.file.name != filename:
+            continue
+        key = (c.hash, c.kind, c.extent.start.offset)
+        if par is not None:
+            parent[key] = par
+        if c.kind in FN_KINDS:
+            fn = c
+        if c.kind == K.LABEL_STMT and fn is not None:
+            labels[(fn.extent.start.offset, c.spelling)] = c
+        elif c.kind == K.GOTO_STMT and fn is not None:
+            gotos.append((c, fn))
+        for ch in c.get_children():
+            stack.append((ch, c, fn))
+
+    def up(c):
+        return parent.get((c.hash, c.kind, c.extent.start.offset))
+
+    def same(a, b):
+        return a is not None and b is not None and a.kind == b.kind and a.extent.start.offset == b.extent.start.offset \
+            and a.extent.end.offset == b.extent.end.offset
+
+    def ancestors(c):
+        out = []
+        while c is not None:
+            out.append(c)
+            c = up(c)
+        return out
+
+    loops = (K.FOR_STMT, K.WHILE_STMT, K.DO_STMT, K.SWITCH_STMT)
+    for g, fn in gotos:
+        toks = list(g.get_tokens())
+        if len(toks) < 2:
+            continue
+        L = labels.get((fn.extent.start.offset, toks[1].spelling))
+        if L is None or L.extent.start.offset < g.extent.start.offset:
+            continue
+        Lb = up(L)
+        if Lb is None or Lb.kind != K.COMPOUND_STMT:
+            continue
+        ga = ancestors(g)
+        if any(same(a, Lb) for a in ga):
+            continue                          # enclosing: eliminate_gotos handles it
+        # lowest compound block C holding both; S_L = its child holding L
+        la = ancestors(L)
+        C = next((a for a in la[1:] if a.kind == K.COMPOUND_STMT and any(same(a, b) for b in ga)), None)
+        if C is None:
+            continue
+        S_L = next(a for a in la if same(up(a), C))
+        # the tail must only fall out of S_L
+        ok, a = True, Lb
+        while not same(a, S_L):
+            p = up(a)
+            if p.kind == K.IF_STMT:
+                pass
+            elif p.kind == K.COMPOUND_STMT:
+                ks = [k for k in p.get_children() if k.kind != K.NULL_STMT]
+                if not ks or not same(ks[-1], a):
+                    ok = False
+            else:
+                ok = False
+            if not ok:
+                break
+            a = p
+        if not ok:
+            raise TranslationError(f"goto {L.spelling}: jumps into a branch whose tail does not fall out of it")
+        # locals of the blocks being left, used by the tail
+        lb_kids = list(Lb.get_children())
+        li = next(i for i, k in enumerate(lb_kids) if same(k, L))
+        tail_start, tail_end = L.extent.start.offset, lb_kids[-1].extent.end.offset
+        if text[tail_end - 1] not in ";}":
+            tail_end = text.find(";", tail_end) + 1
+        local = set()
+        a = Lb
+        while not same(a, S_L):
+            if a.kind == K.COMPOUND_STMT:
+                for k in a.get_children():
+                    if k.extent.start.offset >= tail_start:
+                        break
+                    if k.kind == K.DECL_STMT:
+                        local |= {d.extent.start.offset for d in k.get_children() if d.kind == K.VAR_DECL}
+            a = up(a)
+        for k in lb_kids[li:]:
+            for d in k.walk_preorder():
+                if d.kind == K.DECL_REF_EXPR and d.referenced is not None and \
+                        d.referenced.extent.start.offset in local:
+                    raise TranslationError(f"goto {L.spelling}: the label's tail uses locals of its branch")
+        name = L.spelling
+        flag = f"__arwen_into_{name}_{n}"
+        body = next(ch for ch in fn.get_children() if ch.kind == K.COMPOUND_STMT)
+        sl_end = S_L.extent.end.offset
+        if text[sl_end - 1] not in ";}":
+            sl_end = text.find(";", sl_end) + 1
+        ltoks = list(L.get_tokens())
+        after_colon = ltoks[1].extent.end.offset    # ``name :`` then the labelled statement
+        tail = text[after_colon:tail_end]
+        rw = Rewriter(text)
+        rw.insert(body.extent.start.offset + 1, f" bool {flag} = false;", order=-3e9)
+        rw.replace(tail_start, tail_end, f"{flag} = true;")
+        rw.insert(sl_end, f"\n{name}: if ({flag}) {{ {flag} = false; {tail} }}", order=2e9)
+        for g2, fn2 in gotos:
+            t2 = list(g2.get_tokens())
+            if same(fn2, fn) and len(t2) >= 2 and t2[1].spelling == name:
+                if tail_start <= g2.extent.start.offset < tail_end:
+                    raise TranslationError(f"goto {name}: goto inside the label's own tail")
+                end = g2.extent.end.offset
+                if text[end - 1] != ";":
+                    end = text.find(";", end) + 1
+                rw.replace(g2.extent.start.offset, end, f"{{ {flag} = true; goto {name}; }}")
+        return rw.apply()
+    return None
+
+
 def hoist_block_prototypes(text: str, filename: str) -> str:
     """f2c-style block-scope prototypes (``extern int f_(...), g_(...);`` inside a
     function body) move to file scope, just before the enclosing top-level
@@ -3664,6 +3802,7 @@ def translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str 
     pp = preprocess(source, opts, filename)
     pp = flatten_inheritance(pp, filename)
     pp = hoist_block_prototypes(pp, filename)
+    pp = hoist_branch_labels(pp, filename)
     pp = parametrize_views(pp, filename)
     from . import fastlibm
     pp = fastlibm.apply(pp, opts, source=source, options=options, cupy_raw_module=cupy_raw_module)

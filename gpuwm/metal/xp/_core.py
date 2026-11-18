@@ -47,6 +47,58 @@ class MemoryPointer:
     def device_id(self):
         return 0
 
+    # byte-level operations on unified memory, ordered after the GPU's queued work
+    # (recorded instead when a CUDA graph is being captured)
+    def _bytes(self, size):
+        off = int(self.ptr) - self.mem.gpu
+        if off < 0 or off + int(size) > self.mem.nbytes:
+            raise ValueError("MemoryPointer range outside its allocation")
+        return np.frombuffer(self.mem, dtype=np.uint8)[off:off + int(size)]
+
+    def _host_op(self, fn):
+        if runtime.CAPTURE is not None:
+            runtime.CAPTURE.append(("host", fn))
+            return
+        runtime.host_sync()
+        fn()
+
+    def memset(self, value, size):
+        self._host_op(lambda: self._bytes(size).fill(int(value) & 0xFF))
+
+    def memset_async(self, value, size, stream=None):
+        self.memset(value, size)
+
+    def copy_from_device(self, src, size):
+        self._host_op(lambda: self._bytes(size).__setitem__(slice(None), src._bytes(size)))
+
+    def copy_from_device_async(self, src, size, stream=None):
+        self.copy_from_device(src, size)
+
+    def copy_from_host(self, mem, size):
+        import ctypes
+        self._host_op(lambda: ctypes.memmove(self._bytes(size).ctypes.data, int(getattr(mem, "value", mem) or 0)
+                                             if not hasattr(mem, "ptr") else int(mem.ptr), int(size)))
+
+    def copy_from_host_async(self, mem, size, stream=None):
+        self.copy_from_host(mem, size)
+
+    def copy_to_host(self, mem, size):
+        import ctypes
+        self._host_op(lambda: ctypes.memmove(int(getattr(mem, "value", mem) or 0) if not hasattr(mem, "ptr")
+                                             else int(mem.ptr), self._bytes(size).ctypes.data, int(size)))
+
+    def copy_to_host_async(self, mem, size, stream=None):
+        self.copy_to_host(mem, size)
+
+    def copy_from(self, mem, size):
+        if isinstance(mem, MemoryPointer):
+            self.copy_from_device(mem, size)
+        else:
+            self.copy_from_host(mem, size)
+
+    def copy_from_async(self, mem, size, stream=None):
+        self.copy_from(mem, size)
+
 
 def _wrap(view: np.ndarray, mem) -> "ndarray":
     a = object.__new__(ndarray)

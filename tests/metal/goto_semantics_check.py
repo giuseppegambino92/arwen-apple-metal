@@ -6,7 +6,7 @@ Shapes covered: a Fortran-style iteration (backward goto) with forward exits,
 several gotos to one label, a forward goto out of two nested loops, a goto
 out of a switch, a label inside a loop body (the flag must be cleared on every
 pass), two consecutive backward-goto iterations, a goto skipping statements in
-the middle of a block; and SSiB's real NEWTON routine (consecutive labels,
+the middle of a block, a goto into a sibling branch of an if (NoahMP runoff); and SSiB's real NEWTON routine (consecutive labels,
 interleaved backward and forward gotos).  Declared tolerance: 0 differing words."""
 import ctypes
 import os
@@ -183,6 +183,38 @@ L101:
     nox = (int)nex[l];
     iwolk = (int)iwalk[l];
 }
+DEV int into_branch(int a, int b) {              /* goto into a sibling branch (NoahMP runoff) */
+    int r = a & 255, it;
+    if (a & 1) {
+        r += 3;
+        goto L2001;
+    } else {
+        if (a & 2) {
+            for (it = 0; it < 9; ++it) {
+                r = r * 3 + it;
+                if (((r ^ b) & 7) == 1 || it == 8) {
+                    goto L1003;
+                }
+            }
+        } else if (a & 4) {
+            r -= b & 63;
+            if (r < 0) goto L1003;
+            r += 1;
+        } else {
+            for (it = 0; it < 5; ++it) {
+                r += it * b;
+                if ((r & 15) == 3) break;
+            }
+            L1003: ;
+            if (r > 100) r = 100;
+            r = r * 2 + 1;
+            goto L2001;
+        }
+        r += 1000;
+    }
+L2001:
+    return r;
+}
 DEV int middle_skip(int a, int b) {              /* several forward gotos, statements in between */
     int r = a;
     if (a > b) goto L1;
@@ -211,12 +243,13 @@ extern "C" __global__ void run(const int* ia, const float* fa, int* out, float* 
       ss_newton(a1, y, finc, nox, (b >> 4) & 1, iwolk, l, zinc, a2, y1, iter);
       fo[8 * t + 0] = a1; fo[8 * t + 1] = y; fo[8 * t + 2] = zinc[l]; fo[8 * t + 3] = a2[l];
       fo[8 * t + 4] = y1[l]; fo[8 * t + 5] = iter[l]; fo[8 * t + 6] = (float)nox; fo[8 * t + 7] = (float)iwolk; }
-    out[6 * t + 0] = iter_newton(fa[t], a);
-    out[6 * t + 1] = nested_exit(a & 15, b & 15, a ^ b);
-    out[6 * t + 2] = switch_exit(a, b & 31);
-    out[6 * t + 3] = label_in_loop(a);
-    out[6 * t + 4] = two_iterations(a);
-    out[6 * t + 5] = middle_skip(a & 511, b & 511);
+    out[7 * t + 0] = iter_newton(fa[t], a);
+    out[7 * t + 1] = nested_exit(a & 15, b & 15, a ^ b);
+    out[7 * t + 2] = switch_exit(a, b & 31);
+    out[7 * t + 3] = label_in_loop(a);
+    out[7 * t + 4] = two_iterations(a);
+    out[7 * t + 5] = middle_skip(a & 511, b & 511);
+    out[7 * t + 6] = into_branch(a, b);
 }
 '''
 
@@ -236,12 +269,14 @@ extern "C" void run_host(const int* ia, const float* fa, int* out, float* fo, in
       ss_newton(a1, y, finc, nox, (b >> 4) & 1, iwolk, l, zinc, a2, y1, iter);
       fo[8 * t + 0] = a1; fo[8 * t + 1] = y; fo[8 * t + 2] = zinc[l]; fo[8 * t + 3] = a2[l];
       fo[8 * t + 4] = y1[l]; fo[8 * t + 5] = iter[l]; fo[8 * t + 6] = (float)nox; fo[8 * t + 7] = (float)iwolk; }
-        out[6 * t + 0] = iter_newton(fa[t], a);
-        out[6 * t + 1] = nested_exit(a & 15, b & 15, a ^ b);
-        out[6 * t + 2] = switch_exit(a, b & 31);
-        out[6 * t + 3] = label_in_loop(a);
-        out[6 * t + 4] = two_iterations(a);
-        out[6 * t + 5] = middle_skip(a & 511, b & 511);
+        out[7 * t + 0] = iter_newton(fa[t], a);
+        out[7 * t + 1] = nested_exit(a & 15, b & 15, a ^ b);
+        out[7 * t + 2] = switch_exit(a, b & 31);
+        out[7 * t + 3] = label_in_loop(a);
+        out[7 * t + 4] = two_iterations(a);
+        out[7 * t + 5] = middle_skip(a & 511, b & 511);
+        out[7 * t + 6] = into_branch(a, b);
+    out[7 * t + 6] = into_branch(a, b);
     }
 }
 '''
@@ -258,21 +293,21 @@ def main():
         open(c, "w").write(HOST)
         subprocess.run(["clang++", "-O1", "-ffp-contract=off", "-shared", "-fPIC", c, "-o", so], check=True)
         lib = ctypes.CDLL(so)
-        ref = np.empty(6 * n, np.int32)
+        ref = np.empty(7 * n, np.int32)
         fref = np.zeros(8 * n, np.float32)
         lib.run_host(ia.ctypes.data_as(ctypes.c_void_p), fa.ctypes.data_as(ctypes.c_void_p),
                      ref.ctypes.data_as(ctypes.c_void_p), fref.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(n))
     src = "#define DEV __device__\n#define FABS fabsf\n" + FUNCS + DRIVER
     k = cp.RawModule(code=src, options=("-std=c++17", "--fmad=false", "--ftz=false")).get_function("run")
-    out = cp.empty(6 * n, cp.int32)
+    out = cp.empty(7 * n, cp.int32)
     fo = cp.zeros(8 * n, cp.float32)
     k(((n + 255) // 256,), (256,), (cp.asarray(ia), cp.asarray(fa), out, fo, np.int32(n)))
     got = cp.asnumpy(out)
     fgot = cp.asnumpy(fo)
     bad = 0
     for j, name in enumerate(("iter_newton", "nested_exit", "switch_exit", "label_in_loop", "two_iterations",
-                              "middle_skip")):
-        d = int(np.count_nonzero(got[j::6] != ref[j::6]))
+                              "middle_skip", "into_branch")):
+        d = int(np.count_nonzero(got[j::7] != ref[j::7]))
         bad += d
         print(f"{name:16s} differing words {d} of {n}")
     d = int(np.count_nonzero(fgot.view(np.uint32) != fref.view(np.uint32)))
