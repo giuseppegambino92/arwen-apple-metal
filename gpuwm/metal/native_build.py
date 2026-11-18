@@ -53,7 +53,42 @@ def build(force: bool = False) -> Path:
     return out
 
 
+_GIL_SRC = r"""
+#include <Python.h>
+/* Single-phase init without a Py_mod_gil slot: importing this module makes a
+   free-threaded interpreter re-enable the GIL for the process. */
+static struct PyModuleDef def = {PyModuleDef_HEAD_INIT, "_arwen_metal_gil", NULL, -1, NULL};
+PyMODINIT_FUNC PyInit__arwen_metal_gil(void) { return PyModule_Create(&def); }
+"""
+
+
+def require_gil():
+    """The Metal backend runs with the GIL.  On free-threaded Python, concurrent
+    ensemble members without it corrupted Python objects (a race in the
+    shim/runtime not yet isolated), so the backend re-enables the GIL, exactly as
+    importing any extension without free-threading support does."""
+    if not bool(sysconfig.get_config_var("Py_GIL_DISABLED")) or sys._is_gil_enabled():
+        return
+    _, _, inc = _flags()
+    h = hashlib.sha256(_GIL_SRC.encode() + sys.version.encode()).hexdigest()[:16]
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    out = cache_dir() / f"_arwen_metal_gil-{h}{suffix}"
+    if not out.exists():
+        src = cache_dir() / f"gil-{h}.c"
+        src.write_text(_GIL_SRC)
+        tmp = out.with_suffix(".tmp.so")
+        subprocess.run(["xcrun", "clang", "-O2", "-fPIC", *inc, "-shared", "-undefined", "dynamic_lookup",
+                        str(src), "-o", str(tmp)], check=True)
+        os.replace(tmp, out)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)       # "The global interpreter lock (GIL) has been enabled ..."
+        spec = importlib.util.spec_from_file_location("_arwen_metal_gil", out)
+        importlib.util.module_from_spec(spec)
+
+
 def load():
+    require_gil()
     path = build()
     spec = importlib.util.spec_from_file_location("_arwen_metal_rt", path)
     mod = importlib.util.module_from_spec(spec)

@@ -43,6 +43,7 @@ import os
 import hashlib
 import json
 import re
+import threading
 import struct
 from collections import defaultdict
 
@@ -3933,8 +3934,20 @@ def metal_flags(opts: NvrtcOptions) -> tuple[str, ...]:
     return ("-fno-fast-math", "-ffp-contract=off", "-fmetal-math-fp32-functions=precise")
 
 
+#: libclang (through ctypes) and the cursor-identity patches are not thread-safe:
+#: under free-threaded Python two translations at once corrupt Python objects.
+#: Translations run one at a time; the Metal compiles that follow stay parallel.
+_TRANSLATE_LOCK = threading.Lock()
+
+
 def translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str = "kernel.cu",
               cupy_raw_module: bool = False) -> Translation:
+    with _TRANSLATE_LOCK:
+        return _translate(source, options, f64_mode=f64_mode, filename=filename, cupy_raw_module=cupy_raw_module)
+
+
+def _translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str = "kernel.cu",
+               cupy_raw_module: bool = False) -> Translation:
     if f64_mode not in F64_MODES:
         raise ValueError(f"f64_mode must be one of {F64_MODES}")
     opts = NvrtcOptions.parse(options, cupy_raw_module=cupy_raw_module)
