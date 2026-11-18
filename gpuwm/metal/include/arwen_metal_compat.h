@@ -515,13 +515,14 @@ inline float nearbyint(float x) { return metal::rint(x); }
 inline float __arwen_fmax_ieee(float x, float y, bool ge) {
     if (metal::isnan(x)) return y;
     if (metal::isnan(y)) return x;
-    if (x == 0.0f && y == 0.0f) return as_type<float>(as_type<uint>(x) & as_type<uint>(y));
+    // zeros by their bits: a hardware compare treats a subnormal as zero
+    if ((as_type<uint>(x) << 1) == 0u && (as_type<uint>(y) << 1) == 0u) return as_type<float>(as_type<uint>(x) & as_type<uint>(y));
     return ge ? x : y;
 }
 inline float __arwen_fmin_ieee(float x, float y, bool le) {
     if (metal::isnan(x)) return y;
     if (metal::isnan(y)) return x;
-    if (x == 0.0f && y == 0.0f) return as_type<float>(as_type<uint>(x) | as_type<uint>(y));
+    if ((as_type<uint>(x) << 1) == 0u && (as_type<uint>(y) << 1) == 0u) return as_type<float>(as_type<uint>(x) | as_type<uint>(y));
     return le ? x : y;
 }
 #if ARWEN_FTZ

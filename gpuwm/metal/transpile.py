@@ -3162,7 +3162,9 @@ class _Module:
             if not mm:
                 continue
             if kind == "binop" and len(outs) == 1 and len(ins) == 2:
-                fn = {"add": "__fadd_rn", "sub": "__fsub_rn", "mul": "__fmul_rn", "div": "__fdiv_rn"}[mm.group(1)]
+                # inline PTX without .ftz is exact on subnormals whatever the module's --ftz
+                fn = {"add": "__arwen_fadd", "sub": "__arwen_fsubtract", "mul": "__arwen_fmul",
+                      "div": "__arwen_fdiv"}[mm.group(1)]
                 self.rw.replace(c.extent.start.offset, c.extent.end.offset, f"{outs[0]} = {fn}({ins[0]}, {ins[1]})")
                 return
             if kind == "cmp" and len(outs) == 1 and len(ins) == 2:
