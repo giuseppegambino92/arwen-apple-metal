@@ -16,6 +16,7 @@ import os
 import re
 import struct
 import sys
+import contextlib
 import threading
 import time
 from pathlib import Path
@@ -257,6 +258,27 @@ class KernelError(RuntimeError):
     pass
 
 
+#: libraries above this size create their pipelines one process at a time: Apple's
+#: compiler service drops its XPC connection when several processes back-end
+#: compile very large libraries at once (Goddard, under a parallel test run)
+HEAVY_LIBRARY_BYTES = int(os.environ.get("ARWEN_METAL_HEAVY_LIBRARY", str(1 << 20)))
+
+
+@contextlib.contextmanager
+def _heavy_compile_lock(nbytes):
+    if nbytes < HEAVY_LIBRARY_BYTES:
+        yield
+        return
+    import fcntl
+    path = cache_dir() / "pipeline.lock"
+    with open(path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def _xpc_retry(make, attempts=3):
     """Apple's compiler service (MTLCompilerService) can drop its XPC connection
     under memory pressure; the request itself is fine and is sent again."""
@@ -290,6 +312,7 @@ class Module:
             tmp.write_text(json.dumps(t.metadata()))
             os.replace(tmp, meta)
         self.key = key
+        self.lib_bytes = lib.stat().st_size
         self.meta = json.loads(meta.read_text())
         if _PROFILE is not None and os.environ.get("ARWEN_METAL_PROFILE"):
             from .frontend import NvrtcOptions
@@ -315,7 +338,8 @@ class Module:
     def pipeline(self, name):
         p = self._pipelines.get(name)
         if p is None:
-            p = self._pipelines[name] = self._make_pipeline(name)
+            with _heavy_compile_lock(self.lib_bytes):
+                p = self._pipelines[name] = self._make_pipeline(name)
         return p
 
     def _make_pipeline(self, name):
