@@ -328,23 +328,28 @@ class Event:
 
     def __init__(self, block=False, disable_timing=False, interprocess=False):
         self._t = None
-        self.done = True
+        self._done = True
 
     def record(self, stream=None):
         _rt_module.rt().flush()
         self._t = None
-        self.done = False
+        self._done = False
 
     def synchronize(self):
         _rt_module.synchronize()
         if self._t is None:
             self._t = time.perf_counter()
-        self.done = True
+        self._done = True
 
     def query(self):
-        if not _rt_module.rt().busy():
+        if not self._done and not _rt_module.rt().busy():
             self.synchronize()
-        return self.done
+        return self._done
+
+    @property
+    def done(self):
+        """CuPy's ``Event.done`` queries the event (cudaEventQuery)."""
+        return self.query()
 
 
 def get_elapsed_time(start, end):
