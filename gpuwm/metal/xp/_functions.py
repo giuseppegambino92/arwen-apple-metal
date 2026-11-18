@@ -69,6 +69,8 @@ def host_call(func, args, kwargs):
     hkw = {k: down(v) for k, v in kwargs.items()}
     res = func(*hargs, **hkw)
     out = kwargs.get("out")
+    if runtime.CAPTURE is not None:
+        return _captured_host_call(func, hargs, hkw, res, out, mems)
     if isinstance(out, ndarray):
         return out
 
@@ -86,6 +88,55 @@ def host_call(func, args, kwargs):
             return [up(y) for y in r]
         return r
     return up(res)
+
+
+def _captured_host_call(func, hargs, hkw, res, out, mems):
+    """host_call while a CUDA graph is being captured: the operands are not
+    computed yet (the captured kernels run at Graph.launch), so the value just
+    computed only gives the result's shape and dtype.  The call is recorded and
+    runs again, in capture order, at every launch, writing into the same
+    device arrays it returns now."""
+    from .. import runtime
+    if isinstance(out, ndarray):
+        runtime.CAPTURE.append(("host", lambda: func(*hargs, **hkw)))
+        return out
+    leaves = []
+
+    def alloc(r):
+        if isinstance(r, np.ndarray):
+            if any(r.size and np.shares_memory(r, v) for v, _ in mems):
+                raise NotImplementedError(f"numpy.{getattr(func, '__name__', func)} returning a view "
+                                          "while a CUDA graph is captured, on the Metal backend")
+            d = _empty(r.shape, r.dtype)
+            leaves.append(d)
+            return d
+        if isinstance(r, np.generic):
+            d = _empty((), r.dtype)
+            leaves.append(d)
+            return d
+        if isinstance(r, tuple):
+            return type(r)(*(alloc(y) for y in r)) if hasattr(r, "_fields") else tuple(alloc(y) for y in r)
+        if isinstance(r, list):
+            return [alloc(y) for y in r]
+        raise NotImplementedError(f"numpy.{getattr(func, '__name__', func)} returning "
+                                  f"{type(r).__name__} while a CUDA graph is captured, on the Metal backend")
+    result = alloc(res)
+
+    def replay():
+        r = func(*hargs, **hkw)
+        flat = []
+
+        def walk(x):
+            if isinstance(x, (tuple, list)):
+                for y in x:
+                    walk(y)
+            else:
+                flat.append(np.asarray(x))
+        walk(r)
+        for d, v in zip(leaves, flat):
+            d._v[...] = v
+    runtime.CAPTURE.append(("host", replay))
+    return result
 
 
 def _dev(a):

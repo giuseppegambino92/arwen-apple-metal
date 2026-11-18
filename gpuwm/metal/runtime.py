@@ -206,6 +206,7 @@ def replay(ops):
             _pending = True
             rt().dispatch(*op[1])
         else:
+            synchronize()            # a host step reads what the GPU work before it wrote
             op[1]()
 
 
@@ -518,7 +519,7 @@ class Kernel:
                 g, gx, gy, gz, bx, by, bz, int(shared_mem))
         if CAPTURE is not None:
             # CUDA-graph capture: recorded with its arguments, run by Graph.launch
-            CAPTURE.append(("dispatch", call, self))
+            CAPTURE.append(("dispatch", call, self, args))   # args keep the operands' memory alive
             return
         _pending = True
         rt().dispatch(*call)
