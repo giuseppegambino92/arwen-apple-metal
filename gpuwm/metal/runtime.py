@@ -292,6 +292,32 @@ class KernelError(RuntimeError):
     pass
 
 
+def _translate(source, options, f64_mode, filename, cupy_raw_module):
+    """CUDA -> MSL in a child process (gpuwm.metal.translate_worker): libclang,
+    driven through ctypes, corrupted Python objects of the process it ran in.
+    ARWEN_METAL_INPROC_TRANSLATE=1 translates in this process (debugging)."""
+    if os.environ.get("ARWEN_METAL_INPROC_TRANSLATE") == "1":
+        t = transpile.translate(source, options, f64_mode=f64_mode, filename=filename, cupy_raw_module=cupy_raw_module)
+        return t.msl, list(t.metal_flags), t.metadata()
+    import subprocess
+    import tempfile
+    from .frontend import TranslationError
+    with tempfile.TemporaryDirectory(prefix="arwen-translate-") as tmp:
+        req, res = os.path.join(tmp, "request.json"), os.path.join(tmp, "result.json")
+        with open(req, "w", encoding="utf-8") as f:
+            json.dump(dict(source=source, options=[str(o) for o in options or ()], f64_mode=f64_mode,
+                           filename=filename, cupy_raw_module=bool(cupy_raw_module)), f)
+        env = dict(os.environ, PYTHON_GIL="1")
+        r = subprocess.run([sys.executable, "-m", "gpuwm.metal.translate_worker", req, res],
+                           capture_output=True, text=True, env=env)
+        if r.returncode != 0 or not os.path.exists(res):
+            raise TranslationError(f"{filename}: translator process failed ({r.returncode}):\n{r.stderr[-4000:]}")
+        out = json.loads(open(res, encoding="utf-8").read())
+    if not out["ok"]:
+        raise TranslationError(out["error"])
+    return out["msl"], out["metal_flags"], out["metadata"]
+
+
 #: libraries above this size (256 KiB) create their pipelines one process at a time: Apple's
 #: compiler service drops its XPC connection when several processes back-end
 #: compile very large libraries at once (Goddard, under a parallel test run)
@@ -337,13 +363,13 @@ class Module:
         d.mkdir(parents=True, exist_ok=True)
         lib, meta = d / f"{key}.metallib", d / f"{key}.json"
         if not (lib.exists() and meta.exists()):
-            t = transpile.translate(source, options, f64_mode=f64_mode, filename=filename, cupy_raw_module=cupy_raw_module)
+            msl, flags, metadata = _translate(source, options, f64_mode, filename, cupy_raw_module)
             msl_tmp = d / f"{key}.{os.getpid()}.{threading.get_ident()}.metal.tmp"
-            msl_tmp.write_text(t.msl)
+            msl_tmp.write_text(msl)
             os.replace(msl_tmp, d / f"{key}.metal")
-            compile_msl(t.msl, t.metal_flags, out=lib)
+            compile_msl(msl, tuple(flags), out=lib)
             tmp = meta.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")   # concurrent builders
-            tmp.write_text(json.dumps(t.metadata()))
+            tmp.write_text(json.dumps(metadata))
             os.replace(tmp, meta)
         self.key = key
         self.lib_bytes = lib.stat().st_size
