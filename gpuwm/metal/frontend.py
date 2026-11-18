@@ -64,7 +64,7 @@ class NvrtcOptions:
                 flags["prec_sqrt"] = o.split("=", 1)[1] == "true"
             elif o in ("--use_fast_math", "-use_fast_math"):
                 flags["fast_math"] = True
-            elif o.startswith(("-arch", "--gpu-architecture", "--maxrregcount", "-lineinfo", "--device-as-default-execution-space",
+            elif o.startswith(("-arch", "--gpu-architecture", "--maxrregcount", "-maxrregcount", "-lineinfo", "--device-as-default-execution-space",
                                "--extra-device-vectorization", "-default-device", "--restrict")):
                 continue    # code-generation tuning with no Metal meaning
             else:

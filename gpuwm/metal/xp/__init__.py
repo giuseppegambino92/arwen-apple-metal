@@ -171,7 +171,29 @@ def _linalg_module():
 
 
 linalg = _linalg_module()
-random = _unimplemented_module("cupy.random")
+def _random_module():
+    """cupy.random on Metal: NumPy's generator on the CPU, results as device
+    arrays (declared on first use).  CuPy's own streams differ from NumPy's in
+    any case, so no caller can depend on CuPy's exact random words."""
+    m = _types.ModuleType("cupy.random")
+
+    def __getattr__(attr):
+        fn = getattr(_np.random, attr, None)
+        if fn is None or attr.startswith("_"):
+            raise NotImplementedError(f"cupy.random.{attr} on the Metal backend")
+        if isinstance(fn, type):           # Generator, RandomState, ...: host objects
+            return fn
+
+        def f(*args, **kw):
+            return _F.host_call(fn, args, kw)
+        f.__name__ = attr
+        setattr(m, attr, f)
+        return f
+    m.__getattr__ = __getattr__
+    return m
+
+
+random = _random_module()
 def _testing_module():
     """cupy.testing's array assertions: device operands are read back (after the GPU
     is done) and compared by numpy.testing, exactly as CuPy's own do."""

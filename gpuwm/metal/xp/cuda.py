@@ -144,6 +144,18 @@ def _memcpy3d(params, stream=0):
             ctypes.memmove(do, so, width)
 
 
+def _memcpy2d(dst, dpitch, src, spitch, width, height, kind, stream=0):
+    """cudaMemcpy2DAsync over unified memory, after the GPU's queued work."""
+    import ctypes
+    _rt_module.synchronize()
+    d, sp = _host_ptr(int(dst)), _host_ptr(int(src))
+    for row in range(int(height)):
+        ctypes.memmove(d + row * int(dpitch), sp + row * int(spitch), int(width))
+
+
+runtime_ns.memcpy2DAsync = _captured(_memcpy2d)
+runtime_ns.memcpy2D = lambda dst, dpitch, src, spitch, width, height, kind: _memcpy2d(
+    dst, dpitch, src, spitch, width, height, kind)
 runtime_ns.memcpy3DAsync = _memcpy3d
 runtime_ns.memcpy3D = lambda params: _memcpy3d(params)
 
@@ -469,6 +481,12 @@ class _Pool:
     def total_bytes(self):
         return self.used_bytes()
 
+    def malloc(self, size):
+        """MemoryPool.malloc: a MemoryPointer to a new device allocation."""
+        from ._core import MemoryPointer as _MPtr
+        mem = _rt_module.DeviceMemory(max(int(size), 1))
+        return _MPtr(mem, mem.gpu)
+
     def free_all_blocks(self, stream=None):
         _rt_module.rt().pool_release()
 
@@ -538,7 +556,8 @@ def MemoryPointer(mem, offset):
 
 
 memory = types.SimpleNamespace(OutOfMemoryError=OutOfMemoryError, MemoryPool=_Pool, UnownedMemory=UnownedMemory,
-                               MemoryPointer=MemoryPointer)
+                               MemoryPointer=MemoryPointer, alloc=lambda size: _POOL.malloc(size))
+alloc = memory.alloc
 MemoryPool = _Pool
 get_allocator = lambda: None  # noqa: E731
 

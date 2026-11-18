@@ -24,6 +24,34 @@ def requested(argv=None) -> bool:
     return False
 
 
+def _host_module(name, source):
+    """A module whose functions run ``source``'s (NumPy / SciPy) on the CPU over
+    unified memory, declared on first use (xp._functions.host_call)."""
+    m = types.ModuleType(name)
+    m.__path__ = []
+
+    def __getattr__(attr):
+        import importlib
+        if attr.startswith("__"):
+            raise AttributeError(attr)
+        try:
+            src = importlib.import_module(source)
+        except ImportError:
+            raise NotImplementedError(f"{name}.{attr} is not available on the Metal backend") from None
+        fn = getattr(src, attr, None)
+        if not callable(fn):
+            raise NotImplementedError(f"{name}.{attr} is not available on the Metal backend")
+        from .xp import _functions as F
+
+        def f(*args, **kw):
+            return F.host_call(fn, args, kw)
+        f.__name__ = attr
+        setattr(m, attr, f)
+        return f
+    m.__getattr__ = __getattr__
+    return m
+
+
 def _stub(name):
     m = types.ModuleType(name)
     m.__path__ = []
@@ -98,6 +126,10 @@ def install():
         elif name.count(".") == 1 and name.startswith("cupy.") and isinstance(
                 getattr(xp, name.split(".")[1], None), types.ModuleType):
             m = getattr(xp, name.split(".")[1])        # a real module of the array layer
+        elif name == "cupyx.scipy.special":
+            m = _host_module(name, "scipy.special")
+        elif name in ("cupy_backends.cuda.api.runtime", "cupy_backends.cuda.api.driver"):
+            m = getattr(cuda, name.rsplit(".", 1)[1])     # the same module as cupy.cuda.<runtime|driver>
         else:
             m = _stub(name)
         sys.modules[name] = m
