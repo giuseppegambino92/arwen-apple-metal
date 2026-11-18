@@ -524,7 +524,8 @@ def _empty(shape, dtype=float, order="C"):
         mem = mp.mem
         v = np.ndarray(shape, dtype, buffer=mem, offset=int(mp.ptr) - mem.gpu, order="F" if order == "F" else "C")
         a = _wrap(v, mem)
-        _ALLOCATED_BY[a] = mp          # keeps the allocator's owner object alive with the array
+        _ALLOCATED_BY[id(a)] = mp      # keeps the allocator's owner object alive with the array
+        _weakref.finalize(a, _ALLOCATED_BY.pop, id(a), None)
         return a
     mem = runtime.DeviceMemory(max(n * dtype.itemsize, 1))
     v = np.ndarray(shape, dtype, buffer=mem, order="F" if order == "F" else "C")
@@ -536,7 +537,7 @@ import weakref as _weakref
 
 #: the allocator cupy.cuda.using_allocator installs for this thread (None: the default pool)
 ALLOCATOR = _threading.local()
-_ALLOCATED_BY = _weakref.WeakKeyDictionary()
+_ALLOCATED_BY = {}
 
 
 def is_device(a) -> bool:

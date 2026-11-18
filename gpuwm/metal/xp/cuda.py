@@ -609,20 +609,31 @@ memory = types.SimpleNamespace(OutOfMemoryError=OutOfMemoryError, MemoryPool=_Po
                                MemoryPointer=MemoryPointer, alloc=lambda size: _POOL.malloc(size))
 alloc = memory.alloc
 MemoryPool = _Pool
-get_allocator = lambda: None  # noqa: E731
+def get_allocator():
+    """The allocator new arrays use: using_allocator's, or the default pool's malloc."""
+    import importlib
+    core = importlib.import_module("gpuwm.metal.xp._core")
+    return getattr(core.ALLOCATOR, "fn", None) or _POOL.malloc
+
+
+def set_allocator(allocator=None):
+    import importlib
+    core = importlib.import_module("gpuwm.metal.xp._core")
+    core.ALLOCATOR.fn = None if allocator is _POOL.malloc else allocator
 
 
 @contextlib.contextmanager
 def using_allocator(allocator=None):
     """New arrays of this thread take their memory from ``allocator(nbytes)``
     (a MemoryPointer), as in CuPy; None restores the default pool."""
-    from . import _core
-    prev = getattr(_core.ALLOCATOR, "fn", None)
-    _core.ALLOCATOR.fn = allocator
+    import importlib
+    core = importlib.import_module("gpuwm.metal.xp._core")   # the module (xp._core is CuPy's namespace alias)
+    prev = getattr(core.ALLOCATOR, "fn", None)
+    core.ALLOCATOR.fn = allocator
     try:
         yield
     finally:
-        _core.ALLOCATOR.fn = prev
+        core.ALLOCATOR.fn = prev
 
 
 def malloc_managed(size):
