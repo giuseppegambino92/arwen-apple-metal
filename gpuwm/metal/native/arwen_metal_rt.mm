@@ -112,6 +112,11 @@ struct Runtime {
     // host intervals spent in synchronize(), one time base (host seconds)
     bool timeline = false;
     std::mutex tl_mu;
+    // buffers whose last command buffer completed, handed over by completion
+    // handlers; those must not take mu: a thread holding mu can be blocked in
+    // commandBuffer creation until a completed buffer's handlers have returned
+    std::mutex done_mu;
+    std::vector<NSArray*> done_keep;
     std::vector<double> tl_gpu;      // start, end pairs
     std::vector<double> tl_sync;     // begin, end pairs
     uint64_t n_eager = 0;
@@ -249,6 +254,15 @@ struct Runtime {
     }
 
     void reap() {
+        {
+            std::vector<NSArray*> ready;
+            {
+                std::lock_guard<std::mutex> dg(done_mu);
+                ready.swap(done_keep);
+            }
+            for (NSArray* keep : ready)
+                for (id<MTLBuffer> b in keep) retire(b);
+        }
         size_t k = 0;
         for (size_t i = 0; i < zombies.size(); ++i) {
             if ([zombies[i].first status] >= MTLCommandBufferStatusCompleted) {
@@ -295,8 +309,8 @@ struct Runtime {
             [deferred removeAllObjects];
             Runtime* self_ = this;
             [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
-                std::lock_guard<std::recursive_mutex> g(self_->mu);
-                for (id<MTLBuffer> b in keep) self_->retire(b);
+                std::lock_guard<std::mutex> dg(self_->done_mu);
+                self_->done_keep.push_back(keep);
             }];
         }
         [cb commit];
