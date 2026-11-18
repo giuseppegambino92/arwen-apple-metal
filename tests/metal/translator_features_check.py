@@ -239,6 +239,35 @@ extern "C" __global__ void heap(const int* in, int* out, int n) {
 '''
 
 
+REF_MEMBER_ARRAY = r'''
+struct Work { double a[8]; double b[8]; };
+__device__ double pick(Work& w, int sel, int n) {
+    const double* p = nullptr;              // first assigned a member array: decays to its element pointer
+    if (sel & 1) { for (int i = 0; i < n; ++i) w.a[i] = i * 1.5; p = w.a; }
+    else         { for (int i = 0; i < n; ++i) w.b[i] = i * 2.5; p = w.b; }
+    double s = 0.0; for (int i = 0; i < n; ++i) s += p[i] * (i + 1);
+    return s;
+}
+extern "C" __global__ void refmem(double* out, int n) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x; if (t >= n) return;
+    Work w; out[t] = pick(w, t, 8);
+}
+'''
+
+
+def ref_member_array():
+    m = cp.RawModule(code=REF_MEMBER_ARRAY, options=("-std=c++17", "--fmad=false"))
+    n = 512
+    out = cp.zeros(n, cp.float64)
+    m.get_function("refmem")(((n + 127) // 128,), (128,), (out, np.int32(n)))
+    i = np.arange(8, dtype=np.float64)
+    odd, even = float(np.sum(i * 1.5 * (i + 1))), float(np.sum(i * 2.5 * (i + 1)))
+    exp = np.where(np.arange(n) & 1, odd, even)
+    d = int(np.count_nonzero(cp.asnumpy(out).view(np.uint64) != exp.view(np.uint64)))
+    print(f"{'ptr = ref.member_array':26s} differing words {d} of {n}")
+    return d
+
+
 def globals_and_heap():
     """A pointer-typed ``__device__`` global, and device malloc/free over repeated launches."""
     m = cp.RawModule(code=GLOBALS_HEAP, options=("-std=c++17",))
@@ -313,6 +342,7 @@ def main():
     print(f"{'(c ? local : dev[i]) = v':26s} differing words {d} of {2 * n}")
     bad += dependent_shared()
     bad += globals_and_heap()
+    bad += ref_member_array()
     return 1 if bad else 0
 
 

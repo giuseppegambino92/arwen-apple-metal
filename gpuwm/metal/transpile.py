@@ -2936,14 +2936,14 @@ class _Module:
                                     self.msl_type(c.type, space="device") + " ")
                 else:
                     self.rw.replace(c.extent.start.offset, name_tok.extent.start.offset,
-                                    f"metal::remove_reference_t<decltype({self.text[rhs.extent.start.offset:rhs.extent.end.offset]})> ")
+                                    self._assigned_pointer_type(rhs) + " ")
             else:
                 # address space from the first assignment to this variable
                 rhs = self._first_assignment(c)
                 if rhs is None:
                     raise TranslationError(f"pointer {c.spelling} declared without initialiser or assignment")
                 self.rw.replace(c.extent.start.offset, name_tok.extent.start.offset,
-                                f"metal::remove_reference_t<decltype({self.text[rhs.extent.start.offset:rhs.extent.end.offset]})> ")
+                                self._assigned_pointer_type(rhs) + " ")
         elif ct.kind == T.LVALUEREFERENCE:
             name_tok = next((t for t in toks if t.spelling == c.spelling
                              and t.extent.start.offset >= c.location.offset), None)
@@ -2974,6 +2974,43 @@ class _Module:
             else:
                 self.rw.replace(start, name_tok.extent.start.offset, f"{sep}decltype(auto) ")
 
+    def _decltype_text(self, e) -> str:
+        """Source text of expression ``e`` as it reads after translation, for use
+        inside a decltype placed elsewhere: a reference parameter the translator
+        turns into a pointer reads ``(*p)``."""
+        base = e.extent.start.offset
+        text = self.text[base:e.extent.end.offset]
+        subs = []
+        for d in e.walk_preorder():
+            if d.kind != K.DECL_REF_EXPR or d.referenced is None or d.referenced.kind != K.PARM_DECL:
+                continue
+            owner = self.parent.get(d.referenced.hash)
+            if owner is None:
+                continue
+            refs = self.ref_params.get(self.fusr(owner), {})
+            params = [p.hash for p in self._params(owner)]
+            idx = params.index(d.referenced.hash) if refs and d.referenced.hash in params else -1
+            if refs.get(idx) == "ptr":
+                subs.append((d.extent.start.offset - base, d.extent.end.offset - base, f"(*{d.spelling})"))
+        for s0, e0, new in sorted(subs, reverse=True):
+            text = text[:s0] + new + text[e0:]
+        return text
+
+    def _assigned_pointer_type(self, rhs) -> str:
+        """The pointer type a variable first assigned ``rhs`` must have: an array
+        operand (``p = w.member_array``) decays, so take its first element's address."""
+        t = self._decltype_text(rhs)
+        inner = rhs
+        while inner.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR):     # through the array-to-pointer decay
+            kids = [k for k in inner.get_children() if k.kind.is_expression()]
+            if not kids:
+                break
+            inner = kids[0]
+        if _canon(rhs.type).kind in (T.CONSTANTARRAY, T.INCOMPLETEARRAY) or \
+                _canon(inner.type).kind in (T.CONSTANTARRAY, T.INCOMPLETEARRAY):
+            return f"metal::remove_reference_t<decltype(&({t})[0])>"
+        return f"metal::remove_reference_t<decltype({t})>"
+
     def _pointer_decl_type(self, c) -> str:
         """The MSL type spelling that replaces a local pointer's declared type."""
         init = [ch for ch in c.get_children() if ch.kind.is_expression()]
@@ -2984,7 +3021,7 @@ class _Module:
             if init:
                 return self.msl_type(c.type, space="device")
             raise TranslationError(f"pointer {c.spelling} declared without initialiser or assignment")
-        return f"metal::remove_reference_t<decltype({self.text[rhs.extent.start.offset:rhs.extent.end.offset]})>"
+        return self._assigned_pointer_type(rhs)
 
     def _ref_param_table(self, c):
         """``T* v[] = {&r1, &r2, ...}`` over reference parameters (pointers after
