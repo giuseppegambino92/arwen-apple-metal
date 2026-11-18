@@ -2668,6 +2668,17 @@ class _Module:
             x = ch
         return None
 
+    def _is_view_ctor(self, ref) -> bool:
+        """A constructor of an array view parametrized by parametrize_views."""
+        if ref is None or ref.kind != K.CONSTRUCTOR:
+            return False
+        rec = ref.semantic_parent
+        name = rec.spelling.split("<")[0] if rec is not None else ""
+        for c in self.nodes:
+            if c.kind == K.CLASS_TEMPLATE and c.spelling == name:
+                return any(f.kind == K.FIELD_DECL and "__ARWEN_AP" in f.type.spelling for f in c.get_children())
+        return False
+
     def _is_null_view_arg(self, a) -> bool:
         """A null literal converted to a view by its constructor (``V<T>(nullptr)`` implicitly)."""
         def written(k):     # default arguments have an empty extent
@@ -2763,7 +2774,8 @@ class _Module:
                 continue
             if i < len(params) and _canon(params[i].type).kind == T.POINTER and self._is_null(a):
                 space = self._null_arg_space(usr, i)
-                if "__ARWEN_AP" in params[i].type.spelling:     # a parametrized view's own pointer
+                if "__ARWEN_AP" in params[i].type.spelling or self._is_view_ctor(ref):
+                    # a parametrized view's own pointer (its type is the view's parameter)
                     self.rw.replace(a.extent.start.offset, a.extent.end.offset, "nullptr", opaque=True)
                     continue
                 self.rw.replace(a.extent.start.offset, a.extent.end.offset,
