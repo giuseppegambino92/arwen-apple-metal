@@ -130,6 +130,30 @@ _DT = {"float32": np.float32, "float64": np.float64, "float": np.float32, "doubl
        "uint32": np.uint32, "int64": np.int64, "uint64": np.uint64, "bool": np.bool_, "int": np.int32}
 
 
+_C_TYPENAME = {"bool": "bool", "int8": "signed char", "uint8": "unsigned char", "int16": "short",
+               "uint16": "unsigned short", "int32": "int", "uint32": "unsigned int", "int64": "long long",
+               "uint64": "unsigned long long", "float16": "float16", "float32": "float", "float64": "double"}
+
+
+class _Param(tuple):
+    """(ctype, name, raw), unpacked so internally, with CuPy's ParameterInfo
+    attributes (name, ctype, raw, is_const) for code that reads the contract."""
+    is_const = False
+    # CuPy reports the C type name of a concrete dtype (int32 -> int); placeholders stay
+    ctype = property(lambda self: _C_TYPENAME.get(self[0], self[0]))
+    name = property(lambda self: self[1])
+    raw = property(lambda self: self[2])
+
+
+def _params(s, is_const):
+    out = []
+    for p in _parse_params(s):
+        q = _Param(p)
+        q.is_const = is_const
+        out.append(q)
+    return out
+
+
 def _parse_params(s):
     out = []
     for p in [x.strip() for x in s.split(",") if x.strip()]:
@@ -146,8 +170,8 @@ def _parse_params(s):
 class ElementwiseKernel:
     def __init__(self, in_params, out_params, operation, name="kernel", reduce_dims=True, preamble="",
                  no_return=False, return_tuple=False, loop_prep="", after_loop="", options=(), **kw):
-        self.in_params = _parse_params(in_params)
-        self.out_params = _parse_params(out_params)
+        self.in_params = _params(in_params, True)
+        self.out_params = _params(out_params, False)
         self.operation = operation
         self.name = name
         self.preamble = preamble
@@ -275,8 +299,8 @@ extern "C" __global__ void ek({", ".join(params + ["long long __n", "Lay __L"])}
 class ReductionKernel:
     def __init__(self, in_params, out_params, map_expr, reduce_expr, post_map_expr, identity, name="reduce_kernel",
                  reduce_type=None, reduce_dims=True, preamble="", options=()):
-        self.in_params = _parse_params(in_params)
-        self.out_params = _parse_params(out_params)
+        self.in_params = _params(in_params, True)
+        self.out_params = _params(out_params, False)
         if len(self.out_params) != 1 or len(self.in_params) > 3:
             raise NotImplementedError("ReductionKernel with several outputs or more than 3 inputs on Metal")
         self.map_expr, self.reduce_expr, self.post_map_expr = map_expr, reduce_expr, post_map_expr
