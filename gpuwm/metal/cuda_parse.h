@@ -89,7 +89,7 @@ __device__ long long __double_as_longlong(double); __device__ double __longlong_
 __device__ int __double2hiint(double); __device__ int __double2loint(double); __device__ double __hiloint2double(int, int);
 __device__ float __double2float_rn(double); __device__ float __double2float_rz(double);
 __device__ int __double2int_rz(double); __device__ int __double2int_rn(double); __device__ long long __double2ll_rn(double); __device__ long long __double2ll_rz(double);
-__device__ double __int2double_rn(int); __device__ float __int2float_rn(int); __device__ double __ll2double_rn(long long);
+__device__ double __int2double_rn(int); __device__ float __int2float_rn(int); __device__ float __uint2float_rn(unsigned int); __device__ double __ll2double_rn(long long);
 __device__ int __float2int_rz(float); __device__ int __float2int_rn(float); __device__ int __float2int_rd(float); __device__ unsigned __float2uint_rz(float);
 __device__ long long __float2ll_rz(float); __device__ long long __float2ll_rn(float);
 // IEEE round-to-nearest arithmetic

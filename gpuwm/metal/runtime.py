@@ -277,9 +277,11 @@ class Module:
         lib, meta = d / f"{key}.metallib", d / f"{key}.json"
         if not (lib.exists() and meta.exists()):
             t = transpile.translate(source, options, f64_mode=f64_mode, filename=filename, cupy_raw_module=cupy_raw_module)
-            (d / f"{key}.metal").write_text(t.msl)
+            msl_tmp = d / f"{key}.{os.getpid()}.{threading.get_ident()}.metal.tmp"
+            msl_tmp.write_text(t.msl)
+            os.replace(msl_tmp, d / f"{key}.metal")
             compile_msl(t.msl, t.metal_flags, out=lib)
-            tmp = meta.with_suffix(".tmp")
+            tmp = meta.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")   # concurrent builders
             tmp.write_text(json.dumps(t.metadata()))
             os.replace(tmp, meta)
         self.key = key

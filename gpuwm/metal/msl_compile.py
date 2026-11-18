@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import os
+import threading
 import subprocess
 import tempfile
 from pathlib import Path
@@ -48,7 +49,7 @@ def compile_msl(msl: str, flags=(), *, out: Path, opt=None) -> Path:
                 (Path(keep) / f"{h}.metal").write_text(msl)
                 (Path(keep) / f"{h}.err").write_text(r.stderr)
             raise MetalCompileError(r.stderr)
-        tmp = out.with_suffix(".tmp")
+        tmp = out.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")   # concurrent builders
         r = subprocess.run(["xcrun", "metallib", str(air), "-o", str(tmp)], capture_output=True, text=True)
         if r.returncode != 0:
             raise MetalCompileError(r.stderr)
