@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import nullcontext
 from datetime import datetime, timezone
+import sys
 import threading
 import time
 import os
@@ -182,7 +183,9 @@ class DiagnosticProductConsumer:
 
     def _run(self):
         try:
-            if hasattr(os, "setpriority") and hasattr(os, "PRIO_PROCESS"):
+            # Per-thread nice is Linux semantics (PRIO_PROCESS takes a thread id there);
+            # elsewhere (macOS) a native thread id is not a pid and the call fails.
+            if sys.platform.startswith("linux") and hasattr(os, "setpriority") and hasattr(os, "PRIO_PROCESS"):
                 task = threading.get_native_id()
                 self._cpu_priority = max(10, os.getpriority(os.PRIO_PROCESS, task))
                 os.setpriority(os.PRIO_PROCESS, task, self._cpu_priority)

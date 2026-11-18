@@ -44,13 +44,32 @@ typedef __f64 __f64m;
 inline __f64 __f64_from_bits(ulong b) { return __f64{b}; }
 inline ulong __f64_bits(__f64 x) { return x.v; }
 
+// ---- float <-> double as CUDA converts them.  In modules compiled with
+// -ftz=true (ARWEN_FTZ) CUDA uses cvt.ftz.f64.f32, which flushes a subnormal
+// float operand to signed zero, and cvt.rn.ftz.f32.f64, which flushes a
+// subnormal float result; with --ftz=false both are exact.
+#if defined(ARWEN_FTZ) && ARWEN_FTZ
+inline ulong __arwen_f32_to_sf(float x) {
+    uint b = as_type<uint>(x);
+    return sf_from_f32(((b & 0x7f800000u) == 0u) ? as_type<float>(b & 0x80000000u) : x);
+}
+inline float __arwen_sf_to_f32(ulong v) {
+    float r = sf_to_f32(v);
+    uint b = as_type<uint>(r);
+    return ((b & 0x7f800000u) == 0u) ? as_type<float>(b & 0x80000000u) : r;
+}
+#else
+inline ulong __arwen_f32_to_sf(float x) { return sf_from_f32(x); }
+inline float __arwen_sf_to_f32(ulong v) { return sf_to_f32(v); }
+#endif
+
 // ---- conversions (every one the translator emits goes through here)
 template <typename To, typename From> struct __arwen_cvt_impl { static To f(From x) { return static_cast<To>(x); } };
 template <typename To, typename From> inline To __arwen_cvt(From x) { return __arwen_cvt_impl<To, From>::f(x); }
 #define ARWEN_CVT(To, From, expr) \
     template <> struct __arwen_cvt_impl<To, From> { static To f(From x) { return expr; } };
 ARWEN_CVT(__f64, __f64, x)
-ARWEN_CVT(__f64, float, __f64{sf_from_f32(x)})
+ARWEN_CVT(__f64, float, __f64{__arwen_f32_to_sf(x)})
 #ifdef __METAL_VERSION__
 ARWEN_CVT(__f64, half, __f64{sf_from_f32((float)x)})
 ARWEN_CVT(half, __f64, (half)sf_to_f32(x.v))
@@ -64,7 +83,7 @@ ARWEN_CVT(__f64, uchar, __f64{sf_from_u64((ulong)x)})
 ARWEN_CVT(__f64, long, __f64{sf_from_i64(x)})
 ARWEN_CVT(__f64, ulong, __f64{sf_from_u64(x)})
 ARWEN_CVT(__f64, bool, __f64{x ? 0x3FF0000000000000UL : 0UL})
-ARWEN_CVT(float, __f64, sf_to_f32(x.v))
+ARWEN_CVT(float, __f64, __arwen_sf_to_f32(x.v))
 ARWEN_CVT(int, __f64, sf_to_i32_rz(x.v))
 ARWEN_CVT(uint, __f64, sf_to_u32_rz(x.v))
 ARWEN_CVT(short, __f64, (short)sf_to_i32_rz(x.v))
@@ -132,10 +151,10 @@ ARWEN_F64_COMPOUND()
 #endif
 // float op= double: C++ computes in double and converts back
 #define ARWEN_F32_COMPOUND_F64(AS)                                                                                     \
-    inline AS float& operator+=(AS float& a, __f64 b) { a = sf_to_f32(sf_add(sf_from_f32(a), b.v)); return a; }      \
-    inline AS float& operator-=(AS float& a, __f64 b) { a = sf_to_f32(sf_sub(sf_from_f32(a), b.v)); return a; }      \
-    inline AS float& operator*=(AS float& a, __f64 b) { a = sf_to_f32(sf_mul(sf_from_f32(a), b.v)); return a; }      \
-    inline AS float& operator/=(AS float& a, __f64 b) { a = sf_to_f32(sf_div(sf_from_f32(a), b.v)); return a; }
+    inline AS float& operator+=(AS float& a, __f64 b) { a = __arwen_sf_to_f32(sf_add(__arwen_f32_to_sf(a), b.v)); return a; }      \
+    inline AS float& operator-=(AS float& a, __f64 b) { a = __arwen_sf_to_f32(sf_sub(__arwen_f32_to_sf(a), b.v)); return a; }      \
+    inline AS float& operator*=(AS float& a, __f64 b) { a = __arwen_sf_to_f32(sf_mul(__arwen_f32_to_sf(a), b.v)); return a; }      \
+    inline AS float& operator/=(AS float& a, __f64 b) { a = __arwen_sf_to_f32(sf_div(__arwen_f32_to_sf(a), b.v)); return a; }
 #ifdef __METAL_VERSION__
 ARWEN_F32_COMPOUND_F64(thread)
 ARWEN_F32_COMPOUND_F64(device)
@@ -152,7 +171,7 @@ inline __f64 __ddiv_rn(__f64 a, __f64 b) { return a / b; }
 __attribute__((noinline)) inline __f64 __dsqrt_rn(__f64 a) { return __f64{sf_sqrt(a.v)}; }
 __attribute__((noinline)) inline __f64 __fma_rn(__f64 a, __f64 b, __f64 c) { return __f64{sf_fma(a.v, b.v, c.v)}; }
 inline __f64 __drcp_rn(__f64 a) { return __f64{sf_div(0x3FF0000000000000UL, a.v)}; }
-inline float __double2float_rn(__f64 a) { return sf_to_f32(a.v); }
+inline float __double2float_rn(__f64 a) { return __arwen_sf_to_f32(a.v); }
 inline int __double2int_rz(__f64 a) { return sf_to_i32_rz(a.v); }
 inline int __double2int_rn(__f64 a) { return sf_to_i32_rz(sf_rint(a.v)); }
 inline long __double2ll_rz(__f64 a) { return sf_to_i64_rz(a.v); }
@@ -190,10 +209,10 @@ inline __f64 fmin(__f64 a, __f64 b) {
 }
 inline __f64 max(__f64 a, __f64 b) { return fmax(a, b); }
 inline __f64 min(__f64 a, __f64 b) { return fmin(a, b); }
-inline __f64 max(float a, __f64 b) { return fmax(__f64{sf_from_f32(a)}, b); }
-inline __f64 max(__f64 a, float b) { return fmax(a, __f64{sf_from_f32(b)}); }
-inline __f64 min(float a, __f64 b) { return fmin(__f64{sf_from_f32(a)}, b); }
-inline __f64 min(__f64 a, float b) { return fmin(a, __f64{sf_from_f32(b)}); }
+inline __f64 max(float a, __f64 b) { return fmax(__f64{__arwen_f32_to_sf(a)}, b); }
+inline __f64 max(__f64 a, float b) { return fmax(a, __f64{__arwen_f32_to_sf(b)}); }
+inline __f64 min(float a, __f64 b) { return fmin(__f64{__arwen_f32_to_sf(a)}, b); }
+inline __f64 min(__f64 a, float b) { return fmin(a, __f64{__arwen_f32_to_sf(b)}); }
 inline __f64 fdim(__f64 a, __f64 b) {
     if (SF_ISNAN(a.v) || SF_ISNAN(b.v)) return a + b;
     return sf_lt(b.v, a.v) ? a - b : __f64{0};

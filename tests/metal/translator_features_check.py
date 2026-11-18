@@ -277,6 +277,37 @@ extern "C" __global__ void add64(unsigned long long* c, long long* d, int n) {
 '''
 
 
+CVT = r'''
+extern "C" __global__ void cvt(const float* x, const double* y, double* xd, float* yf, int n) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x; if (t >= n) return;
+    xd[t] = (double)x[t];            // cvt.f64.f32: .ftz flushes a subnormal operand
+    yf[t] = (float)y[t];             // cvt.rn.f32.f64: .ftz flushes a subnormal result
+}
+'''
+
+
+def ftz_conversions():
+    """float <-> double conversions as CUDA compiles them: flushing under -ftz=true
+    (CuPy's RawModule default), exact under --ftz=false."""
+    x = np.asarray([0x00000001, 0x80000001, 0x007fffff, 0x00800000, 0x3f800000], np.uint32).view(np.float32)
+    y = np.asarray([1e-40, -1e-40, 1.1754942e-38, 1.17549435e-38, 2.0], np.float64)
+    bad = 0
+    for opts, ftz in ((("-std=c++17",), True), (("-std=c++17", "--ftz=false"), False)):
+        k = cp.RawModule(code=CVT, options=opts).get_function("cvt")
+        xd, yf = cp.zeros(5, cp.float64), cp.zeros(5, cp.float32)
+        k((1,), (32,), (cp.asarray(x), cp.asarray(y), xd, yf, np.int32(5)))
+        ex, ey = x.astype(np.float64), y.astype(np.float32)
+        if ftz:
+            sub = lambda a: (np.abs(a) < np.finfo(np.float32).tiny) & (a != 0)
+            ex = np.where(sub(x), np.copysign(0.0, x), ex)
+            ey = np.where(sub(ey), np.copysign(np.float32(0), ey), ey).astype(np.float32)
+        d = int(np.count_nonzero(cp.asnumpy(xd).view(np.uint64) != ex.view(np.uint64))) + \
+            int(np.count_nonzero(cp.asnumpy(yf).view(np.uint32) != ey.view(np.uint32)))
+        bad += d
+        print(f"{'cvt f32<->f64 ftz=' + str(ftz).lower():26s} differing words {d} of 10")
+    return bad
+
+
 def atomic_add64():
     m = cp.RawModule(code=ATOMIC64, options=("-std=c++17",))
     n = 1 << 16
@@ -393,6 +424,7 @@ def main():
     bad += ref_member_array()
     bad += param_repoint()
     bad += atomic_add64()
+    bad += ftz_conversions()
     return 1 if bad else 0
 
 
