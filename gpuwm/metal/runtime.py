@@ -72,6 +72,10 @@ def live_memories():
     return list(_LIVE)
 
 
+#: module globals (and their device heap): not pool memory, as on CUDA
+MODULE_GLOBALS = weakref.WeakSet()
+
+
 class DeviceMemory:
     """An MTLBuffer exporting its bytes through the buffer protocol."""
     __slots__ = ("buf", "cpu", "gpu", "nbytes", "_view", "__weakref__")
@@ -328,6 +332,7 @@ class Module:
         gsize = self.meta.get("globals_size", 0)
         if gsize:
             self.globals = DeviceMemory(gsize)
+            MODULE_GLOBALS.add(self.globals)
             ctypes.memset(self.globals.cpu, 0, gsize)          # CUDA zero-initialises __device__ data
             if "__arwen_init_globals" in self.library.function_names():
                 p = self.pipeline("__arwen_init_globals")       # same -O3 / -Os policy as kernels

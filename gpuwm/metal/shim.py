@@ -129,8 +129,8 @@ def install():
         elif name in ("cupy.fft._fft", "cupy.fft.config"):
             m = types.ModuleType(name)
             m.__dict__.update(vars(getattr(xp.fft, name.rsplit(".", 1)[1])))
-        elif name == "cupyx.scipy.special":
-            m = _host_module(name, "scipy.special")
+        elif name in ("cupyx.scipy.special", "cupyx.scipy.ndimage"):
+            m = _host_module(name, name.replace("cupyx.", "", 1))
         elif name in ("cupy_backends.cuda.api.runtime", "cupy_backends.cuda.api.driver"):
             m = getattr(cuda, name.rsplit(".", 1)[1])     # the same module as cupy.cuda.<runtime|driver>
         else:

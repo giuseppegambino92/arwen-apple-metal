@@ -477,7 +477,10 @@ class OutOfMemoryError(MemoryError):
 
 class _Pool:
     def used_bytes(self):
-        return int(_rt_module.rt().stats()["live_bytes"])
+        """Bytes in use, counted as CuPy's pool counts them: every live allocation
+        rounded up to its 512-byte unit (ArWen's memory plans are written in it)."""
+        return int(sum((int(m.nbytes) + 511) // 512 * 512 for m in _rt_module.live_memories()
+                       if m not in _rt_module.MODULE_GLOBALS))
 
     def free_bytes(self):
         """Bytes the pool holds for reuse (retired buffers waiting in size classes)."""
