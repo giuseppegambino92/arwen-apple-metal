@@ -17,6 +17,7 @@ import re
 import struct
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -251,6 +252,19 @@ class KernelError(RuntimeError):
     pass
 
 
+def _xpc_retry(make, attempts=3):
+    """Apple's compiler service (MTLCompilerService) can drop its XPC connection
+    under memory pressure; the request itself is fine and is sent again."""
+    for i in range(attempts):
+        try:
+            return make()
+        except RuntimeError as e:
+            if "XPC_ERROR" not in str(e) or i == attempts - 1:
+                raise
+            print(f"[arwen-metal] Metal compiler service interrupted; retrying ({i + 1})", file=sys.stderr)
+            time.sleep(5 * (i + 1))
+
+
 class Module:
     """A translated, compiled and loaded CUDA module."""
 
@@ -285,7 +299,7 @@ class Module:
             self.globals = DeviceMemory(gsize)
             ctypes.memset(self.globals.cpu, 0, gsize)          # CUDA zero-initialises __device__ data
             if "__arwen_init_globals" in self.library.function_names():
-                p = self.library.pipeline("__arwen_init_globals")
+                p = self.pipeline("__arwen_init_globals")       # same -O3 / -Os policy as kernels
                 global _pending
                 _pending = True
                 rt().dispatch(p, b"", _launch(1, 1, 1, 1, 1, 1, 1), self.globals.buf, 1, 1, 1, 1, 1, 1, 0)
@@ -306,9 +320,9 @@ class Module:
         from .msl_compile import MSL_OPT
         ident = f"{self.key}:{name}"
         if MSL_OPT == "-Os":
-            return self.library.pipeline(name)
+            return _xpc_retry(lambda: self.library.pipeline(name))
         if ident in _slow_pipelines() or name in _slow_kernel_names():
-            return self._os_library().pipeline(name)
+            return _xpc_retry(lambda: self._os_library().pipeline(name))
         budget = float(os.environ.get("ARWEN_METAL_PIPELINE_BUDGET", "90"))
         result = {}
 
@@ -325,7 +339,7 @@ class Module:
         why = f"failed ({result['e']})" if "e" in result else f"exceeded {budget:.0f} s"
         print(f"[arwen-metal] pipeline {name}: -O3 back-end compile {why}; using the -Os build", file=sys.stderr)
         _remember_slow(ident)
-        return self._os_library().pipeline(name)
+        return _xpc_retry(lambda: self._os_library().pipeline(name))
 
     def _os_library(self):
         lib = getattr(self, "_lib_os", None)
