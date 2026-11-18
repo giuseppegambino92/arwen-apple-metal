@@ -228,8 +228,12 @@ _SEED_SLOW_KERNELS = frozenset({"thompson_fork_column", "cam_driver_stage", "nss
                                 "flg_stream_driver"})
 
 
+#: names every module shares: remembered per module (ident), never by name
+_PER_MODULE_ONLY = frozenset({"__arwen_init_globals"})
+
+
 def _slow_kernel_names() -> set:
-    return {i.rsplit(":", 1)[1] for i in _slow_pipelines()} | _SEED_SLOW_KERNELS
+    return ({i.rsplit(":", 1)[1] for i in _slow_pipelines()} - _PER_MODULE_ONLY) | _SEED_SLOW_KERNELS
 
 
 def _remember_slow(ident: str) -> None:
