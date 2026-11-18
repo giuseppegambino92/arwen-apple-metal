@@ -856,6 +856,20 @@ def pytest_collection_modifyitems(config, items):
                         break
     _gate_on_capabilities(items)
     _gate_on_case_inputs(items)
+    _gate_on_metal_applicability(items)
+
+
+def _gate_on_metal_applicability(items):
+    """On the Apple Metal backend, skip the tests that measure something a Mac
+    does not have (tests/metal_not_applicable.py: each entry names its class and
+    the precise reason).  No effect on CUDA or ROCm."""
+    if os.environ.get("GPUWM_BACKEND", "").lower() != "metal":
+        return
+    from metal_not_applicable import reason_for
+    for item in items:
+        reason = reason_for(item.nodeid)
+        if reason:
+            item.add_marker(pytest.mark.skip(reason=f"not applicable on Metal: {reason}"))
 
 
 @pytest.fixture
