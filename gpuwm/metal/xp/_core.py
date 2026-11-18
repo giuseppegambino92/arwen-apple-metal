@@ -517,6 +517,22 @@ def _empty(shape, dtype=float, order="C"):
         if s < 0:
             raise ValueError("negative dimensions are not allowed")
         n *= s
+    hooks = getattr(HOOKS, "active", None)
+    if hooks:
+        nbytes = n * dtype.itemsize
+        for h in hooks:
+            h.alloc_preprocess(device_id=0, mem_size=nbytes)
+            h.malloc_preprocess(device_id=0, size=nbytes, mem_size=nbytes)
+        a = _empty_unhooked(shape, dtype, order, n)
+        ptr = runtime.device_address(a)
+        for h in reversed(hooks):
+            h.malloc_postprocess(device_id=0, size=nbytes, mem_size=nbytes, mem_ptr=ptr, pmem_id=id(a._gpuwm_mem))
+            h.alloc_postprocess(device_id=0, mem_size=nbytes, mem_ptr=ptr)
+        return a
+    return _empty_unhooked(shape, dtype, order, n)
+
+
+def _empty_unhooked(shape, dtype, order, n):
     alloc = getattr(ALLOCATOR, "fn", None)
     if alloc is not None and n * dtype.itemsize:
         # cupy.cuda.using_allocator: the array's memory comes from that allocator
@@ -537,6 +553,8 @@ import weakref as _weakref
 
 #: the allocator cupy.cuda.using_allocator installs for this thread (None: the default pool)
 ALLOCATOR = _threading.local()
+#: cupy.cuda.MemoryHook objects active in this thread (``with hook:``)
+HOOKS = _threading.local()
 _ALLOCATED_BY = {}
 
 

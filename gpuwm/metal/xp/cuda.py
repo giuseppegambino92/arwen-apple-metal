@@ -620,6 +620,35 @@ memory = types.SimpleNamespace(OutOfMemoryError=OutOfMemoryError, MemoryPool=_Po
                                MemoryPointer=MemoryPointer, alloc=lambda size: _POOL.malloc(size))
 alloc = memory.alloc
 MemoryPool = _Pool
+class MemoryHook:
+    """cupy.cuda.MemoryHook: ``with hook:`` calls its alloc/malloc pre- and
+    post-processing methods around every device-array allocation of this thread
+    (free hooks are not called: Metal buffers are released by the runtime)."""
+    name = "MemoryHook"
+
+    def __enter__(self):
+        import importlib
+        core = importlib.import_module("gpuwm.metal.xp._core")
+        active = getattr(core.HOOKS, "active", None)
+        if active is None:
+            active = core.HOOKS.active = []
+        active.append(self)
+        return self
+
+    def __exit__(self, *exc):
+        import importlib
+        core = importlib.import_module("gpuwm.metal.xp._core")
+        core.HOOKS.active.remove(self)
+        return False
+
+    def alloc_preprocess(self, **kw): pass
+    def alloc_postprocess(self, **kw): pass
+    def malloc_preprocess(self, **kw): pass
+    def malloc_postprocess(self, **kw): pass
+    def free_preprocess(self, **kw): pass
+    def free_postprocess(self, **kw): pass
+
+
 def get_allocator():
     """The allocator new arrays use: using_allocator's, or the default pool's malloc."""
     import importlib
