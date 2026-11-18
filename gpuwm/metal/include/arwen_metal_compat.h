@@ -15,6 +15,7 @@
 #define NULL 0
 #endif
 #define __ARWEN_AS_BASE_REF(...)
+#define __location__(a)                             // CUDA host_defines.h: __device__ is __location__(device)
 #define __align__(n) __attribute__((aligned(n)))
 // parametrize_views (transpile.py): array views over device or thread storage
 #define __ARWEN_DEVPTR(T) device T*

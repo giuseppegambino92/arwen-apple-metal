@@ -193,6 +193,21 @@ def tg_memory_limit() -> int:
 
 _TG_LIMIT = None
 
+#: the work being captured into a CUDA graph (gpuwm.metal.xp.cuda.Stream.begin_capture)
+CAPTURE = None
+
+
+def replay(ops):
+    """Run captured work in capture order."""
+    global _pending
+    for op in ops:
+        if op[0] == "dispatch":
+            _pending = True
+            rt().dispatch(*op[1])
+        else:
+            op[1]()
+
+
 _SLOW = None
 
 
@@ -478,10 +493,15 @@ class Kernel:
             internal = self.name in ("ew", "ek", "rk", "red_thread", "red_block", "scan_rows", "gather_axis",
                                      "flag_count", "scan_counts", "scatter_idx", "scatter_rows")
             before = _nan_counts(args, nan_only=internal)
-        _pending = True
         g = self.module.globals.buf if self.module.globals is not None else None
-        rt().dispatch(self.pso, self.pack(args), _launch(grid[0], grid[1], grid[2], block[0], block[1], block[2], split),
-                      g, gx, gy, gz, bx, by, bz, int(shared_mem))
+        call = (self.pso, self.pack(args), _launch(grid[0], grid[1], grid[2], block[0], block[1], block[2], split),
+                g, gx, gy, gz, bx, by, bz, int(shared_mem))
+        if CAPTURE is not None:
+            # CUDA-graph capture: recorded with its arguments, run by Graph.launch
+            CAPTURE.append(("dispatch", call, self))
+            return
+        _pending = True
+        rt().dispatch(*call)
         if _SYNC_EACH:
             synchronize()
         if check:

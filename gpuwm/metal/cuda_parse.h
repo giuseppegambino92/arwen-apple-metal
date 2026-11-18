@@ -5,6 +5,7 @@
 #pragma once
 #define __host__ __attribute__((host))
 #define __device__ __attribute__((device))
+#define __location__(a) __attribute__((a))
 #define __global__ __attribute__((global))
 #define __shared__ __attribute__((shared))
 #define __constant__ __attribute__((constant))

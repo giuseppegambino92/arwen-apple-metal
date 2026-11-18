@@ -232,7 +232,10 @@ class ndarray:
             k = k if isinstance(k, tuple) else (k,)
             return _wrap(self._v[k + (Ellipsis,)], self._gpuwm_mem)
         from . import _functions
-        return _functions.advanced_getitem(self, key)
+        try:
+            return _functions.advanced_getitem(self, key)
+        except NotImplementedError:
+            return _functions.host_getitem(self, key)
 
     def __setitem__(self, key, value):
         if _is_basic(key):
@@ -243,7 +246,10 @@ class ndarray:
             assign(_wrap(self._v[k], self._gpuwm_mem), value)
             return
         from . import _functions
-        _functions.advanced_setitem(self, key, value)
+        try:
+            _functions.advanced_setitem(self, key, value)
+        except NotImplementedError:
+            _functions.host_setitem(self, key, value)
 
     # ----------------------------------------------------------- views
     def view(self, dtype=None, type=None):

@@ -2,7 +2,8 @@
 
 View-only functions use numpy's own implementation (no data movement).
 Everything that reads or writes elements is a GPU kernel.  Anything not listed
-here raises NotImplementedError with its name: no silent host execution.
+here runs in NumPy on the CPU over the same unified memory, declared on first
+use (host_call): never silently.
 """
 from __future__ import annotations
 
@@ -30,7 +31,11 @@ def dispatch(func, args, kwargs):
     impl = _IMPL.get(func)
     if impl is None:
         return host_call(func, args, kwargs)
-    return impl(*args, **kwargs)
+    try:
+        return impl(*args, **kwargs)
+    except NotImplementedError:
+        # a case the Metal kernel does not cover (e.g. pad mode, diff prepend)
+        return host_call(func, args, kwargs)
 
 
 _TOLD = set()
@@ -682,3 +687,38 @@ def advanced_setitem(a, key, value):
         v = C.full((max(1, inner // a.dtype.itemsize),), value, dtype=a.dtype)
         bc = 1
     K.kernel(_SCATTER, "scatter_rows")(((n * inner + 255) // 256,), (256,), (dst, v, idx, n, inner, inner, inner, bc))
+
+
+
+def _host_index(key):
+    def down(k):
+        if isinstance(k, ndarray):
+            return k._v
+        if isinstance(k, tuple):
+            return tuple(down(x) for x in k)
+        if isinstance(k, list):
+            return [down(x) for x in k]
+        return k
+    return down(key)
+
+
+def host_getitem(a, key):
+    """Advanced indexing the Metal gather does not cover: NumPy over unified memory."""
+    from .. import runtime
+    _notice("advanced indexing (mixed form)")
+    runtime.host_sync()
+    return asarray(a._v[_host_index(key)])
+
+
+def host_setitem(a, key, value):
+    from .. import runtime
+    _notice("advanced assignment (mixed form)")
+    runtime.host_sync()
+    a._v[_host_index(key)] = value._v if isinstance(value, ndarray) else value
+
+
+def _notice(what):
+    import sys
+    if what not in _TOLD:
+        _TOLD.add(what)
+        print(f"[arwen-metal] {what}: computed on the CPU over unified memory (no Metal kernel)", file=sys.stderr)

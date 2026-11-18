@@ -67,7 +67,7 @@ runtime_ns = _RuntimeNS(
     deviceGetPCIBusId=lambda d=0: "0000:00:00.0",
     deviceGetLimit=lambda limit: 0,
     deviceSetLimit=lambda limit, value: None,
-    memcpyHostToDevice=1, memcpyDeviceToHost=2, memcpyDeviceToDevice=3, memcpyDefault=4,
+    memcpyHostToHost=0, memcpyHostToDevice=1, memcpyDeviceToHost=2, memcpyDeviceToDevice=3, memcpyDefault=4,
     cudaLimitStackSize=0, cudaLimitMallocHeapSize=2,
 )
 
@@ -89,7 +89,16 @@ def _host_ptr(p):
 
 
 runtime_ns.memcpy = _memcpy
-runtime_ns.memcpyAsync = lambda dst, src, size, kind, stream=0: _memcpy(dst, src, size, kind)
+def _captured(fn):
+    def f(*args, **kw):
+        if _rt_module.CAPTURE is not None:
+            _rt_module.CAPTURE.append(("host", lambda: fn(*args, **kw)))
+            return None
+        return fn(*args, **kw)
+    return f
+
+
+runtime_ns.memcpyAsync = _captured(lambda dst, src, size, kind, stream=0: _memcpy(dst, src, size, kind))
 runtime_ns.memsetAsync = lambda ptr, value, size, stream=0: (_rt_module.synchronize(),
                                                             __import__("ctypes").memset(_host_ptr(ptr), int(value), int(size)))
 _PINNED = __import__("weakref").WeakSet()
@@ -110,6 +119,30 @@ def _pointer_attributes(ptr):
 
 
 runtime_ns.pointerGetAttributes = _pointer_attributes
+
+
+def _memcpy3d(params, stream=0):
+    """cudaMemcpy3DAsync on linear pitched memory, reading cudaMemcpy3DParms by its
+    ABI (srcArray, srcPos, srcPtr, dstArray, dstPos, dstPtr, extent, kind; size_t
+    fields): row by row over unified memory, after the GPU is done."""
+    import ctypes
+    q = ctypes.cast(int(params), ctypes.POINTER(ctypes.c_size_t * 19)).contents
+    src_array, sx, sy, sz, sptr, spitch, _sxs, sysz = q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]
+    dst_array, dx, dy, dz, dptr, dpitch, _dxs, dysz = q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]
+    width, height, depth = q[16], q[17], q[18]
+    if src_array or dst_array:
+        raise NotImplementedError("cudaMemcpy3DAsync with CUDA arrays on the Metal backend")
+    _rt_module.synchronize()
+    s_base, d_base = _host_ptr(sptr), _host_ptr(dptr)
+    for z in range(depth):
+        for y in range(height):
+            so = s_base + ((sz + z) * sysz + (sy + y)) * spitch + sx
+            do = d_base + ((dz + z) * dysz + (dy + y)) * dpitch + dx
+            ctypes.memmove(do, so, width)
+
+
+runtime_ns.memcpy3DAsync = _memcpy3d
+runtime_ns.memcpy3D = lambda params: _memcpy3d(params)
 
 
 class _HostBlock:
@@ -157,7 +190,29 @@ class Device:
 
     @property
     def attributes(self):
-        return {"MultiProcessorCount": 30, "MaxThreadsPerBlock": 1024, "WarpSize": 32}
+        """CuPy's device attribute names, with the Apple GPU's values (cores as
+        multiprocessors; threadgroup memory as shared memory; one 32-lane SIMD-group
+        as a warp; the reported compute capability matches the sm_120 target)."""
+        tg = 32768
+        try:
+            from ..runtime import tg_memory_limit
+            tg = tg_memory_limit()
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "MultiProcessorCount": 30, "MaxThreadsPerBlock": 1024, "MaxThreadsPerMultiProcessor": 1024,
+            "MaxBlockDimX": 1024, "MaxBlockDimY": 1024, "MaxBlockDimZ": 64,
+            "MaxGridDimX": 2**31 - 1, "MaxGridDimY": 65535, "MaxGridDimZ": 65535, "WarpSize": 32,
+            "MaxSharedMemoryPerBlock": tg, "MaxSharedMemoryPerBlockOptin": tg,
+            "MaxSharedMemoryPerMultiprocessor": 2 * tg, "MaxRegistersPerBlock": 65536,
+            "MaxRegistersPerMultiprocessor": 65536, "TotalConstantMemory": 65536,
+            "ComputeCapabilityMajor": 12, "ComputeCapabilityMinor": 0, "Integrated": 1,
+            "ConcurrentKernels": 1, "UnifiedAddressing": 1, "ManagedMemory": 1, "PageableMemoryAccess": 1,
+            "CanMapHostMemory": 1, "CooperativeLaunch": 0, "L2CacheSize": 0, "ClockRate": 1398000,
+            "MemoryClockRate": 0, "GlobalMemoryBusWidth": 512, "AsyncEngineCount": 1, "ECCEnabled": 0,
+            "PciBusId": 0, "PciDeviceId": 0, "PciDomainId": 0, "MaxPitch": 2**31 - 1,
+            "TextureAlignment": 256, "MultiGpuBoardGroupID": 0, "ComputeMode": 0,
+        }
 
     @property
     def mem_info(self):
@@ -189,6 +244,19 @@ class Device:
 _tls = threading.local()
 
 
+class Graph:
+    """An instantiated CUDA graph: the captured launches and copies, replayed in order."""
+
+    def __init__(self, ops):
+        self._ops = list(ops)
+
+    def upload(self, stream=None):
+        return None
+
+    def launch(self, stream=None):
+        _rt_module.replay(self._ops)
+
+
 class Stream:
     null = None
 
@@ -211,7 +279,20 @@ class Stream:
         return None          # a single in-order queue already orders everything
 
     def is_capturing(self):
-        return False         # no CUDA-graph capture on Metal
+        return _rt_module.CAPTURE is not None and getattr(self, "_capturing", False)
+
+    def begin_capture(self, mode=None):
+        """CUDA-graph capture: kernel launches and copies issued from now on are
+        recorded with their arguments instead of run (as on CUDA)."""
+        if _rt_module.CAPTURE is not None:
+            raise CUDARuntimeError(900, "a stream is already capturing")
+        _rt_module.CAPTURE = []
+        self._capturing = True
+
+    def end_capture(self):
+        ops, _rt_module.CAPTURE = _rt_module.CAPTURE or [], None
+        self._capturing = False
+        return Graph(ops)
 
     def use(self):
         _tls.stream = self
