@@ -540,7 +540,14 @@ def take(a, indices, axis=None, out=None, mode="raise"):
     a = _dev(a)
     if axis is None:
         a, axis = a.ravel(), 0
-    return _gather(a, indices, axis % a.ndim)
+    r = _gather(a, indices, axis % a.ndim)
+    if out is None:
+        return r
+    # out= is written in place (CuPy): callers read it, not the return value
+    if not is_device(out) or tuple(out.shape) != tuple(r.shape):
+        raise ValueError(f"take: out has shape {getattr(out, 'shape', None)}, the result {r.shape}")
+    assign(out, r)
+    return out
 
 
 @implements(np.take_along_axis)
