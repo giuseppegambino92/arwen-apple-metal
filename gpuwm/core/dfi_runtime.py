@@ -90,7 +90,11 @@ def submit_compiled_pass(graph, stream, *, start_ticks, stop_ticks,
     lib = load()
     with _lock:
         if _driver is None:
-            _driver = C.WinDLL('nvcuda.dll') if os.name == 'nt' else C.CDLL('libcuda.so.1')
+            import cupy
+            if getattr(cupy, '_gpuwm_metal', False):
+                _driver = cupy.cuda.driver      # Metal backend: its cuGraphLaunch replays the graph
+            else:
+                _driver = C.WinDLL('nvcuda.dll') if os.name == 'nt' else C.CDLL('libcuda.so.1')
         driver = _driver
     status = lib.aw_dfi_submit_compiled_pass(
         C.cast(driver.cuGraphLaunch, C.c_void_p), graph.graphExec, stream.ptr,

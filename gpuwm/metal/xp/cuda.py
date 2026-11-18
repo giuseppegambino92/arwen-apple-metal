@@ -13,6 +13,7 @@ import threading
 import time
 import os
 import types
+import weakref
 
 import numpy as np
 
@@ -259,11 +260,21 @@ class Device:
 _tls = threading.local()
 
 
+_GRAPHS = weakref.WeakValueDictionary()
+_EVENTS = weakref.WeakValueDictionary()
+
+
 class Graph:
     """An instantiated CUDA graph: the captured launches and copies, replayed in order."""
 
     def __init__(self, ops):
         self._ops = list(ops)
+        _GRAPHS[id(self)] = self
+
+    @property
+    def graphExec(self):
+        """The handle native code passes to cuGraphLaunch."""
+        return id(self)
 
     def upload(self, stream=None):
         return None
@@ -345,7 +356,22 @@ class Event:
         self._t = None
         self._done = True
 
+    @property
+    def ptr(self):
+        _EVENTS[id(self)] = self
+        return id(self)
+
+    def _mark(self):
+        self._t = time.perf_counter()
+        self._done = True
+        self._ticket = 0
+
     def record(self, stream=None):
+        if _rt_module.CAPTURE is not None:
+            # an event node of the graph: marked when the replay reaches it
+            self._done = False
+            _rt_module.CAPTURE.append(("host", self._mark))
+            return
         r = _rt_module.rt()
         r.flush()
         self._t = None
@@ -655,6 +681,32 @@ def _cu_launch_kernel_impl(f, gx, gy, gz, bx, by, bz, shmem, stream, params, ext
     return 0
 
 
+def _cu_graph_launch_impl(graph_exec, stream):
+    g = _GRAPHS.get(int(graph_exec or 0))
+    if g is None:
+        return 400
+    try:
+        g.launch()
+    except Exception as e:  # noqa: BLE001
+        import sys
+        print(f"[arwen-metal] cuGraphLaunch: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cu_event_record_with_flags(event, stream, flags=0):
+    e = _EVENTS.get(int(event or 0))
+    if e is None:
+        return 400
+    e.record()
+    return 0
+
+
+def _make_cu_graph_launch():
+    import ctypes
+    return ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(_cu_graph_launch_impl)
+
+
 def _make_cu_launch_kernel():
     import ctypes
     proto = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
@@ -665,6 +717,8 @@ def _make_cu_launch_kernel():
 
 driver = types.SimpleNamespace(occupancyMaxActiveBlocksPerMultiprocessor=lambda f, b, s: 1,
                                cuLaunchKernel=_make_cu_launch_kernel(),
+                               cuGraphLaunch=_make_cu_graph_launch(),
+                               cuEventRecordWithFlags=_cu_event_record_with_flags,
                                funcGetAttribute=_func_get_attribute,
                                **{"CU_FUNC_ATTRIBUTE_" + n.upper(): i for i, n in enumerate(_FUNC_ATTRS)})
 

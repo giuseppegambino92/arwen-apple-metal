@@ -9,7 +9,10 @@ class PassTiming:
         self.stream = stream
         self.events = [tuple(cp.cuda.Event() for _ in range(3)) for _ in range(count)]
         self.tail = (cp.cuda.Event(),cp.cuda.Event())
-        self.driver = C.WinDLL('nvcuda.dll') if os.name == 'nt' else C.CDLL('libcuda.so.1')
+        if getattr(cp, '_gpuwm_metal', False):
+            self.driver = cp.cuda.driver        # Metal backend: events recorded into the graph
+        else:
+            self.driver = C.WinDLL('nvcuda.dll') if os.name == 'nt' else C.CDLL('libcuda.so.1')
         self.driver.cuEventRecordWithFlags.argtypes = (C.c_void_p,C.c_void_p,C.c_uint)
         self.driver.cuEventRecordWithFlags.restype = C.c_int
 
