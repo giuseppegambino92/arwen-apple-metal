@@ -473,6 +473,11 @@ class Kernel:
         fmt += "x" * ((self._size or 16) - pos)
         return struct.Struct(fmt), kinds
 
+    @property
+    def ptr(self):
+        """The handle CUDA code passes around as a CUfunction (cuLaunchKernel)."""
+        return id(self)
+
     def pack(self, args) -> bytes:
         pk = self.__dict__.get("_pk", False)
         if pk is False:

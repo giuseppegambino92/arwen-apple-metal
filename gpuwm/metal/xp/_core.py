@@ -508,9 +508,26 @@ def _empty(shape, dtype=float, order="C"):
         if s < 0:
             raise ValueError("negative dimensions are not allowed")
         n *= s
+    alloc = getattr(ALLOCATOR, "fn", None)
+    if alloc is not None and n * dtype.itemsize:
+        # cupy.cuda.using_allocator: the array's memory comes from that allocator
+        mp = alloc(n * dtype.itemsize)
+        mem = mp.mem
+        v = np.ndarray(shape, dtype, buffer=mem, offset=int(mp.ptr) - mem.gpu, order="F" if order == "F" else "C")
+        a = _wrap(v, mem)
+        _ALLOCATED_BY[a] = mp          # keeps the allocator's owner object alive with the array
+        return a
     mem = runtime.DeviceMemory(max(n * dtype.itemsize, 1))
     v = np.ndarray(shape, dtype, buffer=mem, order="F" if order == "F" else "C")
     return _wrap(v, mem)
+
+
+import threading as _threading
+import weakref as _weakref
+
+#: the allocator cupy.cuda.using_allocator installs for this thread (None: the default pool)
+ALLOCATOR = _threading.local()
+_ALLOCATED_BY = _weakref.WeakKeyDictionary()
 
 
 def is_device(a) -> bool:

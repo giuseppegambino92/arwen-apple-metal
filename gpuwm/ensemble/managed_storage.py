@@ -61,6 +61,12 @@ class ManagedStorage:
         # CUDA retains this symbol for ABI compatibility (Driver API 12.8,
         # Unified Addressing, cuMemPrefetchAsync). Do not bind the v2 symbol
         # with this signature: v2 takes a location struct and an extra flag.
+        if getattr(cp, '_gpuwm_metal', False):
+            # Apple silicon (Metal backend): CPU and GPU share one physical
+            # memory, so there is nothing to migrate; prefetch succeeds as a no-op.
+            self._driver = None
+            self._prefetch = lambda pointer, size, destination, stream: 0
+            return
         self._driver = (ctypes.WinDLL('nvcuda.dll') if sys.platform == 'win32'
                         else ctypes.CDLL('libcuda.so.1'))
         self._prefetch = self._driver.cuMemPrefetchAsync

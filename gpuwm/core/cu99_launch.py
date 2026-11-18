@@ -95,6 +95,11 @@ def _cuda_driver():
         # Resolve CUDA only for submission. The native scalar scheduler
         # also runs on CPU build/test hosts without an installed driver.
         # A global symbol preserves an explicitly preloaded recorder.
+        import cupy
+        if getattr(cupy, "_gpuwm_metal", False):
+            # Metal backend: its cuLaunchKernel launches the translated kernels
+            _DRIVER = cupy.cuda.driver
+            return _DRIVER
         driver = ctypes.CDLL(None) if os.name != "nt" else ctypes.WinDLL("nvcuda.dll")
         if not hasattr(driver, "cuLaunchKernel"):
             driver = ctypes.CDLL("libcuda.so.1")

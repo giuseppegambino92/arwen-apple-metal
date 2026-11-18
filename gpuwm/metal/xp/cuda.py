@@ -41,7 +41,7 @@ def _props():
     return {"name": r.name.encode(), "totalGlobalMem": total, "multiProcessorCount": 30,
             "maxThreadsPerBlock": 1024, "maxThreadsPerMultiProcessor": 1024, "maxBlocksPerMultiProcessor": 32,
             "concurrentKernels": 1, "asyncEngineCount": 0, "unifiedAddressing": 1, "managedMemory": 1,
-            "ECCEnabled": 0, "computeMode": 0, "totalConstMem": 65536, "sharedMemPerBlock": 32768, "sharedMemPerBlockOptin": 32768,
+            "ECCEnabled": 0, "computeMode": 0, "concurrentManagedAccess": 1, "pageableMemoryAccess": 1, "totalConstMem": 65536, "sharedMemPerBlock": 32768, "sharedMemPerBlockOptin": 32768,
             "sharedMemPerMultiprocessor": 65536, "regsPerBlock": 65536, "warpSize": 32,
             "major": 12, "minor": 0, "clockRate": 1398000, "memoryClockRate": 0, "memoryBusWidth": 512,
             "l2CacheSize": 0, "maxThreadsDim": (1024, 1024, 1024), "maxGridSize": (2**31 - 1, 65535, 65535),
@@ -476,6 +476,9 @@ class OutOfMemoryError(MemoryError):
 
 
 class _Pool:
+    def __init__(self, allocator=None):
+        self._allocator = allocator
+
     def used_bytes(self):
         """Bytes in use, counted as CuPy's pool counts them: every live allocation
         rounded up to its 512-byte unit (ArWen's memory plans are written in it)."""
@@ -491,7 +494,10 @@ class _Pool:
         return self.used_bytes()
 
     def malloc(self, size):
-        """MemoryPool.malloc: a MemoryPointer to a new device allocation."""
+        """MemoryPool.malloc: a MemoryPointer to a new allocation (from the pool's
+        own allocator when it was built with one, as MemoryPool(allocator))."""
+        if self._allocator is not None:
+            return self._allocator(int(size))
         from ._core import MemoryPointer as _MPtr
         mem = _rt_module.DeviceMemory(max(int(size), 1))
         return _MPtr(mem, mem.gpu)
@@ -573,7 +579,22 @@ get_allocator = lambda: None  # noqa: E731
 
 @contextlib.contextmanager
 def using_allocator(allocator=None):
-    yield
+    """New arrays of this thread take their memory from ``allocator(nbytes)``
+    (a MemoryPointer), as in CuPy; None restores the default pool."""
+    from . import _core
+    prev = getattr(_core.ALLOCATOR, "fn", None)
+    _core.ALLOCATOR.fn = allocator
+    try:
+        yield
+    finally:
+        _core.ALLOCATOR.fn = prev
+
+
+def malloc_managed(size):
+    """cudaMallocManaged: on Apple silicon all device memory is unified."""
+    from ._core import MemoryPointer as _MPtr
+    mem = _rt_module.DeviceMemory(max(int(size), 1))
+    return _MPtr(mem, mem.gpu)
 
 
 def _nvrtc_version():
@@ -604,7 +625,46 @@ def _func_get_attribute(attribute, ptr):
     return Function(k).attributes[_FUNC_ATTRS[int(attribute)]]
 
 
+def _cu_launch_kernel_impl(f, gx, gy, gz, bx, by, bz, shmem, stream, params, extra):
+    """cuLaunchKernel for native callers (a C function pointer): ``params`` is
+    CUDA's void** kernelParams, each entry pointing at one argument's value; the
+    values are read by the translated kernel's parameter layout and launched."""
+    import ctypes
+    import numpy as _np
+    from ._custom import _BY_PTR
+    k = _BY_PTR.get(int(f or 0))
+    if k is None:
+        return 400                       # CUDA_ERROR_INVALID_HANDLE
+    args = []
+    try:
+        for i, p in enumerate(k._layout):
+            at = params[i]
+            if p["kind"] == "ptr":
+                args.append(ctypes.c_uint64.from_address(at).value)
+            elif p["kind"] == "scalar":
+                code = p["code"]
+                dt = _np.dtype(_rt_module._FMT[code])
+                args.append(_np.frombuffer(ctypes.string_at(at, dt.itemsize), dt)[0])
+            else:
+                args.append(ctypes.string_at(at, p["size"]))
+        k.launch((gx, gy, gz), (bx, by, bz), tuple(args), shmem)
+    except Exception as e:  # noqa: BLE001 - a C caller gets a CUDA status, the reason goes to stderr
+        import sys
+        print(f"[arwen-metal] cuLaunchKernel({k.name}): {e}", file=sys.stderr)
+        return 1                         # CUDA_ERROR_INVALID_VALUE
+    return 0
+
+
+def _make_cu_launch_kernel():
+    import ctypes
+    proto = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                             ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+                             ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p))
+    return proto(_cu_launch_kernel_impl)
+
+
 driver = types.SimpleNamespace(occupancyMaxActiveBlocksPerMultiprocessor=lambda f, b, s: 1,
+                               cuLaunchKernel=_make_cu_launch_kernel(),
                                funcGetAttribute=_func_get_attribute,
                                **{"CU_FUNC_ATTRIBUTE_" + n.upper(): i for i, n in enumerate(_FUNC_ATTRS)})
 
