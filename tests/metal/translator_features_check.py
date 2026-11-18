@@ -255,6 +255,33 @@ extern "C" __global__ void refmem(double* out, int n) {
 '''
 
 
+REPOINT = r'''
+extern "C" __global__ void repoint(const float* dnw, const float* c1h, float* out, int nz, int n) {
+    __shared__ float tc[128];
+    for (unsigned int at = threadIdx.x; at < (unsigned)nz; at += blockDim.x) { tc[at] = dnw[at]; tc[nz + at] = c1h[at]; }
+    __syncthreads();
+    dnw = tc;                               // a kernel parameter moved into __shared__ memory
+    c1h = tc + nz;
+    int t = blockIdx.x * blockDim.x + threadIdx.x; if (t >= n) return;
+    out[t] = dnw[t % nz] * 2.0f + c1h[(t * 7) % nz];
+}
+'''
+
+
+def param_repoint():
+    m = cp.RawModule(code=REPOINT, options=("-std=c++17", "--fmad=false"))
+    nz, n = 64, 4096
+    a = np.random.default_rng(9).uniform(-3, 3, nz).astype(np.float32)
+    b = np.random.default_rng(10).uniform(-3, 3, nz).astype(np.float32)
+    out = cp.zeros(n, cp.float32)
+    m.get_function("repoint")(((n + 127) // 128,), (128,), (cp.asarray(a), cp.asarray(b), out, np.int32(nz), np.int32(n)))
+    t = np.arange(n)
+    exp = (a[t % nz] * np.float32(2) + b[(t * 7) % nz]).astype(np.float32)
+    d = int(np.count_nonzero(cp.asnumpy(out).view(np.uint32) != exp.view(np.uint32)))
+    print(f"{'param = __shared__ array':26s} differing words {d} of {n}")
+    return d
+
+
 def ref_member_array():
     m = cp.RawModule(code=REF_MEMBER_ARRAY, options=("-std=c++17", "--fmad=false"))
     n = 512
@@ -343,6 +370,7 @@ def main():
     bad += dependent_shared()
     bad += globals_and_heap()
     bad += ref_member_array()
+    bad += param_repoint()
     return 1 if bad else 0
 
 

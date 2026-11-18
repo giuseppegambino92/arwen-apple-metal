@@ -1629,10 +1629,50 @@ class _Module:
             self.rw.insert(st.extent.start.offset, f"if (!{flag}) {{ ", order=-1e8)
             self.rw.insert(semi, " }", order=1e8)
 
+    def edit_param_repoints(self):
+        """``p = shared_array;`` for a pointer parameter of a kernel, as a statement
+        of the kernel body: a CUDA generic pointer moved from device to
+        threadgroup memory, which one MSL pointer cannot be.  From that statement
+        on the parameter is a new threadgroup pointer, ``auto __arwen_tg_p = ...``;
+        uses before it keep the device parameter.  Any other re-pointing into
+        threadgroup memory is a TranslationError."""
+        for c in self.nodes:
+            if c.kind != K.BINARY_OPERATOR:
+                continue
+            ch = list(c.get_children())
+            if len(ch) != 2 or ch[0].kind != K.DECL_REF_EXPR or ch[0].referenced is None \
+                    or ch[0].referenced.kind != K.PARM_DECL or _canon(ch[0].type).kind != T.POINTER:
+                continue
+            toks = _tokens(c)
+            if not any(t.spelling == "=" and ch[0].extent.end.offset <= t.extent.start.offset
+                       < ch[1].extent.start.offset for t in toks):
+                continue
+            if self._expr_space(ch[1]) != "threadgroup":
+                continue
+            param = ch[0].referenced
+            fn = self.parent.get(param.hash)
+            body = next((k for k in fn.get_children() if k.kind == K.COMPOUND_STMT), None) if fn is not None else None
+            if fn is None or not self.is_kernel(fn) or body is None or \
+                    not any(k.hash == c.hash for k in body.get_children()):
+                raise TranslationError(f"pointer parameter {param.spelling} re-pointed into __shared__ memory "
+                                       "other than by a statement of the kernel body")
+            new = f"__arwen_tg_{param.spelling}"
+            after = c.extent.end.offset
+            for d in self.nodes:
+                if d.kind == K.DECL_REF_EXPR and d.referenced is not None and d.referenced.hash == param.hash \
+                        and d.extent.start.offset > after:
+                    p2 = self.parent.get(d.hash)
+                    if p2 is not None and p2.kind == K.BINARY_OPERATOR and list(p2.get_children())[0].hash == d.hash \
+                            and any(t.spelling == "=" for t in _tokens(p2)[:2]):
+                        raise TranslationError(f"pointer parameter {param.spelling} re-pointed more than once")
+                    self.rw.replace(d.extent.start.offset, d.extent.end.offset, new)
+            self.rw.replace(ch[0].extent.start.offset, ch[0].extent.end.offset, f"auto {new}")
+
     def run(self) -> Translation:
         self.collect()
         self.analyse()
         self.find_reassigned()
+        self.edit_param_repoints()
         self.eliminate_gotos()
         self.edit_fields()
         self.edit_init_lists()
