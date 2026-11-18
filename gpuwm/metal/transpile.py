@@ -2396,8 +2396,11 @@ class _Module:
                 elif ref.kind == K.VAR_DECL and self._main(ref) and self._is_mutable_global(ref):
                     g = self.globals_mut[ref.get_usr()]
                     dims = "".join(f"[{d}]" for d in getattr(g, "dims", []))
-                    expr = (f"(*(device {g.msl_type}*)(__arwen_ctx.g + {g.offset}))" if not dims
-                            else f"(*(device {g.msl_type} (*){dims})(__arwen_ctx.g + {g.offset}))")
+                    # a pointer object stored in device memory: ``device T* device``
+                    dv = (f"{g.msl_type} device" if g.msl_type.rstrip().endswith("*")
+                          else f"device {g.msl_type}")
+                    expr = (f"(*({dv}*)(__arwen_ctx.g + {g.offset}))" if not dims
+                            else f"(*({dv} (*){dims})(__arwen_ctx.g + {g.offset}))")
                     self.rw.replace(c.extent.start.offset, c.extent.end.offset, expr)
                 elif ref.kind == K.PARM_DECL:
                     owner = self.parent.get(ref.hash)
@@ -3527,6 +3530,49 @@ def parametrize_views(text: str, filename: str) -> str:
     return rw.apply()
 
 
+#: CUDA's device heap (malloc/free in device code) on Metal: a per-module heap in
+#: the module's globals with an atomic bump offset, reset by the runtime before
+#: every launch of the module (``__arwen_heap_reset``).  Exact for allocations
+#: that do not outlive their launch -- ArWen's only user, the Grell-Freitas spill,
+#: frees each one at the end of its column.  Exhaustion returns nullptr, as CUDA.
+DEVICE_HEAP_BYTES = int(os.environ.get("ARWEN_METAL_DEVICE_HEAP", str(256 << 20)))
+_HEAP_CALL = re.compile(r"(?<![\w.>:])(malloc|free)\s*\(")
+
+
+_CLOCK_CALL = re.compile(r"(?<![\w.>:])(clock64|clock)\s*\(\s*\)")
+
+
+def device_clock(text: str) -> str:
+    """CUDA's clock()/clock64() on Metal, which has no device cycle counter: a
+    per-module counter that advances by one on every read (monotonic, so timed
+    busy-waits end and elapsed counts are positive, but they count reads, not
+    cycles)."""
+    if not _CLOCK_CALL.search(text):
+        return text
+    return ("__device__ unsigned int __arwen_clock_ctr;\n"
+            "__device__ long long __arwen_clock64() { return (long long)atomicAdd(&__arwen_clock_ctr, 1u) + 1; }\n"
+            + _CLOCK_CALL.sub("__arwen_clock64()", text))
+
+
+def device_heap(text: str) -> str:
+    text = device_clock(text)
+    if not re.search(r"(?<![\w.>:])malloc\s*\(", text):
+        return text
+    body = _HEAP_CALL.sub(lambda m: f"__arwen_{m.group(1)}(", text)
+    return (f"__device__ unsigned char __arwen_heap[{DEVICE_HEAP_BYTES}u];\n"
+            "__device__ unsigned int __arwen_heap_top;\n"
+            "__device__ void* __arwen_malloc(unsigned long long n) {\n"
+            "    unsigned int need = (unsigned int)((n + 15ull) & ~15ull);\n"
+            "    unsigned int at = atomicAdd(&__arwen_heap_top, need);\n"
+            "    unsigned char* r = __arwen_heap + at;\n"
+            f"    if (n > {DEVICE_HEAP_BYTES}ull || (unsigned long long)at + need > {DEVICE_HEAP_BYTES}ull) r = nullptr;\n"
+            "    return (void*)r;\n"
+            "}\n"
+            "__device__ void __arwen_free(void*) {}\n"
+            "extern \"C\" __global__ void __arwen_heap_reset() { __arwen_heap_top = 0u; }\n"
+            + body)
+
+
 def hoist_branch_labels(text: str, filename: str) -> str:
     """A forward ``goto L`` into another branch of an enclosing ``if`` (f2c output:
     ``if (a) { ... goto L; } else { ...; L: tail }``) has no structured form in
@@ -3800,6 +3846,7 @@ def translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str 
     if opts.unknown:
         raise TranslationError(f"unsupported NVRTC options: {opts.unknown}")
     pp = preprocess(source, opts, filename)
+    pp = device_heap(pp)
     pp = flatten_inheritance(pp, filename)
     pp = hoist_block_prototypes(pp, filename)
     pp = hoist_branch_labels(pp, filename)

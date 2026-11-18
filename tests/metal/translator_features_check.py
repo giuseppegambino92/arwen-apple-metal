@@ -220,6 +220,52 @@ def dependent_shared():
     return bad
 
 
+GLOBALS_HEAP = r'''
+__device__ unsigned int* bound;
+extern "C" __global__ void bind(unsigned int* c) { if (threadIdx.x == 0 && blockIdx.x == 0) bound = c; }
+extern "C" __global__ void bump(int n) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t < n) atomicAdd(bound + (t % 64), 1u);
+}
+extern "C" __global__ void heap(const int* in, int* out, int n) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x; if (t >= n) return;
+    int m = 8 + (in[t] & 63);
+    int* p = (int*)malloc(m * sizeof(int));
+    if (p == nullptr) { out[t] = -1; return; }
+    for (int i = 0; i < m; ++i) p[i] = in[t] ^ (i * 2654435761u);
+    int s = 0; for (int i = m - 1; i >= 0; --i) s = s * 31 + p[i];
+    free(p); out[t] = s;
+}
+'''
+
+
+def globals_and_heap():
+    """A pointer-typed ``__device__`` global, and device malloc/free over repeated launches."""
+    m = cp.RawModule(code=GLOBALS_HEAP, options=("-std=c++17",))
+    counts = cp.zeros(64, cp.uint32)
+    m.get_function("bind")((1,), (1,), (counts,))
+    n = 64 * 1000
+    for _ in range(5):
+        m.get_function("bump")(((n + 255) // 256,), (256,), (np.int32(n),))
+    d1 = int(np.count_nonzero(cp.asnumpy(counts) != 5000))
+    print(f"{'pointer __device__ global':26s} differing words {d1} of 64")
+    x = np.random.default_rng(5).integers(0, 1 << 30, 50_000).astype(np.int32)
+    exp = np.empty_like(x)
+    for t, v in enumerate(x.tolist()):
+        mm = 8 + (v & 63)
+        p = [(v ^ ((i * 2654435761) & 0xFFFFFFFF)) & 0xFFFFFFFF for i in range(mm)]
+        acc = 0
+        for i in range(mm - 1, -1, -1):
+            acc = (acc * 31 + p[i]) & 0xFFFFFFFF
+        exp[t] = np.uint32(acc).view(np.int32)
+    out = cp.zeros_like(cp.asarray(x))
+    for _ in range(4):
+        m.get_function("heap")(((x.size + 255) // 256,), (256,), (cp.asarray(x), out, np.int32(x.size)))
+    d2 = int(np.count_nonzero(cp.asnumpy(out) != exp))
+    print(f"{'device malloc/free':26s} differing words {d2} of {x.size}")
+    return d1 + d2
+
+
 def main():
     n = 100_000
     rng = np.random.default_rng(11)
@@ -266,6 +312,7 @@ def main():
     bad += d
     print(f"{'(c ? local : dev[i]) = v':26s} differing words {d} of {2 * n}")
     bad += dependent_shared()
+    bad += globals_and_heap()
     return 1 if bad else 0
 
 

@@ -298,6 +298,7 @@ class Module:
             for k in self.meta["kernels"]:
                 _KTAGS.setdefault(k, set()).add(tag)
         self.library = rt().load_library(str(lib))
+        self.has_heap = "__arwen_heap_reset" in self.meta["kernels"]
         self.f64_mode = f64_mode
         self._pipelines = {}
         self.globals = None
@@ -357,6 +358,13 @@ class Module:
                 compile_msl((d / f"{self.key}.metal").read_text(), tuple(self.meta["metal_flags"]), out=path, opt="-Os")
             lib = self._lib_os = rt().load_library(str(path))
         return lib
+
+    @property
+    def heap_reset(self):
+        k = getattr(self, "_heap_reset", None)
+        if k is None:
+            k = self._heap_reset = Kernel(self, "__arwen_heap_reset")
+        return k
 
     def get_function(self, name):
         if name not in self.meta["kernels"]:
@@ -515,6 +523,9 @@ class Kernel:
                                      "flag_count", "scan_counts", "scatter_idx", "scatter_rows")
             before = _nan_counts(args, nan_only=internal)
         g = self.module.globals.buf if self.module.globals is not None else None
+        if self.module.has_heap and self.name != "__arwen_heap_reset":
+            # CUDA device heap: every launch of the module starts from an empty heap
+            self.module.heap_reset.launch((1, 1, 1), (1, 1, 1), ())
         call = (self.pso, self.pack(args), _launch(grid[0], grid[1], grid[2], block[0], block[1], block[2], split),
                 g, gx, gy, gz, bx, by, bz, int(shared_mem))
         if CAPTURE is not None:
