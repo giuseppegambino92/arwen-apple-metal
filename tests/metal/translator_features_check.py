@@ -268,6 +268,27 @@ extern "C" __global__ void repoint(const float* dnw, const float* c1h, float* ou
 '''
 
 
+ATOMIC64 = r'''
+extern "C" __global__ void add64(unsigned long long* c, long long* d, int n) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x; if (t >= n) return;
+    atomicAdd(&c[t & 3], 0xFFFFFFFFull + (unsigned long long)t);       // every add carries into the high word
+    atomicAdd((unsigned long long*)&d[0], (unsigned long long)(long long)(-3));
+}
+'''
+
+
+def atomic_add64():
+    m = cp.RawModule(code=ATOMIC64, options=("-std=c++17",))
+    n = 1 << 16
+    c, d = cp.zeros(4, cp.uint64), cp.zeros(1, cp.int64)
+    m.get_function("add64")(((n + 255) // 256,), (256,), (c, d, np.int32(n)))
+    t = np.arange(n, dtype=np.uint64)
+    exp = np.array([np.sum(np.uint64(0xFFFFFFFF) + t[t % 4 == j]) for j in range(4)], np.uint64)
+    bad = int(np.count_nonzero(cp.asnumpy(c) != exp)) + int(int(d.get()[0]) != -3 * n)
+    print(f"{'64-bit atomicAdd':26s} differing words {bad} of 5")
+    return bad
+
+
 def param_repoint():
     m = cp.RawModule(code=REPOINT, options=("-std=c++17", "--fmad=false"))
     nz, n = 64, 4096
@@ -371,6 +392,7 @@ def main():
     bad += globals_and_heap()
     bad += ref_member_array()
     bad += param_repoint()
+    bad += atomic_add64()
     return 1 if bad else 0
 
 

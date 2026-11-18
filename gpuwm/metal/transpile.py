@@ -2976,14 +2976,14 @@ class _Module:
                                     self.msl_type(c.type, space="device") + " ")
                 else:
                     self.rw.replace(c.extent.start.offset, name_tok.extent.start.offset,
-                                    self._assigned_pointer_type(rhs) + " ")
+                                    self._assigned_pointer_type(rhs, c) + " ")
             else:
                 # address space from the first assignment to this variable
                 rhs = self._first_assignment(c)
                 if rhs is None:
                     raise TranslationError(f"pointer {c.spelling} declared without initialiser or assignment")
                 self.rw.replace(c.extent.start.offset, name_tok.extent.start.offset,
-                                self._assigned_pointer_type(rhs) + " ")
+                                self._assigned_pointer_type(rhs, c) + " ")
         elif ct.kind == T.LVALUEREFERENCE:
             name_tok = next((t for t in toks if t.spelling == c.spelling
                              and t.extent.start.offset >= c.location.offset), None)
@@ -3036,9 +3036,16 @@ class _Module:
             text = text[:s0] + new + text[e0:]
         return text
 
-    def _assigned_pointer_type(self, rhs) -> str:
+    def _assigned_pointer_type(self, rhs, var=None) -> str:
         """The pointer type a variable first assigned ``rhs`` must have: an array
-        operand (``p = w.member_array``) decays, so take its first element's address."""
+        operand (``p = w.member_array``) decays, so take its first element's address.
+        When ``rhs`` names something declared after ``var`` (declarations hoisted to
+        the top of a function), a decltype at the declaration cannot see it: the
+        declared type, in the address space ``rhs`` points into (device if unknown)."""
+        if var is not None and any(
+                d.kind == K.DECL_REF_EXPR and d.referenced is not None and d.referenced.kind == K.VAR_DECL
+                and d.referenced.extent.start.offset > var.extent.end.offset for d in rhs.walk_preorder()):
+            return self.msl_type(var.type, space=self._expr_space(rhs) or "device")
         t = self._decltype_text(rhs)
         inner = rhs
         while inner.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR):     # through the array-to-pointer decay
@@ -3061,7 +3068,7 @@ class _Module:
             if init:
                 return self.msl_type(c.type, space="device")
             raise TranslationError(f"pointer {c.spelling} declared without initialiser or assignment")
-        return self._assigned_pointer_type(rhs)
+        return self._assigned_pointer_type(rhs, c)
 
     def _ref_param_table(self, c):
         """``T* v[] = {&r1, &r2, ...}`` over reference parameters (pointers after

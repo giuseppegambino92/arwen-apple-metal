@@ -320,6 +320,26 @@ ARWEN_ATOMIC_INT(device, int, atomic_int)
 ARWEN_ATOMIC_INT(device, uint, atomic_uint)
 ARWEN_ATOMIC_INT(threadgroup, int, atomic_int)
 ARWEN_ATOMIC_INT(threadgroup, uint, atomic_uint)
+// 64-bit atomicAdd (counters): Apple GPUs have no 64-bit atomic add.  Two 32-bit
+// atomics, the carry of the low word added to the high one: the final sum is
+// exact under any contention; the returned "old" value is not one atomic
+// 64-bit snapshot when other threads add at the same time.
+#define ARWEN_ATOMIC_ADD64(AS, T)                                                                         \
+    inline T atomicAdd(AS T* p, T v) {                                                                    \
+        AS metal::atomic_uint* w = (AS metal::atomic_uint*)p;                                             \
+        ulong u = (ulong)v;                                                                               \
+        uint lo = (uint)u, hi = (uint)(u >> 32);                                                          \
+        uint old_lo = metal::atomic_fetch_add_explicit(&w[0], lo, metal::memory_order_relaxed);           \
+        uint carry = (uint)(((ulong)old_lo + lo) >> 32);                                                  \
+        uint add_hi = hi + carry;                                                                         \
+        uint old_hi = add_hi ? metal::atomic_fetch_add_explicit(&w[1], add_hi, metal::memory_order_relaxed) \
+                             : metal::atomic_load_explicit(&w[1], metal::memory_order_relaxed);           \
+        return (T)(((ulong)old_hi << 32) | old_lo);                                                       \
+    }
+ARWEN_ATOMIC_ADD64(device, ulong)
+ARWEN_ATOMIC_ADD64(device, long)
+ARWEN_ATOMIC_ADD64(threadgroup, ulong)
+ARWEN_ATOMIC_ADD64(threadgroup, long)
 inline float atomicAdd(device float* p, float v) { return metal::atomic_fetch_add_explicit((device metal::atomic_float*)p, v, metal::memory_order_relaxed); }
 // threadgroup memory has no atomic_float: compare-and-swap on the bit pattern
 inline float atomicAdd(threadgroup float* p, float v) {
