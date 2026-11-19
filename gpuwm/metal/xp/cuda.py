@@ -543,22 +543,50 @@ class OutOfMemoryError(MemoryError):
 
 
 class _Pool:
-    def __init__(self, allocator=None):
+    """cupy.cuda.MemoryPool.
+
+    The default pool (``get_default_memory_pool``) reports the whole process:
+    every live allocation, rounded to CuPy's 512-byte unit.  A pool the caller
+    creates keeps CuPy's own accounting: the blocks it handed out
+    (``used_bytes``), the freed blocks it retains for reuse (``free_bytes``;
+    a later request is served from them first), and ``set_limit`` -- a request
+    that cannot fit under the limit even after dropping the retained blocks
+    raises OutOfMemoryError, as CuPy does.  The memory itself always comes from
+    the Metal runtime's buffer pool."""
+
+    def __init__(self, allocator=None, *, default=False):
         self._allocator = allocator
+        self._default = default
+        self._used = 0
+        self._free = 0
+        self._limit = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _unit(size):
+        return (int(size) + 511) // 512 * 512
 
     def used_bytes(self):
-        """Bytes in use, counted as CuPy's pool counts them: every live allocation
-        rounded up to its 512-byte unit (ArWen's memory plans are written in it)."""
-        return int(sum((int(m.nbytes) + 511) // 512 * 512 for m in _rt_module.live_memories()
-                       if m not in _rt_module.MODULE_GLOBALS))
+        if self._default:
+            return int(sum((int(m.nbytes) + 511) // 512 * 512 for m in _rt_module.live_memories()
+                           if m not in _rt_module.MODULE_GLOBALS))
+        return self._used
 
     def free_bytes(self):
-        """Bytes the pool holds for reuse (retired buffers waiting in size classes)."""
-        st = _rt_module.rt().stats()
-        return int(st.get("pooled_bytes", 0))
+        if self._default:
+            st = _rt_module.rt().stats()
+            return int(st.get("pooled_bytes", 0))
+        return self._free
 
     def total_bytes(self):
-        return self.used_bytes()
+        if self._default:
+            return self.used_bytes()
+        return self._used + self._free
+
+    def _released(self, unit):
+        with self._lock:
+            self._used -= unit
+            self._free += unit
 
     def malloc(self, size):
         """MemoryPool.malloc: a MemoryPointer to a new allocation (from the pool's
@@ -566,23 +594,47 @@ class _Pool:
         if self._allocator is not None:
             return self._allocator(int(size))
         from ._core import MemoryPointer as _MPtr
+        if not self._default:
+            unit = self._unit(max(int(size), 1))
+            with self._lock:
+                if unit <= self._free:
+                    self._free -= unit
+                else:
+                    if self._limit is not None and self._used + self._free + unit > self._limit:
+                        self._free = 0                     # CuPy frees the cached blocks and retries
+                        if self._used + unit > self._limit:
+                            raise OutOfMemoryError(
+                                f"Out of memory allocating {unit:,} bytes (allocated so far: "
+                                f"{self._used:,} bytes, limit set to: {self._limit:,} bytes).")
+                self._used += unit
+            mem = _rt_module.DeviceMemory(max(int(size), 1))
+            weakref.finalize(mem, self._released, unit)
+            return _MPtr(mem, mem.gpu)
         mem = _rt_module.DeviceMemory(max(int(size), 1))
         return _MPtr(mem, mem.gpu)
 
     def free_all_blocks(self, stream=None):
+        if not self._default:
+            with self._lock:
+                self._free = 0
         _rt_module.rt().pool_release()
 
     def n_free_blocks(self):
         return int(_rt_module.rt().pool_blocks())
 
     def set_limit(self, size=None, fraction=None):
-        return None
+        if size is None and fraction is None:
+            self._limit = None
+        elif size is not None:
+            self._limit = int(size) or None
+        else:
+            self._limit = int(float(fraction) * _mem_info()[1]) or None
 
     def get_limit(self):
-        return _mem_info()[1]
+        return self._limit if self._limit is not None else _mem_info()[1]
 
 
-_POOL = _Pool()
+_POOL = _Pool(default=True)
 
 
 class PinnedMemoryPointer:
@@ -650,8 +702,9 @@ alloc = memory.alloc
 MemoryPool = _Pool
 class MemoryHook:
     """cupy.cuda.MemoryHook: ``with hook:`` calls its alloc/malloc pre- and
-    post-processing methods around every device-array allocation of this thread
-    (free hooks are not called: Metal buffers are released by the runtime)."""
+    post-processing methods around every device-array allocation of this thread,
+    and its free pre- and post-processing methods when an allocation made under
+    a hook is freed while hooks are active in the freeing thread (as CuPy)."""
     name = "MemoryHook"
 
     def __enter__(self):

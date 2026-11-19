@@ -64,6 +64,15 @@ EXPLICIT = {
     "tests.test_kernel_aot_gpu::test_direct_pack_keeps_both_numerical_modes_when_builder_defaults_fast": "ptx",
     # gpuwm.nvrtc_ptx_cache: the native (cubin) image cache
     "tests.test_nvrtc_ptx_cache::test_native_image_cache_retains_subnormal_words_and_recovers_corruption": "ptx",
+    # need independent streams that overlap (a host copy blocked on one stream
+    # while others step; immediate stream-ordered reuse of a block still read)
+    "tests.test_ranked_domain_gpu::test_output_snapshot_survives_steps_during_a_delayed_download": "cuda_streams",
+    "tests.test_multislab_hazards_gpu::test_uploaded_table_eviction_waits_for_readers": "cuda_streams",
+    # CUDA local-memory frame sizes (Metal reports 0)
+    "tests.test_preflight::test_the_recorded_local_frames_match_the_driver": "cuda_introspection",
+    "tests.test_rrtmgp::test_rte_tile_scales_with_the_kernel_frame_not_a_fixed_thread_count": "cuda_introspection",
+    # counts *.cubin files written to CUPY_CACHE_DIR
+    "tests.test_preparation_prewarm::test_preparation_prewarm_caches_root_initialize_kernels": "ptx",
     # RTX 5090: AttributeError: 'cupy.cuda.function.Module' object has no attribute 'module'
     "tests.test_ssib_wrf461_parity::test_table_views_accept_both_cuda_module_interfaces": "arwen_drift",
 }

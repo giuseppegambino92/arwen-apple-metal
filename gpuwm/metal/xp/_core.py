@@ -142,7 +142,13 @@ class ndarray:
 
     @shape.setter
     def shape(self, value):
-        self._v.shape = value          # numpy raises when it would need a copy
+        try:
+            self._v = np.reshape(self._v, value, copy=False)
+        except ValueError as e:
+            if "copy" in str(e) or "view" in str(e):
+                raise AttributeError("incompatible shape for in-place modification. "
+                                     "Use `.reshape()` to make a copy with the desired shape.") from None
+            raise
 
     @property
     def T(self):
@@ -346,11 +352,12 @@ class ndarray:
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
         if order == "C":
-            v = self._v.view()
             try:
-                v.shape = shape                   # succeeds only when no copy is needed
-                return _wrap(v, self._gpuwm_mem)
-            except AttributeError:
+                # copy=False: a view, or ValueError when the layout would need a copy
+                return _wrap(np.reshape(self._v, shape, copy=False), self._gpuwm_mem)
+            except ValueError as e:
+                if "copy" not in str(e) and "view" not in str(e):
+                    raise
                 c = self.copy("C")
                 return _wrap(c._v.reshape(shape), c._gpuwm_mem)
         src = self if self.flags.f_contiguous else self.copy("F")
@@ -537,8 +544,22 @@ def _empty(shape, dtype=float, order="C"):
         for h in reversed(hooks):
             h.malloc_postprocess(device_id=0, size=nbytes, mem_size=nbytes, mem_ptr=ptr, pmem_id=id(a._gpuwm_mem))
             h.alloc_postprocess(device_id=0, mem_size=nbytes, mem_ptr=ptr)
+        if nbytes:
+            # CuPy calls free_pre/postprocess of the hooks active when the block
+            # is freed: here, when the allocation's memory object dies
+            _weakref.finalize(a._gpuwm_mem, _free_hooks, nbytes, ptr, id(a._gpuwm_mem))
         return a
     return _empty_unhooked(shape, dtype, order, n)
+
+
+def _free_hooks(nbytes, ptr, pmem_id):
+    hooks = getattr(HOOKS, "active", None)
+    if not hooks:
+        return
+    for h in hooks:
+        h.free_preprocess(device_id=0, mem_size=nbytes, mem_ptr=ptr, pmem_id=pmem_id)
+    for h in reversed(hooks):
+        h.free_postprocess(device_id=0, mem_size=nbytes, mem_ptr=ptr, pmem_id=pmem_id)
 
 
 def _empty_unhooked(shape, dtype, order, n):
@@ -683,7 +704,9 @@ def array(obj, dtype=None, copy=True, order="K", subok=False, ndmin=0, blocking=
     if isinstance(obj, (list, tuple)) and any(is_device(x) for x in obj):
         from ._functions import stack
         return stack([array(x, dtype=dtype) for x in obj])
-    h = np.array(obj, dtype=dtype, order=order if order in "CFAK" else "K", ndmin=ndmin)
+    # copy=None: a host array already of the right dtype is read in place (its
+    # bytes go straight into the device buffer below), as CuPy's H2D copy does
+    h = np.array(obj, dtype=dtype, order=order if order in "CFAK" else "K", ndmin=ndmin, copy=None)
     if h.dtype.kind not in "biufc":
         raise TypeError(f"cannot create a device array of dtype {h.dtype}")
     out = _empty(h.shape, h.dtype, "F" if (h.flags.f_contiguous and not h.flags.c_contiguous) else "C")
