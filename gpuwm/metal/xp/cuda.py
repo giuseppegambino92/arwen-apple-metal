@@ -448,9 +448,56 @@ def get_elapsed_time(start, end):
 _TOKEN = b"ARWEN-METAL-SOURCE\x00"
 
 
+_PROGRAMS = {}
+_PROGRAMS_LOCK = threading.Lock()
+
+
+def _program_dir():
+    from gpuwm.metal.native_build import cache_dir
+    d = cache_dir() / "programs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _token(source, options, name_expressions=None):
-    return _TOKEN + json.dumps({"source": source, "options": [str(o) for o in options or ()],
+    """The "image" compile_using_nvrtc returns: content-addressed like a cubin.
+
+    It names the program by the SHA-256 of its preprocessed text (the macros of
+    its options applied, comments and inactive #if blocks gone) and options, so
+    two sources that preprocess to the same program give the same bytes, as
+    NVRTC's images do.  The source itself is kept by digest (in memory and in
+    the cache directory) for function.Module.load; the first source registered
+    under a digest is the one loaded."""
+    opts = [str(o) for o in options or ()]
+    try:
+        from gpuwm.metal.frontend import NvrtcOptions, preprocess
+        pp = preprocess(source, NvrtcOptions.parse(tuple(opts), cupy_raw_module=False))
+        canon = "\n".join(" ".join(line.split()) for line in pp.splitlines() if line.strip())
+    except Exception:                      # not preprocessable here: the raw text names it
+        canon = source
+    import hashlib
+    digest = hashlib.sha256(json.dumps([canon, opts, list(name_expressions or ())]).encode()).hexdigest()
+    with _PROGRAMS_LOCK:
+        if digest not in _PROGRAMS:
+            _PROGRAMS[digest] = source
+            path = _program_dir() / f"{digest}.json"
+            if not path.exists():
+                tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+                tmp.write_text(json.dumps({"source": source}))
+                os.replace(tmp, path)
+    return _TOKEN + json.dumps({"program": digest, "options": opts,
                                 "name_expressions": list(name_expressions or ())}).encode()
+
+
+def _token_source(d):
+    if "source" in d:                      # tokens written before content addressing
+        return d["source"]
+    digest = d["program"]
+    src = _PROGRAMS.get(digest)
+    if src is None:
+        src = json.loads((_program_dir() / f"{digest}.json").read_text())["source"]
+        _PROGRAMS[digest] = src
+    return src
 
 
 def compile_using_nvrtc(source, options=(), arch=None, filename="kern.cu", name_expressions=None, log_stream=None,
@@ -513,7 +560,8 @@ class _Module:
             raise RuntimeError("function.Module.load on Metal needs the source token produced by "
                                "compiler.compile_using_nvrtc (a PTX/cubin image cannot run on Metal)")
         d = json.loads(image[len(_TOKEN):].decode())
-        self._m = _rt_module.Module(d["source"], effective_options(d["source"], d["options"]), cupy_raw_module=False)
+        source = _token_source(d)
+        self._m = _rt_module.Module(source, effective_options(source, d["options"]), cupy_raw_module=False)
         return self
 
     def load_file(self, path):
