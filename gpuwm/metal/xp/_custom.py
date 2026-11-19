@@ -29,7 +29,17 @@ class Function:
 
     def __call__(self, grid, block, args, shared_mem=0, stream=None, enable_cooperative_groups=False):
         if enable_cooperative_groups:
-            raise NotImplementedError("cooperative launches on the Metal backend")
+            # CUDA's guarantee: every block of the grid is resident at once, so
+            # blocks may wait on each other.  Granted under the same bound the
+            # occupancy query reports; grid-wide sync (cooperative_groups) is
+            # not translated, so only kernels that coordinate through memory run
+            g = grid if isinstance(grid, tuple) else (grid,)
+            b = block if isinstance(block, tuple) else (block,)
+            nblocks = int(np.prod(g)); nthreads = int(np.prod(b))
+            resident = max(1, self._k.max_threads // max(nthreads, 1)) * 30
+            if nblocks > resident:
+                raise RuntimeError(f"cooperative launch of {nblocks} blocks exceeds the {resident} "
+                                   "this device keeps resident (cudaErrorCooperativeLaunchTooLarge)")
         self._k.launch(grid, block, tuple(args), shared_mem)
 
     @property

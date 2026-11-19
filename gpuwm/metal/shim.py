@@ -203,7 +203,11 @@ def backend():
             return xp.cuda.runtime.memGetInfo()
 
         def active_blocks_per_multiprocessor(self, function, block_size, dynamic_shared=0):
-            return max(1, function.max_threads_per_block // max(block_size, 1))
+            if isinstance(function, int):              # function.ptr (CuPy passes the handle)
+                from gpuwm.metal.xp._custom import _BY_PTR
+                function = _BY_PTR[function]
+            threads = getattr(function, "max_threads_per_block", None) or function.max_threads
+            return max(1, threads // max(block_size, 1))
 
         def synchronize(self):
             from gpuwm.metal import runtime

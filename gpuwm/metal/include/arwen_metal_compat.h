@@ -450,6 +450,36 @@ inline uint __umulhi(uint a, uint b) { return metal::mulhi(a, b); }
 inline uint __brev(uint x) { return metal::reverse_bits(x); }
 template <typename P> inline auto __ldg(P p) { return *p; }
 template <typename P> inline auto __ldcg(P p) { return *p; }
+// __ldcg on device memory: CUDA reads it at L2, past this SM's L1, which is how
+// one block sees what another block published in the same launch.  An Apple GPU
+// core's cache is not coherent with the others either; a relaxed device-scope
+// atomic load reads the coherent copy (two of them for an 8-byte value).
+template <typename T> inline T __ldcg(const device T* p) {
+    if constexpr (sizeof(T) == 4) {
+        return as_type<T>(metal::atomic_load_explicit(
+            reinterpret_cast<const device metal::atomic_uint*>(p), metal::memory_order_relaxed));
+    } else if constexpr (sizeof(T) == 8) {
+        const device metal::atomic_uint* q = reinterpret_cast<const device metal::atomic_uint*>(p);
+        uint2 w = uint2(metal::atomic_load_explicit(q, metal::memory_order_relaxed),
+                        metal::atomic_load_explicit(q + 1, metal::memory_order_relaxed));
+        return as_type<T>(w);
+    } else {
+        return *p;
+    }
+}
+template <typename T> inline T __ldcg(device T* p) { return __ldcg((const device T*)p); }
+// *(volatile T*)p on device memory (transpile.volatile_device_access): CUDA's
+// volatile reaches the coherent level; on Metal a relaxed device atomic does.
+template <typename T> inline T __arwen_vload(const device T* p) { return __ldcg(p); }
+template <typename T> inline T __arwen_vload(const thread T* p) { return *(const thread volatile T*)p; }
+template <typename T> inline T __arwen_vload(const threadgroup T* p) { return *(const threadgroup volatile T*)p; }
+template <typename T> inline void __arwen_vstore(device T* p, T v) {
+    static_assert(sizeof(T) == 4, "volatile device store of a non-32-bit value");
+    metal::atomic_store_explicit(reinterpret_cast<device metal::atomic_uint*>(p), as_type<uint>(v),
+                                 metal::memory_order_relaxed);
+}
+template <typename T> inline void __arwen_vstore(thread T* p, T v) { *(thread volatile T*)p = v; }
+template <typename T> inline void __arwen_vstore(threadgroup T* p, T v) { *(threadgroup volatile T*)p = v; }
 template <typename P> inline auto __ldca(P p) { return *p; }
 
 // ------------------------------------------------------------------ min / max (CUDA overload set)

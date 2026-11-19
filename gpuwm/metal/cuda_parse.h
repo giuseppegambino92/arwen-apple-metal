@@ -103,7 +103,7 @@ __device__ int __clz(int); __device__ int __clzll(long long); __device__ int __p
 __device__ int __ffs(int); __device__ int __ffsll(long long); __device__ unsigned long long __umul64hi(unsigned long long, unsigned long long);
 __device__ long long __mul64hi(long long, long long); __device__ unsigned __umulhi(unsigned, unsigned); __device__ unsigned __brev(unsigned);
 // cache-hinted loads
-template <class T> __device__ T __ldg(const T*); template <class T> __device__ T __ldcg(const T*); template <class T> __device__ T __ldca(const T*);
+template <class T> __device__ T __arwen_vload(const T*); template <class T> __device__ void __arwen_vstore(T*, T); template <class T> __device__ T __ldg(const T*); template <class T> __device__ T __ldcg(const T*); template <class T> __device__ T __ldca(const T*);
 // math: float, double and the CUDA overloads of the double names for float
 #define ARWEN_M1(n) __device__ float n##f(float); __device__ double n(double); __device__ float n(float);
 #define ARWEN_M2(n) __device__ float n##f(float, float); __device__ double n(double, double); __device__ float n(float, float);

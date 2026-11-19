@@ -3654,6 +3654,66 @@ def device_clock(text: str) -> str:
             + _CLOCK_CALL.sub("__arwen_clock64()", text))
 
 
+_VOLATILE_CAST = re.compile(r"\*\s*\(\s*(const\s+)?volatile\s+(const\s+)?([A-Za-z_][\w\s]*?)\s*\*\s*\)\s*\(")
+
+
+def _balanced(text: str, i: int) -> int:
+    """Index just past the ')' that closes the '(' at text[i]."""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    raise TranslationError("unbalanced parentheses after a volatile cast")
+
+
+def volatile_device_access(pp: str) -> str:
+    """``*(volatile T*)(p)`` -> relaxed atomic load / store of ``p``.
+
+    On CUDA a volatile access goes to the coherent level of the memory
+    hierarchy, which is how blocks of one launch publish to each other
+    (``__threadfence(); *(volatile int*)flag = t;`` and a spinning reader).  A
+    volatile MSL access is not ordered by Metal's fences and can be served from
+    a core's own cache; a relaxed device-scope atomic is coherent and ordered.
+    Measured: a 120-block publish chain is wrong with volatile, right with this.
+    """
+    out, pos = [], 0
+    for m in _VOLATILE_CAST.finditer(pp):
+        if m.start() < pos:
+            continue
+        open_paren = m.end() - 1
+        end = _balanced(pp, open_paren)
+        ptype = m.group(3).strip()
+        target = pp[open_paren:end]
+        rest = pp[end:]
+        assign = re.match(r"\s*=(?!=)", rest)
+        out.append(pp[pos:m.start()])
+        if assign:
+            depth, j = 0, end + assign.end()
+            while j < len(pp):
+                ch = pp[j]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif ch in ";," and depth == 0:
+                    break
+                j += 1
+            value = pp[end + assign.end():j].strip()
+            out.append(f"__arwen_vstore(({ptype}*){target}, ({ptype})({value}))")
+            pos = j
+        else:
+            out.append(f"__arwen_vload((const {ptype}*){target})")
+            pos = end
+    out.append(pp[pos:])
+    return "".join(out)
+
+
 def device_heap(text: str) -> str:
     text = device_clock(text)
     if not re.search(r"(?<![\w.>:])malloc\s*\(", text):
@@ -3959,6 +4019,7 @@ def _translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str
         raise TranslationError(f"unsupported NVRTC options: {opts.unknown}")
     pp = preprocess(source, opts, filename)
     pp = device_heap(pp)
+    pp = volatile_device_access(pp)
     pp = flatten_inheritance(pp, filename)
     pp = hoist_block_prototypes(pp, filename)
     pp = hoist_branch_labels(pp, filename)
