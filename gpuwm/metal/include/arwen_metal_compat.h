@@ -620,6 +620,30 @@ inline long lrintf(float x) { return __arwen_f2l_sat(metal::rint(x)); }
 inline long lroundf(float x) { return __arwen_f2l_sat(metal::round(x)); }
 inline long llroundf(float x) { return __arwen_f2l_sat(metal::round(x)); }
 
+#include "arwen_fastlibm_ff.h"
+
+// |x|^n for a small integer n, in float-float: exponentiation by squaring
+// (<= 12 products, each within ~2^-44 relative), a float-float reciprocal for
+// n < 0, then the binary32 rounding only when it is certain.  Apple's
+// precise::pow is 1 ulp off even where the result is exact (10^6 ->
+// 1000000.06, measured), and integer powers are what physics code writes.
+inline float __arwen_powf_int(float ax, int n) {
+    __arwen_ff r = __arwen_ff_of(1.0f, 0.0f), b = __arwen_ff_of(ax, 0.0f);
+    int m = n < 0 ? -n : n;
+    while (m) {
+        if (m & 1) r = __arwen_ff_mul(r, b);
+        m >>= 1;
+        if (m) b = __arwen_ff_mul(b, b);
+    }
+    if (n < 0) {
+        float q = 1.0f / r.h;
+        float e = metal::fma(-q, r.h, 1.0f);
+        e = metal::fma(-q, r.l, e);
+        r = __arwen_ff_fast_two_sum(q, q * e);
+    }
+    return __arwen_ff_round_sure(r, metal::fabs(r.h) * 0x1p-38f);
+}
+
 // C99 pow on top of Metal's pow(|x|, y): integer exponents of negative bases,
 // and the special cases Metal leaves undefined.
 inline float __arwen_powf(float x, float y) {
@@ -641,7 +665,13 @@ inline float __arwen_powf(float x, float y) {
         return (x < 0.0f && yodd) ? -r : r;
     }
     if (x < 0.0f && !yint) return __arwen_qnanf();
-    float r = metal::precise::pow(ax, y);
+    float r;
+    if (yint && metal::fabs(y) <= 64.0f) {
+        r = __arwen_powf_int(ax, (int)y);
+        if (as_type<uint>(r) == ARWEN_FASTLIBM_UNSURE_BITS) r = metal::precise::pow(ax, y);
+    } else {
+        r = metal::precise::pow(ax, y);
+    }
     return (x < 0.0f && yodd) ? -r : r;
 }
 #if ARWEN_FTZ

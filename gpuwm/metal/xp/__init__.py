@@ -123,11 +123,16 @@ def fuse(*a, **k):
     raise NotImplementedError("cupy.fuse on the Metal backend")
 
 
+class _Unavailable(AttributeError, NotImplementedError):
+    """A CuPy name this backend does not provide: an AttributeError, so hasattr()
+    and getattr(module, name, default) behave as on a module without it."""
+
+
 def _unimplemented_module(name):
     m = _types.ModuleType(name)
 
     def __getattr__(attr):
-        raise NotImplementedError(f"{name}.{attr} on the Metal backend")
+        raise _Unavailable(f"{name}.{attr} on the Metal backend")
     m.__getattr__ = __getattr__
     return m
 
@@ -141,7 +146,7 @@ def _fft_module():
     def __getattr__(attr):
         fn = getattr(_np.fft, attr, None)
         if fn is None or attr.startswith("_"):
-            raise NotImplementedError(f"cupy.fft.{attr} on the Metal backend")
+            raise _Unavailable(f"cupy.fft.{attr} on the Metal backend")
         if not callable(fn):
             return fn
 
@@ -192,7 +197,7 @@ def _linalg_module():
     m.LinAlgError = _np.linalg.LinAlgError
 
     def __getattr__(attr):
-        raise NotImplementedError(f"cupy.linalg.{attr} on the Metal backend")
+        raise _Unavailable(f"cupy.linalg.{attr} on the Metal backend")
     m.__getattr__ = __getattr__
     return m
 
@@ -207,7 +212,7 @@ def _random_module():
     def __getattr__(attr):
         fn = getattr(_np.random, attr, None)
         if fn is None or attr.startswith("_"):
-            raise NotImplementedError(f"cupy.random.{attr} on the Metal backend")
+            raise _Unavailable(f"cupy.random.{attr} on the Metal backend")
         if attr in ("RandomState", "Generator", "default_rng"):
             return _device_generator(fn)
         if isinstance(fn, type):           # other host classes
@@ -267,7 +272,7 @@ def _testing_module():
         setattr(m, name, wrap(getattr(npt, name)))
 
     def __getattr__(attr):
-        raise NotImplementedError(f"cupy.testing.{attr} on the Metal backend")
+        raise _Unavailable(f"cupy.testing.{attr} on the Metal backend")
     m.__getattr__ = __getattr__
     return m
 

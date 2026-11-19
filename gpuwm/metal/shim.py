@@ -37,10 +37,10 @@ def _host_module(name, source):
         try:
             src = importlib.import_module(source)
         except ImportError:
-            raise NotImplementedError(f"{name}.{attr} is not available on the Metal backend") from None
+            raise __import__("gpuwm.metal.xp", fromlist=["_Unavailable"])._Unavailable(f"{name}.{attr} is not available on the Metal backend") from None
         fn = getattr(src, attr, None)
         if not callable(fn):
-            raise NotImplementedError(f"{name}.{attr} is not available on the Metal backend")
+            raise __import__("gpuwm.metal.xp", fromlist=["_Unavailable"])._Unavailable(f"{name}.{attr} is not available on the Metal backend")
         from .xp import _functions as F
 
         def f(*args, **kw):
@@ -59,7 +59,7 @@ def _stub(name):
     def __getattr__(attr):
         if attr.startswith("__"):
             raise AttributeError(attr)
-        raise NotImplementedError(f"{name}.{attr} is not available on the Metal backend")
+        raise __import__("gpuwm.metal.xp", fromlist=["_Unavailable"])._Unavailable(f"{name}.{attr} is not available on the Metal backend")
     m.__getattr__ = __getattr__
     return m
 

@@ -428,7 +428,8 @@ class _Module:
         self.filename = filename
         tu, errors = parse(text, filename)
         if errors:
-            msg = "\n".join(f"{e.location.line}:{e.location.column}: {e.spelling}" for e in errors[:20])
+            msg = "\n".join(f"{e.location.line}:{e.location.column}: {e.spelling}"
+                            + _nvrtc_wording(e.spelling) for e in errors[:20])
             raise TranslationError(f"{filename}: CUDA parse errors:\n{msg}")
         tu._arwen_text = text
         tu._arwen_filename = filename
@@ -3668,6 +3669,14 @@ def _balanced(text: str, i: int) -> int:
             if depth == 0:
                 return j + 1
     raise TranslationError("unbalanced parentheses after a volatile cast")
+
+
+def _nvrtc_wording(clang_message: str) -> str:
+    """NVRTC's wording of the same diagnostic, for callers that match it."""
+    m = re.match(r"redefinition of '([^']+)'", clang_message)
+    if m:
+        return f' (function "{m.group(1)}" has already been defined)'
+    return ""
 
 
 def volatile_device_access(pp: str) -> str:
