@@ -1,7 +1,7 @@
 """Build tests/metal_not_applicable.py's ENTRIES from classified Metal failures.
 
     python tools/metal/build_applicability_registry.py FAILURES.json [--cuda-same SAME.json]
-        [--cuda-pass PASS.json] [--write]
+        [--cuda-pass PASS.json] [--cuda-junit 'DIR/*.xml'] [--write]
 
 FAILURES.json maps node ids (JUnit ``classname::name``) to [state, message] for
 the tests failing on Metal.  A test enters the registry only with evidence for
@@ -11,6 +11,10 @@ its class:
   CUDA introspection) or for data/tools present only on the CUDA/Linux host;
 * --cuda-same: the test fails on an RTX 5090 with the same message (ArWen drift);
 * --cuda-pass: the test passes on the RTX 5090 and pins CUDA's output words;
+* --cuda-junit: JUnit files of the same tests run on the RTX 5090 (one process
+  per file); a test failing there with the same kind of failure -- the same
+  first characters of the message once checkout paths are removed -- counts as
+  --cuda-same, a passing one as --cuda-pass;
 * the files whose CPU reference was shown to run on the Mac's own libm/NumPy;
 * the KF default-tolerance tests (pass with ARWEN_METAL_STRICT_GLIBC=1).
 
@@ -64,6 +68,9 @@ def classify(failures, same=(), cuda_pass=()):
         module = nodeid.split("::", 1)[0]
         text = nodeid + " " + (message or "")
         cls = next((name for name, pat in RULES if re.search(pat, text)), None)
+        # before the CUDA evidence: this class keeps them running under STRICT_GLIBC
+        if cls is None and module in KF_FILES:
+            cls = "kf_default_tolerance"
         if cls is None and nodeid in same:
             cls = "arwen_drift"
         if cls is None and nodeid in cuda_pass and re.search(HASH_PIN, text):
@@ -77,6 +84,35 @@ def classify(failures, same=(), cuda_pass=()):
         if cls is not None:
             out[nodeid] = cls
     return out
+
+
+def _junit(pattern):
+    import glob
+    import xml.etree.ElementTree as ET
+    out = {}
+    for f in sorted(glob.glob(pattern)):
+        for tc in ET.parse(f).getroot().iter("testcase"):
+            r = next((c for c in tc if c.tag in ("failure", "error", "skipped")), None)
+            state = "passed" if r is None else ("skipped" if r.tag == "skipped" else "failed")
+            out[tc.get("classname") + "::" + tc.get("name")] = (state, (r.get("message") if r is not None else "") or "")
+    return out
+
+
+def _head(message, n=25):
+    """The kind of a failure: its first characters without checkout paths."""
+    m = re.sub(r"(/Users|/home)/[^\s'\"]*?/(arwen|pr_final)/", "<root>/", message.split("\n", 1)[0])
+    return m[:n]
+
+
+def same_on_cuda(failures, cuda):
+    same, passed = [], []
+    for nodeid, (_, message) in failures.items():
+        state, cmsg = cuda.get(nodeid, (None, ""))
+        if state == "failed" and _head(cmsg) == _head(message or ""):
+            same.append(nodeid)
+        elif state == "passed":
+            passed.append(nodeid)
+    return same, passed
 
 
 def to_pytest_id(nodeid):
@@ -95,11 +131,15 @@ def main(argv=None):
     ap.add_argument("failures")
     ap.add_argument("--cuda-same")
     ap.add_argument("--cuda-pass")
+    ap.add_argument("--cuda-junit")
     ap.add_argument("--write", action="store_true")
     a = ap.parse_args(argv)
     failures = json.load(open(a.failures))
     same = json.load(open(a.cuda_same)) if a.cuda_same else []
     cuda_pass = json.load(open(a.cuda_pass)) if a.cuda_pass else []
+    if a.cuda_junit:
+        s2, p2 = same_on_cuda(failures, _junit(a.cuda_junit))
+        same, cuda_pass = list(same) + s2, list(cuda_pass) + p2
     entries = classify(failures, same, cuda_pass)
     ids = {}
     for nodeid, cls in entries.items():

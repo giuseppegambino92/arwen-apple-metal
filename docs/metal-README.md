@@ -29,7 +29,7 @@ gpuwm go /path/to/wrf_run_dir --backend metal --history-compression none
 | reproducibility | 142 775 319 output words identical from run to run, re-checked after every change |
 | exactness checks | binary64 emulation 0 ulp; FP32 gradual underflow, translator constructs and `goto` elimination 0 differing words; glibc libm fast paths verified on all 2³² inputs |
 | coverage | all 342 CUDA translation units and 46 / 46 production loaders build |
-| ArWen's GPU test suite | 13 458 tests: 185 failing (1.4 %), 478 skipped as not applicable on a Mac with a stated reason, the rest passing |
+| ArWen's GPU test suite | 13 458 tests: 150 failing (1.1 %), 513 skipped as not applicable on a Mac with a stated reason, the rest passing |
 | speed | 1 simulated hour in 81–240 s on an M3 Max laptop (RTX 5090: ~11 s) |
 
 ---
@@ -153,33 +153,34 @@ Each piece has a check with a declared tolerance and a measured result:
 | `goto` elimination vs native clang (`tests/metal/goto_semantics_check.py`) | 8 shapes incl. SSiB NEWTON and a jump into a sibling branch (Noah-MP), 0 differing words |
 | Kain-Fritsch (KF-CuP) columns vs WRF's Fortran oracle, `GPUWM_WRF_EXACT=1` | 0 differing words, 5 configurations |
 | glibc libm fast paths (`tools/metal/verify_fastlibm.py`) | all 2³² inputs per routed function, 0 mismatches |
-| ArWen's own GPU test suite on Metal (13 458 tests) | 185 failing (1.4 %); 478 skipped as not applicable on a Mac, each with its reason; every other test passing or skipped by ArWen's own conditions (2026-11-19) |
+| ArWen's own GPU test suite on Metal (13 458 tests) | 150 failing (1.1 %); 513 skipped as not applicable on a Mac, each with its reason; every other test passing or skipped by ArWen's own conditions (2026-11-19) |
 
-The 478 skips are listed one by one in `tests/metal_not_applicable.py` and
+The 513 skips are listed one by one in `tests/metal_not_applicable.py` and
 applied by `tests/conftest.py` only when `GPUWM_BACKEND=metal`; pytest prints
 the reason of each.  A test is listed only with evidence for its class:
 
 | class | tests | why it does not apply on a Mac |
 |---|---|---|
 | `ptx` | 212 | PTX / NVRTC-direct compiles, nvJitLink, cubin — Metal has no PTX |
-| `arwen_drift` | 120 | fails on any backend in ArWen 3.0.3 (same failure on an RTX 5090, or an error in the test's own fixture) |
+| `arwen_drift` | 155 | fails on any backend in ArWen 3.0.3 (same failure on an RTX 5090, or an error in the test's own fixture) |
 | `cuda_hash_pin` | 57 | SHA-256 pins of CUDA's output words, which encode `ptxas` FMA contraction (Metal is often closer to the WRF oracle) |
 | `macos_reference` | 33 | the CPU reference runs on the Mac with Apple's libm or NumPy arm64 (Metal matches glibc there) |
 | `cuda_host_only` | 19 | data, tools or environment present only on the Linux/CUDA machine |
-| `kf_default_tolerance` | 15 | KF-CuP default numerics vs a tolerance measured on CUDA; they run, and pass, with `ARWEN_METAL_STRICT_GLIBC=1` |
+| `kf_default_tolerance` | 15 | KF-CuP default-numerics word counts, which the RTX 5090 fails as well; with `ARWEN_METAL_STRICT_GLIBC=1` they run here, and pass word-exact |
 | `cuda_introspection` | 14 | CUDA local-memory frames, registers, NVRTC builtin behaviour |
 | `native_libm` | 8 | ULP distance from WRF pinned for CUDA's hardware `powf`; Apple's `powf` rounds differently in the last bit (Exner `pi_phy`: 1826 vs 304 of 5880 words 1 ULP from WRF) |
 
-The 185 tests that still fail stay in the suite: nothing yet shows that
-they do not apply to Metal (a CUDA cross-check of part of them was cut short
-when the reference machine went offline).  Grouped by their messages:
+The 150 tests that still fail stay in the suite.  Each failing file was also
+run on the RTX 5090, one process per file: 105 of these tests pass there, so
+they are Metal-side; 11 fail there for a different reason; 34 are in files
+the CUDA run did not cover.  Grouped by their messages:
 
 | what | tests |
 |---|---|
-| numerical differences against CUDA-measured pins or tolerances, and other assertions to investigate | 122 |
+| numerical differences against CUDA-measured pins or tolerances, and other assertions to investigate | 90 |
 | Apple's shader compiler crashing or giving up on the largest kernels | 25 |
-| array-layer / CUDA-API functions not provided yet (`matmul`, `memcpyPeerAsync`, …) | 25 |
-| memory and allocation accounting that differs from CUDA's | 13 |
+| array-layer / CUDA-API functions not provided yet (`matmul`, `memcpyPeerAsync`, …) | 23 |
+| memory and allocation accounting that differs from CUDA's | 12 |
 
 Two checks caught real defects that compiled cleanly: overlapping backward
 `goto` regions jumping to the wrong label (SSiB), and kernels launched with
@@ -267,10 +268,11 @@ python tests/metal/translator_features_check.py      # and the other tests/metal
     anything), Linux-only tools (`troute_mc_replay`, a ptrace tracer), data
     recorded on the CUDA machine (`HYDRO_CLOCK_BASELINE`);
   - ArWen's default (non-exact) numerics in Kain-Fritsch: with the GPU's own
-    `expf`/`powf`, KF's thresholds amplify Metal-vs-CUDA last-bit differences
-    past the tolerance measured for CUDA.  This is the deliberate default (the
-    native math is 2.4x faster); `ARWEN_METAL_STRICT_GLIBC=1` or
-    `GPUWM_WRF_EXACT=1` make KF word-exact against WRF's Fortran oracle.
+    `expf`/`powf`, KF's word-count checks fail on the RTX 5090 too, by similar
+    amounts (`rthcuten`: 1189 words off on CUDA, 1255 on Metal).  Native math
+    stays the default on Metal (2.4x faster in KF);
+    `ARWEN_METAL_STRICT_GLIBC=1` or `GPUWM_WRF_EXACT=1` make KF word-exact
+    against WRF's Fortran oracle, and these tests then run and pass.
 * **Some NumPy functions run on the CPU.**  Functions the array layer has no
   Metal kernel for (`sort`, `unique`, `median`, `linalg`, …) run in NumPy on
   the same unified memory, declared on first use; none is on the forecast's
