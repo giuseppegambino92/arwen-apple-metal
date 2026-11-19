@@ -2500,6 +2500,25 @@ class _Module:
                        K.CXX_REINTERPRET_CAST_EXPR, K.CXX_CONST_CAST_EXPR):
                 self.edit_explicit_cast(c)
 
+    def _nan_guarded(self, c, operand: str) -> bool:
+        """``c`` lies in the else branch of a conditional whose condition tests
+        ``operand`` for NaN (isnan(x), x != x)."""
+        pat = re.compile(r"^\(*(?:(?:metal::)?isnan\(" + re.escape(operand) + r"\)|"
+                         + re.escape(operand) + r"!=" + re.escape(operand) + r")\)*$")
+        node = c
+        p = self.parent.get(node.hash)
+        while p is not None and p.kind in (K.CONDITIONAL_OPERATOR, K.PAREN_EXPR, K.UNEXPOSED_EXPR):
+            if p.kind == K.CONDITIONAL_OPERATOR:
+                kids = list(p.get_children())
+                if len(kids) == 3 and kids[2].hash != kids[0].hash:
+                    in_else = kids[2].extent.start.offset <= node.extent.start.offset and \
+                        node.extent.end.offset <= kids[2].extent.end.offset
+                    cond = re.sub(r"\s+", "", self.text[kids[0].extent.start.offset:kids[0].extent.end.offset])
+                    if in_else and pat.match(cond):
+                        return True
+            node, p = p, self.parent.get(p.hash)
+        return False
+
     def edit_select_minmax(self):
         """``a > b ? a : b`` on floats -> __arwen_sel_max(a, b) (and the three sibling forms).
 
@@ -2529,14 +2548,17 @@ class _Module:
             a, b, t, f = txt(ck[0]), txt(ck[1]), txt(kids[1]), txt(kids[2])
             if not (simple.match(a) and simple.match(b)) or "++" in a + b or "--" in a + b or "=" in a + b:
                 continue
-            # __arwen_sel_*(x, y): FMNMX on the zeros (max(+0, -0) = +0, the
-            # measured CUDA word) but the selection's NaN rule -- the else
-            # operand y comes back when it is NaN (ysu_min(1000, NaN) is NaN
-            # on the RTX 5090; a NaN first operand already yields y in fminf)
+            # ptxas folds the selection into FMNMX (which ignores the sign of
+            # zero) only where no NaN can reach it: inside isnan() guards of
+            # both operands (rp_max: max(+0, -0) = +0, measured).  With a NaN
+            # possible it keeps the exact selection (ysu_min(1000, NaN) = NaN,
+            # ysu_min(-0, 0) = 0 on the RTX 5090), and so does this translator.
+            if not (self._nan_guarded(c, a) and self._nan_guarded(c, b)):
+                continue
             if (t, f) == (a, b):
-                fn = "__arwen_sel_max" if ops == [">"] else "__arwen_sel_min"
+                fn = "fmaxf" if ops == [">"] else "fminf"
             elif (t, f) == (b, a):
-                fn = "__arwen_sel_min" if ops == [">"] else "__arwen_sel_max"
+                fn = "fminf" if ops == [">"] else "fmaxf"
             else:
                 continue
             if self.rw.in_opaque(c.extent.start.offset, c.extent.end.offset):

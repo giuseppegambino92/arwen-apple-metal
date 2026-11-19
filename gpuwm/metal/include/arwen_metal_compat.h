@@ -607,10 +607,6 @@ ARWEN_F2(fdim, (metal::isnan(x) || metal::isnan(y)) ? x + y : (x > y ? x - y : 0
 inline float fmaf(float a, float b, float c) { return metal::fma(a, b, c); }
 inline float fma(float a, float b, float c) { return metal::fma(a, b, c); }
 inline bool isnan(float x) { return metal::isnan(x); }
-// translated `a < b ? a : b` / `a > b ? a : b` (transpile.edit_select_minmax):
-// the else operand when it is NaN, FMNMX (fminf/fmaxf) otherwise
-inline float __arwen_sel_min(float a, float b) { return metal::isnan(b) ? b : fminf(a, b); }
-inline float __arwen_sel_max(float a, float b) { return metal::isnan(b) ? b : fmaxf(a, b); }
 inline bool isinf(float x) { return metal::isinf(x); }
 inline bool isfinite(float x) { return metal::isfinite(x); }
 inline bool signbit(float x) { return metal::signbit(x); }
