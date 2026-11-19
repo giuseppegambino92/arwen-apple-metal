@@ -414,7 +414,7 @@ class Module:
         if MSL_OPT == "-Os":
             return _xpc_retry(lambda: self.library.pipeline(name))
         if ident in _slow_pipelines() or name in _slow_kernel_names():
-            return _xpc_retry(lambda: self._os_library().pipeline(name))
+            return self._small_build(name)
         budget = float(os.environ.get("ARWEN_METAL_PIPELINE_BUDGET", "90"))
         result = {}
 
@@ -431,17 +431,33 @@ class Module:
         why = f"failed ({result['e']})" if "e" in result else f"exceeded {budget:.0f} s"
         print(f"[arwen-metal] pipeline {name}: -O3 back-end compile {why}; using the -Os build", file=sys.stderr)
         _remember_slow(ident)
-        return _xpc_retry(lambda: self._os_library().pipeline(name))
+        return self._small_build(name)
 
-    def _os_library(self):
-        lib = getattr(self, "_lib_os", None)
+    def _os_library(self, opt="-Os"):
+        attr = "_lib_os" if opt == "-Os" else "_lib_" + opt.strip("-")
+        lib = getattr(self, attr, None)
         if lib is None:
             d = cache_dir() / "modules"
-            path = d / f"{self.key}-Os.metallib"
+            path = d / f"{self.key}{opt}.metallib"
             if not path.exists():
-                compile_msl((d / f"{self.key}.metal").read_text(), tuple(self.meta["metal_flags"]), out=path, opt="-Os")
-            lib = self._lib_os = rt().load_library(str(path))
+                compile_msl((d / f"{self.key}.metal").read_text(), tuple(self.meta["metal_flags"]), out=path, opt=opt)
+            lib = rt().load_library(str(path))
+            setattr(self, attr, lib)
         return lib
+
+    def _small_build(self, name):
+        """The -Os build, and when Apple's compiler service crashes on that too,
+        the -O0 AIR: the back end then receives the IR as translated, which it
+        has compiled for every kernel that crashed its optimiser (same words:
+        no FP reassociation at any level, -ffp-contract=off)."""
+        try:
+            return _xpc_retry(lambda: self._os_library("-Os").pipeline(name))
+        except RuntimeError as e:
+            if "XPC_ERROR" not in str(e) and "stack space" not in str(e):
+                raise
+            print(f"[arwen-metal] pipeline {name}: -Os build failed ({str(e)[:80]}); using the -O0 build",
+                  file=sys.stderr)
+            return _xpc_retry(lambda: self._os_library("-O0").pipeline(name))
 
     @property
     def heap_reset(self):

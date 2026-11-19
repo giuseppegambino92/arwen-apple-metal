@@ -341,7 +341,10 @@ def _array_dims(t):
     dims = []
     while _canon(t).kind == T.CONSTANTARRAY:
         dims.append(_canon(t).element_count)
-        t = t.get_array_element_type()
+        e = t.get_array_element_type()
+        # through a typedef (``typedef char GFText[50]``) the sugared type is no
+        # array to clang: take the element of its canonical type
+        t = e if e.kind != T.INVALID else _canon(t).get_array_element_type()
     return t, dims
 
 
@@ -2131,9 +2134,17 @@ class _Module:
                         continue
                     if rstart is None:
                         rstart = t.extent.start.offset
-                if rstart is not None:
+                if fn.kind == K.CONVERSION_FUNCTION and _canon(rt).kind == T.POINTER:
+                    # ``operator char*()``: the type follows the keyword
+                    lp = next((t for t in toks if t.spelling == "(" and t.extent.start.offset > name_tok.extent.end.offset), None)
+                    if lp is not None:
+                        self.rw.replace(name_tok.extent.end.offset, lp.extent.start.offset,
+                                        " " + self.msl_type(rt, space="device") + " ")
+                elif rstart is not None:
                     new = "decltype(auto)" if _canon(rt).kind == T.LVALUEREFERENCE else "auto"
                     self.rw.replace(rstart, name_tok.extent.start.offset, new + " ")
+                    if new == "auto" and not self._dependent(rt):
+                        self._type_null_returns(fn, rt)
         ctx = usr in self.needs_ctx
         if ctx:
             lp = None
@@ -2490,7 +2501,7 @@ class _Module:
                 self.edit_explicit_cast(c)
 
     def edit_select_minmax(self):
-        """``a > b ? a : b`` on floats -> fmaxf(a, b) (and the three sibling forms).
+        """``a > b ? a : b`` on floats -> __arwen_sel_max(a, b) (and the three sibling forms).
 
         NVRTC emits setp + selp for these, but ptxas selects them into FMNMX, and
         CUDA results follow FMNMX's semantics (max(+0, -0) = +0, NaN loses);
@@ -2518,10 +2529,14 @@ class _Module:
             a, b, t, f = txt(ck[0]), txt(ck[1]), txt(kids[1]), txt(kids[2])
             if not (simple.match(a) and simple.match(b)) or "++" in a + b or "--" in a + b or "=" in a + b:
                 continue
+            # __arwen_sel_*(x, y): FMNMX on the zeros (max(+0, -0) = +0, the
+            # measured CUDA word) but the selection's NaN rule -- the else
+            # operand y comes back when it is NaN (ysu_min(1000, NaN) is NaN
+            # on the RTX 5090; a NaN first operand already yields y in fminf)
             if (t, f) == (a, b):
-                fn = "fmaxf" if ops == [">"] else "fminf"
+                fn = "__arwen_sel_max" if ops == [">"] else "__arwen_sel_min"
             elif (t, f) == (b, a):
-                fn = "fminf" if ops == [">"] else "fmaxf"
+                fn = "__arwen_sel_min" if ops == [">"] else "__arwen_sel_max"
             else:
                 continue
             if self.rw.in_opaque(c.extent.start.offset, c.extent.end.offset):
@@ -2587,6 +2602,27 @@ class _Module:
                     self.rw.replace(toks[0].extent.start.offset, toks[0].extent.end.offset, "__arwen_fneg(")
                     self.rw.insert(c.extent.end.offset, ")", order=c.extent.end.offset - c.extent.start.offset)
 
+    def _type_null_returns(self, fn, rt):
+        """An ``auto`` function that also returns a null pointer: every return
+        gets the declared pointer type (device memory), or deduction would see
+        nullptr_t in one return and a pointer in another."""
+        rets = [n for n in fn.walk_preorder() if n.kind == K.RETURN_STMT]
+        vals = [[ch for ch in r.get_children()] for r in rets]
+        if not any(v and self._is_null(v[0]) for v in vals):
+            return
+        ty = self.msl_type(rt, space="device")
+        for r, v in zip(rets, vals):
+            if not v:
+                continue
+            e = v[0]
+            if self.rw.in_opaque(e.extent.start.offset, e.extent.end.offset):
+                continue
+            if self._is_null(e):
+                self.rw.replace(e.extent.start.offset, e.extent.end.offset, f"(({ty})nullptr)", opaque=True)
+            else:
+                self.rw.insert(e.extent.start.offset, f"(({ty})(", order=-1e9)
+                self.rw.insert(e.extent.end.offset, "))", order=1e9)
+
     def edit_explicit_cast(self, c):
         if c.kind == K.CXX_CONST_CAST_EXPR and self._dependent(c.type):
             # const_cast<P>(x) in a template changes no value: a template-parameter P is
@@ -2631,6 +2667,15 @@ class _Module:
                 self.rw.replace(s1, c.extent.end.offset, "))")
             else:
                 self.rw.insert(s1, "))", order=1e9)
+            return
+        if (to_c.kind == T.POINTER and c.kind == K.CSTYLE_CAST_EXPR and self._dependent(op.type)
+                and fr_c.kind not in (T.POINTER, T.CONSTANTARRAY, T.INCOMPLETEARRAY)):
+            # (T*)expr with a type-dependent operand (template bodies): the space of
+            # the operand's pointer, known when the template is instantiated
+            pt = c.type.get_pointee()
+            pointee = self.msl_type(pt, storage=True) if not self._dependent(pt) else pt.spelling
+            self.rw.replace(c.extent.start.offset, s0, f"__arwen_pcast<{pointee}>(")
+            self.rw.replace(s1, c.extent.end.offset, ")") if s1 < c.extent.end.offset else self.rw.insert(s1, ")")
             return
         if to_c.kind == T.POINTER and fr_c.kind in (T.POINTER, T.CONSTANTARRAY, T.INCOMPLETEARRAY):
             pt = c.type.get_pointee()
@@ -3356,12 +3401,19 @@ class _Module:
         init_kernel = ""
         inits = [g for g in self.globals_mut.values() if g.init]
         if inits:
-            lines = []
-            for g in inits:
-                lines.append(f"    *(device {g.msl_type}*)(__arwen_g + {g.offset}) = {g.init};"
-                             if not g.init.lstrip().startswith("{") else
-                             f"    {{ const {g.msl_type} __v[] = {g.init}; for (uint i = 0; i < sizeof(__v)/sizeof(__v[0]); ++i) ((device {g.msl_type}*)(__arwen_g + {g.offset}))[i] = __v[i]; }}")
-            init_kernel = ("\nkernel void __arwen_init_globals(device uchar* __arwen_g [[buffer(2)]])\n{\n"
+            lines, tables = [], []
+            for n, g in enumerate(inits):
+                if not g.init.lstrip().startswith("{"):
+                    lines.append(f"    *(device {g.msl_type}*)(__arwen_g + {g.offset}) = {g.init};")
+                    continue
+                # the initializer list as program-scope constant data, copied in:
+                # a thread-local copy of a large table made Apple's compiler
+                # service crash (XPC_ERROR_CONNECTION_INTERRUPTED, BMJ / Goddard)
+                tables.append(f"constant {g.msl_type} __arwen_ginit_{n}[] = {g.init};")
+                lines.append(f"    for (uint i = 0; i < sizeof(__arwen_ginit_{n})/sizeof(__arwen_ginit_{n}[0]); ++i) "
+                             f"((device {g.msl_type}*)(__arwen_g + {g.offset}))[i] = __arwen_ginit_{n}[i];")
+            init_kernel = ("\n" + "\n".join(tables)
+                           + "\nkernel void __arwen_init_globals(device uchar* __arwen_g [[buffer(2)]])\n{\n"
                            + "\n".join(lines) + "\n}\n")
         flags = metal_flags(self.opts)
         prelude = (f"// generated by gpuwm.metal.transpile ({TRANSLATOR_REVISION}); do not edit\n"
