@@ -136,6 +136,12 @@ struct Runtime {
     std::unordered_map<size_t, std::vector<id<MTLBuffer>>> pool;
     int64_t pooled_bytes = 0, pool_cap = (int64_t)4096 << 20;
     uint64_t n_alloc = 0, n_pool_hits = 0;
+    // the byte count each pooled buffer was last allocated for: a request for
+    // the same count gets that buffer back first (CuPy's pool reuses a freed
+    // block of the requested size, most recent first), any other one in the
+    // class only if none matches
+    std::unordered_map<void*, size_t> last_request;
+    bool trace_pool = getenv("ARWEN_METAL_TRACE_POOL") != nullptr;
 
     static size_t size_class(size_t n) {
         const size_t page = 16384;
@@ -149,10 +155,12 @@ struct Runtime {
     // a buffer no work can reference any more: pool it or drop it
     void retire(id<MTLBuffer> b) {
         size_t len = [b length];
+        if (trace_pool) fprintf(stderr, "[pool] retire %#llx len %zu\n", (unsigned long long)[b gpuAddress], len);
         if (pooled_bytes + (int64_t)len <= pool_cap && len == size_class(len)) {
             pool[len].push_back(b);
             pooled_bytes += (int64_t)len;
         } else {
+            last_request.erase((__bridge void*)b);
             [residency removeAllocation:b];
             residency_dirty = true;
         }
@@ -165,6 +173,7 @@ struct Runtime {
         if (!pool.empty()) {
             for (auto& kv : pool) for (id<MTLBuffer> x : kv.second) [residency removeAllocation:x];
             pool.clear();
+            last_request.clear();
             pooled_bytes = 0;
             [residency commit];
         }
@@ -204,14 +213,29 @@ struct Runtime {
 
     Buffer* alloc(size_t nbytes) {
         std::lock_guard<std::recursive_mutex> g(mu);
+        reap();                      // buffers whose work has completed are reusable now
         size_t n = nbytes ? nbytes : 16;
         size_t cls = size_class(n);
         n_alloc++;
         id<MTLBuffer> b = nil;
         auto it = pool.find(cls);
         if (it != pool.end() && !it->second.empty()) {
-            b = it->second.back();
-            it->second.pop_back();
+            auto& v = it->second;
+            // among buffers last allocated for exactly n bytes, the lowest GPU
+            // address: CuPy carves blocks from arenas and merges adjacent free
+            // ones, so after a workspace is released a request of the same size
+            // starts again at the arena's beginning -- the earliest allocation
+            size_t pick = v.size() - 1;
+            uint64_t best = UINT64_MAX;
+            for (size_t i = 0; i < v.size(); ++i) {
+                auto lr = last_request.find((__bridge void*)v[i]);
+                if (lr != last_request.end() && lr->second == n && (uint64_t)[v[i] gpuAddress] < best) {
+                    best = (uint64_t)[v[i] gpuAddress];
+                    pick = i;
+                }
+            }
+            b = v[pick];
+            v.erase(v.begin() + (ptrdiff_t)pick);
             pooled_bytes -= (int64_t)cls;
             n_pool_hits++;
         } else {
@@ -219,6 +243,7 @@ struct Runtime {
             if (!b && pooled_bytes) {                  // memory pressure: give the pool back and retry
                 for (auto& kv : pool) for (id<MTLBuffer> x : kv.second) [residency removeAllocation:x];
                 pool.clear();
+                last_request.clear();
                 pooled_bytes = 0;
                 [residency commit];
                 b = [dev newBufferWithLength:cls options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
@@ -233,6 +258,8 @@ struct Runtime {
             if (flush_on_alloc) commit();
             else [enc useResource:b usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
         }
+        last_request[(__bridge void*)b] = n;
+        if (trace_pool) fprintf(stderr, "[pool] alloc %zu -> %#llx\n", n, (unsigned long long)[b gpuAddress]);
         auto* r = new Buffer();
         r->buf = b;
         r->nbytes = n;
@@ -244,6 +271,7 @@ struct Runtime {
 
     void release(id<MTLBuffer> b, size_t n) {
         std::lock_guard<std::recursive_mutex> g(mu);
+        if (trace_pool) fprintf(stderr, "[pool] release %#llx n %zu cb %d\n", (unsigned long long)[b gpuAddress], n, cb != nil);
         live_bytes -= (int64_t)n;
         if (cb != nil) {
             // referenced by work still being encoded: released when that command buffer completes
@@ -308,15 +336,12 @@ struct Runtime {
         if (cb == nil) return;
         [enc endEncoding];
         if (order_mode != 2) [cb encodeSignalEvent:order_event value:++order_value];
-        if ([deferred count]) {
-            NSArray* keep = [deferred copy];
-            [deferred removeAllObjects];
-            Runtime* self_ = this;
-            [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
-                std::lock_guard<std::mutex> dg(self_->done_mu);
-                self_->done_keep.push_back(keep);
-            }];
-        }
+        // buffers released while this command buffer was being encoded: reaped
+        // once its status reads completed (a completion handler runs later than
+        // waitUntilCompleted returns, so a pool fed by the handler missed buffers
+        // the host had already synchronised on -- CuPy reuses them at once)
+        for (id<MTLBuffer> b in deferred) zombies.emplace_back(cb, b);
+        [deferred removeAllObjects];
         [cb commit];
         n_committed.fetch_add(1);
         last_committed = cb;

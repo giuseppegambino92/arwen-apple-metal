@@ -30,6 +30,12 @@ CLASSES = {
     "cuda_host_only": "it needs data, tools or an environment present only on the "
                       "CUDA/Linux machine (x86-64 Fortran builds, staged tables, "
                       "recorded baselines)",
+    "cuda_contraction": "a negative control of nvrtc/ptxas FMA contraction: it pins what "
+                        "contracting a*b+c does to a formula on CUDA; Metal compiles "
+                        "without contraction, so the effect does not exist here",
+    "cuda_streams": "it races two independent CUDA streams (a spin-wait gate released from "
+                    "another stream); this backend runs every stream on one in-order Metal "
+                    "queue, so the race it guards against cannot occur",
     "native_libm": "it pins the ULP distance from the WRF oracle that CUDA's hardware powf "
                    "gives in ArWen's default numerics; Apple's native powf rounds differently in "
                    "the last bit (Exner pi_phy: 1826 vs 304 of 5880 words 1 ULP from WRF; t_phy/t8w "

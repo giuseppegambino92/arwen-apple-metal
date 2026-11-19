@@ -47,6 +47,25 @@ RULES = [
 #: from glibc than CUDA's (pi_phy: 1826 vs 304 words differing from WRF)
 NATIVE_LIBM_TESTS = {
     "tests.test_bigstep_prep_wrf471_parity::test_bigstep_phy_prep_compiled_wrf471_exposed_outputs",
+    # ratchets at the error of CUDA's hardware powf(smob, b) (non-integer exponent)
+    "tests.test_thompson_aerosol_device_helpers::test_snow_number_end_to_end_through_the_fits_is_the_cold_network_path",
+}
+#: tests run individually on 2026-11-19 after the array-layer fixes, each read:
+EXPLICIT = {
+    # negative controls of nvrtc/ptxas FMA contraction: the effect they pin is
+    # the NVIDIA compiler's; Metal compiles without contraction
+    "tests.test_thompson_aerosol_device_helpers::test_the_hoisted_mp8_field_fit_really_does_disagree_with_wrf": "cuda_contraction",
+    "tests.test_thompson_aerosol_adapter::test_the_contraction_pinned_saturation_fit_is_load_bearing_for_g3": "cuda_contraction",
+    # two CUDA streams racing (a spin-wait gate released from another stream);
+    # the Metal backend runs every stream on one in-order queue
+    "tests.test_rrtmg_sw_stream_order::test_delayed_table_upload_orders_two_member_streams": "cuda_streams",
+    # AOT cubin packs ("Real cubin load") and the NVRTC library digest
+    "tests.test_kernel_aot_gpu::test_real_cupy_bridge_preserves_template_name_mapping": "ptx",
+    "tests.test_kernel_aot_gpu::test_direct_pack_keeps_both_numerical_modes_when_builder_defaults_fast": "ptx",
+    # gpuwm.nvrtc_ptx_cache: the native (cubin) image cache
+    "tests.test_nvrtc_ptx_cache::test_native_image_cache_retains_subnormal_words_and_recovers_corruption": "ptx",
+    # RTX 5090: AttributeError: 'cupy.cuda.function.Module' object has no attribute 'module'
+    "tests.test_ssib_wrf461_parity::test_table_views_accept_both_cuda_module_interfaces": "arwen_drift",
 }
 #: files whose CPU reference was measured to be the Mac's own libm / NumPy (2026-11-18)
 MACOS_REFERENCE_FILES = {
@@ -67,7 +86,8 @@ def classify(failures, same=(), cuda_pass=()):
     for nodeid, (state, message) in failures.items():
         module = nodeid.split("::", 1)[0]
         text = nodeid + " " + (message or "")
-        cls = next((name for name, pat in RULES if re.search(pat, text)), None)
+        cls = EXPLICIT.get(nodeid.split("[", 1)[0])
+        cls = cls or next((name for name, pat in RULES if re.search(pat, text)), None)
         # before the CUDA evidence: this class keeps them running under STRICT_GLIBC
         if cls is None and module in KF_FILES:
             cls = "kf_default_tolerance"
