@@ -98,6 +98,11 @@ struct Runtime {
     // command buffers committed / completed (they complete in commit order:
     // the order event chains them), for per-event completion queries
     std::atomic<uint64_t> n_committed{0}, n_completed{0};
+    // GPUEndTime of completed command buffer #k (1-based, commit order = completion
+    // order on the one queue), for event timestamps that do not depend on when the
+    // host looks (cupy.cuda.get_elapsed_time)
+    static constexpr size_t END_RING = 8192;
+    std::vector<double> end_times = std::vector<double>(END_RING, 0.0);
     bool flush_on_alloc = false;
     bool profile = false;                    // one command buffer per dispatch, GPU time per kernel
     std::vector<std::pair<id<MTLCommandBuffer>, std::string>> prof_pending;
@@ -312,6 +317,8 @@ struct Runtime {
             cb = [queue commandBufferWithUnretainedReferences];
             Runtime* self_ = this;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+                uint64_t k = self_->n_completed.load() + 1;
+                self_->end_times[k % Runtime::END_RING] = [c GPUEndTime];
                 self_->n_completed.fetch_add(1);
                 if (self_->timeline) {
                     std::lock_guard<std::mutex> tg(self_->tl_mu);
@@ -537,5 +544,11 @@ NB_MODULE(_arwen_metal_rt, m) {
         .def("busy", &Runtime::busy)
         .def("committed", [](Runtime& r) { return (uint64_t)r.n_committed.load(); })
         .def("completed", [](Runtime& r) { return (uint64_t)r.n_completed.load(); })
+        .def("end_time", [](Runtime& r, uint64_t k) {
+            // seconds, in host_seconds' time base; NaN when #k has not completed or left the ring
+            uint64_t done = r.n_completed.load();
+            if (k == 0 || k > done || done - k >= Runtime::END_RING) return std::nan("");
+            return r.end_times[k % Runtime::END_RING]; })
+        .def("host_seconds", [](Runtime&) { return host_seconds(); })
         .def("stats", &Runtime::stats);
 }

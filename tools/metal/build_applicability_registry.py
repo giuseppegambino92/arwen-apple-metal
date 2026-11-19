@@ -104,6 +104,28 @@ EXPLICIT = {
     # inputs WOOF actually used", run_gpu_columns.py): its exner is CUDA's powf;
     # Metal computes glibc's powf, 274 of 4800 exner words differ from CUDA's
     "tests.test_nssl2_column_oracle::test_production_step_matches_wrf": "native_libm",
+    # the reduce pass writes su += pi * part[q], which ptxas contracts into the
+    # fold's explicit __fmaf_rn; without contraction the two differ by 1 ulp
+    "tests.test_rrtmgp::test_rte_warp_fold_matches_the_reduce_pass_it_replaces": "cuda_contraction",
+    "tests.test_rrtmgp::test_rte_buffered_fold_geometries_match_partials": "cuda_contraction",
+    # cupy replaced by NumPy: a float64 CPU mirror pinned to 1.3e-10 on an x86/glibc host
+    "tests.test_rrtmgp::test_real74_model_top_downward_flux_cpu_reference": "macos_reference",
+    # SSiB default arm: the retained receipt counts CUDA's bits off WRF (650,646,
+    # ordinary arithmetic with ptxas contraction); Metal 591,739
+    "tests.test_ssib_wrf461_parity::test_default_arm_reproduces_the_retained_field_receipt": "cuda_hash_pin",
+    # tolerance measured on CUDA for the default arm; runs and passes under ARWEN_METAL_STRICT_GLIBC=1
+    "tests.test_ssib_wrf461_parity::test_default_arm_within_measured_tolerance": "default_native_math",
+    # Noah 4.6.1 / mosaic: CUDA's measured distance from WRF; Metal 0 differing words
+    # in every Noah field, fewer differing mosaic cells than CUDA
+    "tests.test_noah_wrf461_parity::test_noah_cuda_column_holds_its_measured_distance_from_wrf": "cuda_hash_pin",
+    "tests.test_noah_mosaic_wrf471_parity::test_every_family_bitwise": "cuda_hash_pin",
+    # Blackwell (sm_120) -ftz=true codegen: on sm_89 the control matches WRF, as on Metal
+    "tests.test_kf_wrf461_oracle::test_the_flushed_route_is_what_the_unflushed_compile_prevents": "cuda_introspection",
+    "tests.test_noahmp_bareflux_cuda::test_device_negative_controls_rounding": "cuda_contraction",
+    "tests.test_ftz_receipt::test_probe_sensitivity_control_moves_the_bit_column": "ptx",
+    "tests.test_kernel_aot::test_shipped_unit_packs_hold_every_current_loader_request": "ptx",
+    "tests.test_kernel_aot::test_mskf_catalog_is_the_forecast_loader_request": "ptx",
+    "tests.test_wsm5::test_unflushed_kernel_frame_reader_matches_the_real_driver": "cuda_introspection",
     # RTX 5090: AttributeError: 'cupy.cuda.function.Module' object has no attribute 'module'
     "tests.test_ssib_wrf461_parity::test_table_views_accept_both_cuda_module_interfaces": "arwen_drift",
 }

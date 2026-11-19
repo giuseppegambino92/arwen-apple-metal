@@ -400,9 +400,18 @@ class Event:
         return id(self)
 
     def _mark(self):
-        self._t = time.perf_counter()
+        self._t = _rt_module.rt().host_seconds()
         self._done = True
         self._ticket = 0
+
+    def _stamp(self):
+        """GPU end time of the command buffer that completes this event's work
+        (host seconds when the event closed no GPU work)."""
+        t = float("nan")
+        k = getattr(self, "_ticket", 0)
+        if k:
+            t = _rt_module.rt().end_time(k)
+        self._t = t if t == t else _rt_module.rt().host_seconds()
 
     def record(self, stream=None):
         if _rt_module.CAPTURE is not None:
@@ -419,7 +428,7 @@ class Event:
     def synchronize(self):
         _rt_module.synchronize()
         if self._t is None:
-            self._t = time.perf_counter()
+            self._stamp()
         self._done = True
 
     def query(self):
@@ -428,7 +437,7 @@ class Event:
             if r.completed() >= getattr(self, "_ticket", 0):
                 self._done = True
                 if self._t is None:
-                    self._t = time.perf_counter()
+                    self._stamp()
         return self._done
 
     @property
@@ -476,28 +485,31 @@ def _token(source, options, name_expressions=None):
     except Exception:                      # not preprocessable here: the raw text names it
         canon = source
     import hashlib
-    digest = hashlib.sha256(json.dumps([canon, opts, list(name_expressions or ())]).encode()).hexdigest()
+    # include paths and macro definitions are consumed by the preprocessing
+    # above: what is left of the options is what shapes the image
+    shaping = [o for o in opts if not o.startswith(("-I", "--include-path", "-D", "--define-macro", "-U"))]
+    digest = hashlib.sha256(json.dumps([canon, shaping, list(name_expressions or ())]).encode()).hexdigest()
     with _PROGRAMS_LOCK:
         if digest not in _PROGRAMS:
-            _PROGRAMS[digest] = source
+            _PROGRAMS[digest] = (source, opts)
             path = _program_dir() / f"{digest}.json"
             if not path.exists():
                 tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-                tmp.write_text(json.dumps({"source": source}))
+                tmp.write_text(json.dumps({"source": source, "options": opts}))
                 os.replace(tmp, path)
-    return _TOKEN + json.dumps({"program": digest, "options": opts,
-                                "name_expressions": list(name_expressions or ())}).encode()
+    return _TOKEN + json.dumps({"program": digest, "name_expressions": list(name_expressions or ())}).encode()
 
 
 def _token_source(d):
+    """(source, options) of a compile token."""
     if "source" in d:                      # tokens written before content addressing
-        return d["source"]
+        return d["source"], d.get("options", [])
     digest = d["program"]
-    src = _PROGRAMS.get(digest)
-    if src is None:
-        src = json.loads((_program_dir() / f"{digest}.json").read_text())["source"]
-        _PROGRAMS[digest] = src
-    return src
+    entry = _PROGRAMS.get(digest)
+    if entry is None:
+        j = json.loads((_program_dir() / f"{digest}.json").read_text())
+        entry = _PROGRAMS[digest] = (j["source"], j.get("options", d.get("options", [])))
+    return entry
 
 
 def compile_using_nvrtc(source, options=(), arch=None, filename="kern.cu", name_expressions=None, log_stream=None,
@@ -560,8 +572,8 @@ class _Module:
             raise RuntimeError("function.Module.load on Metal needs the source token produced by "
                                "compiler.compile_using_nvrtc (a PTX/cubin image cannot run on Metal)")
         d = json.loads(image[len(_TOKEN):].decode())
-        source = _token_source(d)
-        self._m = _rt_module.Module(source, effective_options(source, d["options"]), cupy_raw_module=False)
+        source, options = _token_source(d)
+        self._m = _rt_module.Module(source, effective_options(source, options), cupy_raw_module=False)
         return self
 
     def load_file(self, path):

@@ -42,6 +42,9 @@ CLASSES = {
                    "the last bit (Exner pi_phy: 1826 vs 304 of 5880 words 1 ULP from WRF; t_phy/t8w "
                    "up to 2-3 ULP). Native math stays the default for speed; GPUWM_WRF_EXACT=1 "
                    "computes the glibc-exact power",
+    "default_native_math": "a tolerance measured on CUDA for ArWen's default numerics, which "
+                           "call the GPU's own float libm; with ARWEN_METAL_STRICT_GLIBC=1 "
+                           "it runs here, and passes",
     "kf_default_tolerance": "ArWen 3.0.3's default KF-CuP numerics fail these word "
                             "counts on the RTX 5090 as well (e.g. rthcuten 1189 words "
                             "off on CUDA, 1255 on Metal); with ARWEN_METAL_STRICT_GLIBC=1 "
@@ -583,6 +586,6 @@ def reason_for(nodeid: str) -> str | None:
     cls = ENTRIES.get(nodeid) or ENTRIES.get(nodeid.split("[", 1)[0])
     if cls is None:
         return None
-    if cls == "kf_default_tolerance" and os.environ.get("ARWEN_METAL_STRICT_GLIBC") == "1":
+    if cls in ("kf_default_tolerance", "default_native_math") and os.environ.get("ARWEN_METAL_STRICT_GLIBC") == "1":
         return None              # with the glibc copies the test applies, and passes
     return f"[{cls}] {CLASSES[cls]}"
