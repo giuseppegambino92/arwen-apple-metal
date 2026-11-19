@@ -19,6 +19,19 @@ surface, Tiedtke convection — runs natively on a Mac GPU.
 gpuwm go /path/to/wrf_run_dir --backend metal --history-compression none
 ```
 
+**At a glance**
+
+| | |
+|---|---|
+| what runs | ArWen's own CUDA kernels, translated to Metal at first use — no hand-written port, no NVIDIA hardware, no emulator |
+| forecast | operational two-domain WRF configuration (6 km / 2 km, 45 levels): 1 h and 6 h runs complete |
+| against an RTX 5090 | word-identical at 00:00; after 6 h, 2 m temperature RMSE 0.09 K and surface pressure correlation 1.0000 |
+| reproducibility | 142 775 319 output words identical from run to run, re-checked after every change |
+| exactness checks | binary64 emulation 0 ulp; FP32 gradual underflow, translator constructs and `goto` elimination 0 differing words; glibc libm fast paths verified on all 2³² inputs |
+| coverage | all 342 CUDA translation units and 46 / 46 production loaders build |
+| ArWen's GPU test suite | 13 458 tests: 185 failing (1.4 %), 478 skipped as not applicable on a Mac with a stated reason, the rest passing |
+| speed | 1 simulated hour in 81–240 s on an M3 Max laptop (RTX 5090: ~11 s) |
+
 ---
 
 ## Contents
