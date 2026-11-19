@@ -103,6 +103,11 @@ def _captured(fn):
 
 
 runtime_ns.memcpyAsync = _captured(lambda dst, src, size, kind, stream=0: _memcpy(dst, src, size, kind))
+# one Apple GPU: every "peer" is this device, so a peer copy is an ordinary copy
+runtime_ns.memcpyPeerAsync = _captured(lambda dst, dst_dev, src, src_dev, size, stream=0: _memcpy(dst, src, size, 3))
+runtime_ns.memcpyPeer = lambda dst, dst_dev, src, src_dev, size: _memcpy(dst, src, size, 3)
+runtime_ns.deviceCanAccessPeer = lambda a, b: 1
+runtime_ns.deviceEnablePeerAccess = lambda peer, flags=0: None
 runtime_ns.memsetAsync = lambda ptr, value, size, stream=0: (_rt_module.synchronize(),
                                                             __import__("ctypes").memset(_host_ptr(ptr), int(value), int(size)))
 _PINNED = __import__("weakref").WeakSet()
@@ -294,6 +299,21 @@ class Graph:
     def launch(self, stream=None):
         _rt_module.replay(self._ops)
 
+    def debug_dot_str(self, flags=0):
+        """cudaGraphDebugDotPrint's text: one node per captured launch (kernel
+        name) or host step, chained in capture order -- the topology, no
+        pointers, like CUDA's at flags=0."""
+        g = f"graph_{id(self) & 0xffff}"
+        lines = ["digraph dot {", f"subgraph cluster_{id(self) & 0xffff} {{", f'label="{g}" graph[style="dashed"];']
+        for i, op in enumerate(self._ops):
+            if op[0] == "dispatch":
+                kind, label = "KERNEL", getattr(op[2], "name", "kernel")
+            else:
+                kind, label = "HOST", getattr(op[1], "__qualname__", "host")
+            lines.append(f'"{g}_node_{i}"[style="solid" shape="rectangle" label="{i}\\n{kind}\\n{label}"];')
+        lines += [f'"{g}_node_{i}" -> "{g}_node_{i + 1}";' for i in range(len(self._ops) - 1)]
+        return "\n".join(lines + ["}", "}"]) + "\n"
+
 
 class Stream:
     null = None
@@ -308,6 +328,11 @@ class Stream:
 
     def query(self):
         return not _rt_module.rt().busy()
+
+    @property
+    def done(self):
+        """CuPy's ``Stream.done``: True when all work queued on it is complete."""
+        return self.query()
 
     def record(self, event=None):
         event = event or Event()
@@ -469,6 +494,9 @@ compiler = types.SimpleNamespace(
     _get_arch_for_options_for_nvrtc=lambda arch=None: ("-arch=sm_120", "cubin"),
     get_cache_dir=lambda: str(__import__("gpuwm.metal.native_build", fromlist=["cache_dir"]).cache_dir()),
     CompileException=RuntimeError,
+    _get_nvrtc_version=lambda: _nvrtc_version(),
+    _get_bool_env_variable=lambda name, default: (
+        __import__("os").environ.get(name, "1" if default else "0").lower() not in ("0", "false", "")),
 )
 
 
@@ -647,6 +675,9 @@ class MemoryHook:
     def malloc_postprocess(self, **kw): pass
     def free_preprocess(self, **kw): pass
     def free_postprocess(self, **kw): pass
+
+
+memory_hook = types.SimpleNamespace(MemoryHook=MemoryHook)
 
 
 def get_allocator():

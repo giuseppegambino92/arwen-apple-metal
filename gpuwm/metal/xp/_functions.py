@@ -535,6 +535,87 @@ def _gather(a, idx, axis, along=False):
     return res
 
 
+_MATMUL = """
+typedef __T__ T;
+extern "C" __global__ void matmul_k(const T* A, const T* B, T* C, long long nb, long long M, long long N,
+                                   long long K, int a_bcast, int b_bcast) {
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nb * M * N) return;
+    long long b = t / (M * N), r = t % (M * N), i = r / N, j = r % N;
+    const T* a = A + (a_bcast ? 0 : b * M * K) + i * K;
+    const T* bb = B + (b_bcast ? 0 : b * K * N) + j;
+    T acc = (T)0;
+    for (long long k = 0; k < K; ++k) {
+        T p = a[k] * bb[k * N];
+        acc = acc + p;
+    }
+    C[t] = acc;
+}
+"""
+
+
+@implements(np.matmul)
+def matmul(a, b, out=None, **kw):
+    """NumPy's matmul on the GPU: 1-D operands promoted and their axis dropped,
+    batch dimensions broadcast; each output element sums its K products in
+    order (no FMA contraction)."""
+    a, b = _dev(a), _dev(b)
+    dt = np.result_type(a.dtype, b.dtype)
+    if dt.kind == "c" or a.ndim == 0 or b.ndim == 0:
+        return host_call(np.matmul, (a, b), {"out": out} if out is not None else {})
+    if dt.kind == "b":
+        dt = np.dtype(np.int64)
+    A = a.reshape((1,) + a.shape) if a.ndim == 1 else a
+    B = b.reshape(b.shape + (1,)) if b.ndim == 1 else b
+    M, K = A.shape[-2:]
+    K2, N = B.shape[-2:]
+    if K != K2:
+        raise ValueError(f"matmul: Input operand 1 has a mismatch in its core dimension 0 (size {K2} is different from {K})")
+    batch = np.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+    nb = int(np.prod(batch, dtype=np.int64))
+    def prep(x, core):
+        bc = int(np.prod(x.shape[:-2], dtype=np.int64)) == 1 and nb > 1
+        x = x.astype(dt, copy=False)
+        if not bc and tuple(x.shape[:-2]) != batch:
+            x = broadcast_to(x, batch + core)
+        x = x.reshape(core) if bc else x
+        return (x if x.flags.c_contiguous else x.copy()), int(bc)
+    A, abc = prep(A, (M, K))
+    B, bbc = prep(B, (K, N))
+    res = C.empty(batch + (M, N), dtype=dt)
+    total = nb * M * N
+    if total:
+        if K == 0:
+            res.fill(0)
+        else:
+            k = _matmul_kernel(dt)
+            k(((total + 255) // 256,), (256,), (A, B, res, np.int64(nb), np.int64(M), np.int64(N),
+                                                np.int64(K), np.int32(abc), np.int32(bbc)))
+    shape = batch + ((M,) if a.ndim > 1 else ()) + ((N,) if b.ndim > 1 else ())
+    res = res.reshape(shape)
+    if out is not None:
+        assign(out, res)
+        return out
+    return res
+
+
+_MATMUL_K = {}
+
+
+def _matmul_kernel(dt):
+    if dt not in _MATMUL_K:
+        _MATMUL_K[dt] = K.kernel(_MATMUL.replace("__T__", K.ctype(dt)), "matmul_k")
+    return _MATMUL_K[dt]
+
+
+@implements(np.dot)
+def dot(a, b, out=None):
+    a, b = _dev(a), _dev(b)
+    if a.ndim <= 2 and b.ndim <= 2 and a.ndim and b.ndim:
+        return matmul(a, b, out=out)
+    return host_call(np.dot, (a, b), {"out": out} if out is not None else {})
+
+
 @implements(np.take)
 def take(a, indices, axis=None, out=None, mode="raise"):
     a = _dev(a)
@@ -724,9 +805,89 @@ extern "C" __global__ void scatter_rows(char* dst, const char* src, const long l
 """
 
 
+_SCATTER_ND = {}
+
+
+def _scatter_nd(k):
+    """dst[lead, i0[j], i1[j], ...] = src: one thread per byte of the result."""
+    if k not in _SCATTER_ND:
+        idx = ", ".join(f"const long long* i{m}" for m in range(k))
+        one = ", ".join(f"long long one{m}" for m in range(k))
+        dims = ", ".join(f"long long n{m}" for m in range(k))
+        sts = ", ".join(f"long long s{m}" for m in range(k))
+        body = "".join(f"    {{ long long q = i{m}[one{m} ? 0 : j]; if (q < 0) q += n{m}; off += q * s{m}; }}\n"
+                       for m in range(k))
+        src = f"""
+extern "C" __global__ void scatter_nd(char* dst, const char* src, {idx}, {one}, {dims}, {sts},
+                                      long long ni, long long nlead, long long inner, long long isz, int vmode) {{
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= ni * nlead * isz) return;
+    long long e = t / isz, b = t % isz;
+    long long l = e / ni, j = e % ni;
+    long long off = l * inner;
+{body}    long long se = vmode == 0 ? 0 : (vmode == 2 ? j : e);
+    dst[off * isz + b] = src[se * isz + b];
+}}
+"""
+        _SCATTER_ND[k] = K.kernel(src, "scatter_nd")
+    return _SCATTER_ND[k]
+
+
 def advanced_setitem(a, key, value):
     if not isinstance(key, tuple):
         key = (key,)
+    full = lambda x: isinstance(x, slice) and x == slice(None)
+    lead = 0
+    while lead < len(key) and full(key[lead]):
+        lead += 1
+    adv = key[lead:]
+    if len(key) == a.ndim and len(adv) > (1 if lead == 0 else 0) and a.flags.c_contiguous and all(
+            not isinstance(x, (slice, type(None), type(Ellipsis), bool)) and not (
+                hasattr(x, "dtype") and np.dtype(x.dtype) == np.bool_) for x in adv):
+        # a[:, ..., i0, i1, ...] = v: full slices first, then one integer index per
+        # remaining axis (NumPy keeps the index dimensions in place).  One kernel
+        # computes each target offset from the index arrays themselves, so no
+        # index-sized temporaries are allocated (CuPy allocates none either)
+        idx = [x if is_device(x) else asarray(np.asarray(x)) for x in adv]
+        ishape = np.broadcast_shapes(*(tuple(x.shape) for x in idx))
+        ni = int(np.prod(ishape, dtype=np.int64))
+        nlead = int(np.prod(a.shape[:lead], dtype=np.int64))
+        if ni == 0 or nlead == 0:
+            return
+        ok = True
+        prepared = []
+        for x in idx:
+            if x.size not in (1, ni) or not x.flags.c_contiguous:
+                ok = False
+                break
+            prepared.append(x if x.dtype == np.int64 else x.astype(np.int64))
+        if ok:
+            v = value
+            if is_device(v):
+                v = v.astype(a.dtype, copy=False)
+                if v.size == 1:
+                    vmode = 0
+                elif tuple(v.shape) == tuple(a.shape[:lead]) + ishape or v.size == nlead * ni and v.ndim == lead + len(ishape):
+                    vmode = 1
+                elif v.size == ni and tuple(v.shape)[-len(ishape):] == ishape:
+                    vmode = 2
+                else:
+                    v = broadcast_to(v, tuple(a.shape[:lead]) + ishape).copy()
+                    vmode = 1
+                v = v if v.flags.c_contiguous else v.copy()
+            else:
+                v = C.full((1,), value, dtype=a.dtype)
+                vmode = 0
+            inner = int(np.prod(a.shape[lead:], dtype=np.int64))
+            strides = [st // a.dtype.itemsize for st in a.strides[lead:]]
+            k = _scatter_nd(len(prepared))
+            args = [a, v] + prepared
+            args += [np.int64(int(x.size == 1)) for x in prepared]
+            args += [np.int64(n) for n in a.shape[lead:]] + [np.int64(st) for st in strides]
+            args += [np.int64(ni), np.int64(nlead), np.int64(inner), np.int64(a.dtype.itemsize), np.int32(vmode)]
+            total = ni * nlead * a.dtype.itemsize
+            k(((total + 255) // 256,), (256,), tuple(args))
+            return
     if len(key) != 1:
         raise NotImplementedError("advanced assignment with more than one index on the Metal backend")
     k = key[0]

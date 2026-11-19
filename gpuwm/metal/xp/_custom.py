@@ -80,6 +80,65 @@ class Function:
             raise AttributeError(f"cannot set {name} on a Metal kernel")
 
 
+def _split_top(text):
+    """Split at the commas that are not inside <>, () or []."""
+    out, depth, cur = [], 0, ""
+    for ch in text:
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def _instantiate_name_expressions(code, names):
+    """NVRTC name expressions on a kernel template (``k<unsigned int>``): the
+    template becomes a ``__device__`` function and each expression gets an
+    ``extern "C"`` kernel with the template arguments substituted into its
+    parameter list, which calls that instance.  Returns the new source and
+    {expression: kernel name}."""
+    import re
+    mapping, wrappers = {}, []
+    for i, expr in enumerate(names or ()):
+        m = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*<(.*)>\s*", expr)
+        if not m:
+            continue
+        fname, args = m.group(1), _split_top(m.group(2))
+        d = re.search(r"template\s*<([^{;]*?)>\s*(?:__global__\s+void|void\s+__global__)\s+" + re.escape(fname) + r"\s*\(", code)
+        if not d:
+            continue
+        tparams = [re.findall(r"[A-Za-z_]\w*", p.split("=")[0])[-1] for p in _split_top(d.group(1))]
+        if len(args) > len(tparams):
+            continue
+        j, depth = d.end(), 1                      # the parameter list: up to the matching ')'
+        while depth:
+            depth += {"(": 1, ")": -1}.get(code[j], 0)
+            j += 1
+        params = _split_top(code[d.end():j - 1])
+        sub = dict(zip(tparams, args))
+        typed = [re.sub(r"\b[A-Za-z_]\w*\b", lambda t: sub.get(t.group(0), t.group(0)), p) for p in params]
+        pnames = [re.findall(r"[A-Za-z_]\w*", p.split("[")[0])[-1] for p in params]
+        kname = f"__arwen_ne_{i}_{fname}"
+        wrappers.append(f'extern "C" __global__ void {kname}({", ".join(typed)}) '
+                        f'{{ {fname}<{", ".join(args)}>({", ".join(pnames)}); }}')
+        mapping[expr] = kname
+    if not mapping:
+        return code, {}
+    for fname in {e.split("<")[0].strip() for e in mapping}:
+        code = re.sub(r"(template\s*<[^{;]*?>\s*)__global__(\s+void\s+" + re.escape(fname) + r"\s*\()",
+                      r"\1__device__\2", code)
+        code = re.sub(r"(template\s*<[^{;]*?>\s*void\s+)__global__(\s+" + re.escape(fname) + r"\s*\()",
+                      r"\1__device__\2", code)
+    return code + "\n" + "\n".join(wrappers) + "\n", mapping
+
+
 class RawModule:
     def __init__(self, code=None, *, path=None, options=(), backend="nvrtc", translate_cucomplex=False,
                  enable_cooperative_groups=False, name_expressions=None, jitify=False):
@@ -90,11 +149,12 @@ class RawModule:
         self.code = code
         self.options = tuple(options)
         from .cuda import effective_options
-        self.module = runtime.Module(code, effective_options(code, self.options), cupy_raw_module=True)
+        source, self._names = _instantiate_name_expressions(code, name_expressions)
+        self.module = runtime.Module(source, effective_options(code, self.options), cupy_raw_module=True)
         self.name_expressions = name_expressions
 
     def get_function(self, name):
-        return Function(self.module.get_function(name))
+        return Function(self.module.get_function(self._names.get(name, name)))
 
     def get_global(self, name):
         mem, g = self.module.get_global(name)

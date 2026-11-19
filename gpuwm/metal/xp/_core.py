@@ -445,7 +445,16 @@ class ndarray:
     conjugate = conj
 
     def __matmul__(self, other):
-        raise NotImplementedError("matmul on the Metal backend")
+        from . import _functions
+        return _functions.matmul(self, other)
+
+    def __rmatmul__(self, other):
+        from . import _functions
+        return _functions.matmul(other, self)
+
+    def dot(self, other, out=None):
+        from . import _functions
+        return _functions.dot(self, other, out=out)
 
 
 # operators: NumPy's ufuncs, which dispatch to the GPU through __array_ufunc__

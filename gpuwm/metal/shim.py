@@ -104,7 +104,7 @@ def install():
     cuda.__path__ = []
     xp.cuda = cuda
     sys.modules["cupy.cuda"] = cuda
-    for sub in ("runtime", "compiler", "function", "memory", "nvrtc", "driver", "cufft"):
+    for sub in ("runtime", "compiler", "function", "memory", "memory_hook", "nvrtc", "driver", "cufft"):
         mod = types.ModuleType(f"cupy.cuda.{sub}")
         mod.__dict__.update(vars(getattr(cuda, sub)) if not isinstance(getattr(cuda, sub), types.ModuleType)
                             else vars(getattr(cuda, sub)))
