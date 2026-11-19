@@ -1,0 +1,10 @@
+{
+ "a": "runs/metal_1h_r12/run-20261118-132426Z_i202611170000Z/wrfout/wrfout_d02_2026-11-17_01_00_00",
+ "b": "runs/metal_1h_r8/run-20261118-030447Z_i202611170000Z/wrfout/wrfout_d02_2026-11-17_01_00_00",
+ "variables_compared": 242,
+ "only_in_a": [],
+ "only_in_b": [],
+ "words_compared": 96488189,
+ "differing_words": 0,
+ "differing_variables": []
+}

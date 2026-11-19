@@ -343,7 +343,7 @@ template <typename T> struct __arwen_no_cas64 { static constant bool value = fal
 template <typename P, typename T>
 inline T atomicCAS(P p, T cmp, T v) {
     static_assert(__arwen_no_cas64<T>::value,
-                  "64-bit atomicCAS: Apple GPUs have no 64-bit compare-and-swap (see docs/metal-README.md)");
+                  "64-bit atomicCAS: Apple GPUs have no 64-bit compare-and-swap (see README.md)");
     return v;
 }
 ARWEN_ATOMIC_ADD64(device, ulong)
