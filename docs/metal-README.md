@@ -135,25 +135,38 @@ Each piece has a check with a declared tolerance and a measured result:
 | binary64 emulation (`tests/metal/sf64_gpu_check.py` + host checks) | 0 ulp core operations |
 | FP32 gradual underflow (`tests/metal/ftz_false_gpu_check.py`) | 0 of 4 194 304 words |
 | CuPy-compatible array layer vs NumPy (`tests/metal/xp_parity_check.py`) | 124 checks, 0 failures |
-| translator constructs vs native clang (`tests/metal/translator_features_check.py`) | 18 constructs, 0 differing words |
+| translator constructs vs native clang (`tests/metal/translator_features_check.py`) | 27 cases, 0 differing words |
+| ensemble members packed into one batch vs run one by one (packed, scheduled, batched RRTMGP) | 30 / 30 tests, word for word |
 | `goto` elimination vs native clang (`tests/metal/goto_semantics_check.py`) | 8 shapes incl. SSiB NEWTON and a jump into a sibling branch (Noah-MP), 0 differing words |
 | Kain-Fritsch (KF-CuP) columns vs WRF's Fortran oracle, `GPUWM_WRF_EXACT=1` | 0 differing words, 5 configurations |
 | glibc libm fast paths (`tools/metal/verify_fastlibm.py`) | all 2³² inputs per routed function, 0 mismatches |
-| ArWen's own GPU test suite on Metal (13 458 tests) | 723 failing (5.4 %), every other test passing or skipped — by cause below (2026-11-18) |
+| ArWen's own GPU test suite on Metal (13 458 tests) | 185 failing (1.4 %); 478 skipped as not applicable on a Mac, each with its reason; every other test passing or skipped by ArWen's own conditions (2026-11-19) |
 
-What the 723 failing GPU tests are (2026-11-18; a confirmation rerun of
-their 174 files is under way):
+The 478 skips are listed one by one in `tests/metal_not_applicable.py` and
+applied by `tests/conftest.py` only when `GPUWM_BACKEND=metal`; pytest prints
+the reason of each.  A test is listed only with evidence for its class:
 
-| cause | tests | applies to Metal? |
+| class | tests | why it does not apply on a Mac |
 |---|---|---|
-| CUDA-only machinery: PTX / NVRTC-direct compiles, nvJitLink, cubin | 212 | no — there is no PTX on Metal |
-| SHA-256 pins of CUDA's output words (they encode `ptxas` FMA choices) | 57 | no — Metal is often closer to the WRF oracle |
-| ArWen test/code drift in 3.0.3 (configs missing attributes the code reads) | 48 | no — fails on any backend |
-| data, tools or environment present only on the CUDA machine or on Linux | 44 | no |
-| CPU references computed on the Mac (Apple libm, NumPy arm64) | 34 | no — Metal matches glibc there |
-| CUDA introspection (local frames, registers, NVRTC builtins) | 22 | no |
-| Apple's compiler service dropping XPC under a parallel run | 9 | flaky; rerun alone passes |
-| Metal-side, to investigate | 297 | yes — part already fixed after the measuring run |
+| `ptx` | 212 | PTX / NVRTC-direct compiles, nvJitLink, cubin — Metal has no PTX |
+| `arwen_drift` | 120 | fails on any backend in ArWen 3.0.3 (same failure on an RTX 5090, or an error in the test's own fixture) |
+| `cuda_hash_pin` | 57 | SHA-256 pins of CUDA's output words, which encode `ptxas` FMA contraction (Metal is often closer to the WRF oracle) |
+| `macos_reference` | 33 | the CPU reference runs on the Mac with Apple's libm or NumPy arm64 (Metal matches glibc there) |
+| `cuda_host_only` | 19 | data, tools or environment present only on the Linux/CUDA machine |
+| `kf_default_tolerance` | 15 | KF-CuP default numerics vs a tolerance measured on CUDA; they run, and pass, with `ARWEN_METAL_STRICT_GLIBC=1` |
+| `cuda_introspection` | 14 | CUDA local-memory frames, registers, NVRTC builtin behaviour |
+| `native_libm` | 8 | ULP distance from WRF pinned for CUDA's hardware `powf`; Apple's `powf` rounds differently in the last bit (Exner `pi_phy`: 1826 vs 304 of 5880 words 1 ULP from WRF) |
+
+The 185 tests that still fail stay in the suite: nothing yet shows that
+they do not apply to Metal (a CUDA cross-check of part of them was cut short
+when the reference machine went offline).  Grouped by their messages:
+
+| what | tests |
+|---|---|
+| numerical differences against CUDA-measured pins or tolerances, and other assertions to investigate | 122 |
+| Apple's shader compiler crashing or giving up on the largest kernels | 25 |
+| array-layer / CUDA-API functions not provided yet (`matmul`, `memcpyPeerAsync`, …) | 25 |
+| memory and allocation accounting that differs from CUDA's | 13 |
 
 Two checks caught real defects that compiled cleanly: overlapping backward
 `goto` regions jumping to the wrong label (SSiB), and kernels launched with
@@ -255,6 +268,12 @@ python tests/metal/translator_features_check.py      # and the other tests/metal
   device clock).
 * **CUDA-only machinery** — PTX/cubin images, nvJitLink, CUDA local-memory
   frame sizes, multi-GPU — does not apply.
+* **No 64-bit compare-and-swap.**  Apple GPUs have none; the Grell-Freitas
+  "lanes" variant that needs it stops at compile time with that reason
+  (64-bit `atomicAdd` is emulated exactly with two 32-bit atomics).
+* **Nested ensembles with map-factor feedback** (`mapped=True`) differ from
+  the scalar path in ArWen 3.0.3 itself: the batch does not feed back the map
+  factors the scalar path copies.  The RTX 5090 fails the same 24 tests.
 
 ## Repository map
 
