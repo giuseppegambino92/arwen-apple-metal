@@ -792,6 +792,8 @@ class _Module:
                 builtin_users.add(fusr)
         self._layout_dependent_shared()
         self.callers = callers
+        self.private_const_index = self._private_const_subscripts()
+        builtin_users |= {u for u, _ in self.private_const_index}
         need = set(u for u in builtin_users | warp_users if u)
 
         def propagate():
@@ -1691,6 +1693,7 @@ class _Module:
         self.edit_dependent_conversions()
         self.edit_dependent_conditionals()
         self.edit_conditional_lvalues()
+        self.edit_private_const_index()
         self.edit_expressions()
         self.edit_select_minmax()
         if not self.opts.ftz:
@@ -2519,6 +2522,98 @@ class _Module:
             node, p = p, self.parent.get(p.hash)
         return False
 
+    #: element count from which a private array is affected by the Apple GPU
+    #: compiler defect worked around below (measured: 32 elements correct, 63 wrong)
+    PRIVATE_CONST_INDEX_MIN = 33
+
+    def _private_const_subscripts(self):
+        """(function usr, index cursor) of every integer-literal subscript on a
+        large private array or on a pointer/array parameter of a device function.
+
+        Apple's GPU compiler (M3 Max, macOS 27.2; reproduced in plain Swift/MSL,
+        tools/metal/apple_private_array_repro.swift) returns 0 for ``a[0]`` on a
+        private ``float a[64]`` read after a loop that reads ``a``; a run-time
+        index is compiled correctly.  The translator therefore gives those
+        subscripts a run-time zero (``__arwen_ctx.z``)."""
+        out = []
+        for c in self.nodes:
+            if c.kind != K.ARRAY_SUBSCRIPT_EXPR:
+                continue
+            fn = self.fn_of.get(c.hash)
+            if fn is None or fn.kind in (K.CXX_METHOD, K.CONVERSION_FUNCTION, K.CONSTRUCTOR, K.DESTRUCTOR):
+                continue                 # members: the ctx parameter is not threaded into records here
+            kids = list(c.get_children())
+            if len(kids) != 2:
+                continue
+            idx = kids[1]
+            while idx.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len(list(idx.get_children())) == 1:
+                idx = list(idx.get_children())[0]
+            if idx.kind != K.INTEGER_LITERAL:
+                continue
+            base = kids[0]
+            while True:
+                while base.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len(list(base.get_children())) == 1:
+                    base = list(base.get_children())[0]
+                if base.kind == K.ARRAY_SUBSCRIPT_EXPR:
+                    base = list(base.get_children())[0]
+                    continue
+                break
+            if base.kind == K.MEMBER_REF_EXPR and base.referenced is not None \
+                    and base.referenced.kind == K.FIELD_DECL:
+                # ``col.q[0]`` on a large array member of a local struct
+                ft = _canon(base.referenced.type)
+                if ft.kind == T.CONSTANTARRAY and ft.get_size() >= 4 * self.PRIVATE_CONST_INDEX_MIN:
+                    obj = list(base.get_children())
+                    if obj and obj[0].kind == K.DECL_REF_EXPR and obj[0].referenced is not None \
+                            and obj[0].referenced.kind in (K.VAR_DECL, K.PARM_DECL) \
+                            and not self._program_scope(obj[0].referenced):
+                        out.append((fn.get_usr(), idx))
+                continue
+            if base.kind != K.DECL_REF_EXPR or base.referenced is None:
+                continue
+            ref = base.referenced
+            ct = _canon(ref.type)
+            if ref.kind == K.VAR_DECL and ct.kind == T.POINTER and not self._program_scope(ref) \
+                    and not self.is_kernel(fn):
+                pass                        # a local pointer: it may point into a private array
+            elif ref.kind == K.VAR_DECL:
+                if self._program_scope(ref) or K.CUDASHARED_ATTR in self._attrs(ref) or ct.kind not in (
+                        T.CONSTANTARRAY, T.DEPENDENTSIZEDARRAY, T.INCOMPLETEARRAY, T.VARIABLEARRAY):
+                    continue
+                if ct.kind == T.CONSTANTARRAY:
+                    n, t = 1, ref.type
+                    while _canon(t).kind == T.CONSTANTARRAY:
+                        n *= _canon(t).element_count
+                        e = t.get_array_element_type()
+                        t = e if e.kind != T.INVALID else _canon(t).get_array_element_type()
+                    if _canon(t).kind in (T.DEPENDENTSIZEDARRAY,):
+                        n = self.PRIVATE_CONST_INDEX_MIN
+                    if n < self.PRIVATE_CONST_INDEX_MIN:
+                        continue
+            elif ref.kind == K.PARM_DECL:
+                if self.is_kernel(fn) or ct.kind not in (T.POINTER, T.CONSTANTARRAY, T.INCOMPLETEARRAY,
+                                                         T.DEPENDENTSIZEDARRAY):
+                    continue
+            else:
+                continue
+            p, in_lambda = self.parent.get(c.hash), False
+            while p is not None and p.hash != fn.hash:
+                if p.kind == K.LAMBDA_EXPR:
+                    in_lambda = True
+                    break
+                p = self.parent.get(p.hash)
+            if in_lambda:
+                continue
+            out.append((fn.get_usr(), idx))
+        return out
+
+    def edit_private_const_index(self):
+        for _, idx in getattr(self, "private_const_index", ()):
+            s, e = idx.extent.start.offset, idx.extent.end.offset
+            if self.rw.in_opaque(s, e):
+                continue
+            self.rw.replace(s, e, f"({self.text[s:e]} + __arwen_ctx.z)", opaque=True)
+
     def edit_select_minmax(self):
         """``a > b ? a : b`` on floats -> __arwen_sel_max(a, b) (and the three sibling forms).
 
@@ -2887,7 +2982,10 @@ class _Module:
                 raise TranslationError(f"call to {c.spelling}: argument list not found")
             nargs = len(list(self.call_args(c)))
             # before any wrapper the first argument gets (``&(`` for a reference parameter)
-            self.rw.insert(lp, "__arwen_ctx" + (", " if nargs else ""), order=-100)
+            # first at the paren whatever wraps the first argument there (float-op
+            # helpers are ordered by -width: a wide first argument sorted before
+            # an order of -100 and swallowed the ctx -- __arwen_fdiv(__arwen_ctx, ...))
+            self.rw.insert(lp, "__arwen_ctx" + (", " if nargs else ""), order=-1e15)
         params = self._params(ref)
         for i, a in enumerate(self.call_args(c)):
             if i < len(params) and _canon(params[i].type).kind == T.RECORD and self._record_has_pointers(params[i].type):

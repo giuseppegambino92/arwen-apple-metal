@@ -19,9 +19,10 @@ CLASSES = {
     "cuda_introspection": "it reads CUDA compiler/driver internals (local-memory "
                           "frames, registers, NVRTC builtin behaviour) that Metal "
                           "does not expose",
-    "cuda_hash_pin": "it pins the SHA-256 of CUDA's output words, which encode "
-                     "ptxas's FMA contraction under --fmad=true; Metal computes "
-                     "without contraction (often closer to the WRF oracle)",
+    "cuda_hash_pin": "it pins CUDA's output words (their SHA-256, the words themselves, or "
+                     "their measured distance from a WRF oracle), which encode ptxas's FMA "
+                     "contraction under --fmad=true; Metal computes without contraction and is "
+                     "closer to the WRF oracle where one exists (dycore: never farther)",
     "macos_reference": "its CPU reference runs on the Mac itself, linking Apple's "
                        "libm or NumPy for arm64 instead of glibc/x86 (Metal matches "
                        "the glibc words, e.g. logf(8841.5107) = 0x41116539)",

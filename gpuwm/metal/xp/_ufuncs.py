@@ -190,11 +190,28 @@ def _expr(name, loop, nin):
         e = "ipow(x0, x1)"
     elif f and name in _UNARY_FLOAT:
         e = _UNARY_FLOAT[name].replace("(T)", f"({T})")
+    elif name == "power" and dt == np.float32:
+        # glibc's powf (ArWen's own device copy, mynn_libm.cuh): WRF's Fortran **
+        # word for word; Apple's precise::pow is up to 1 ulp off (and CUDA's
+        # powf agrees with glibc on the inputs ArWen's exact paths check)
+        pre, e = _glibc_powf_preamble(), "mynn_glibc_powf(x0, x1)"
     elif f and name in _BINARY_FLOAT:
         e = _BINARY_FLOAT[name]
     else:
         raise NotImplementedError(f"ufunc {name} for dtype {dt} on the Metal backend")
     return pre, "o0 = " + e.replace("(T)", f"({T})") + ";"
+
+
+_GLIBC_POWF = None
+
+
+def _glibc_powf_preamble():
+    global _GLIBC_POWF
+    if _GLIBC_POWF is None:
+        from pathlib import Path
+        hdr = Path(__file__).resolve().parents[2] / "core" / "kernels" / "mynn_libm.cuh"
+        _GLIBC_POWF = "typedef float real;\n" + hdr.read_text()
+    return _GLIBC_POWF
 
 
 def _scalar_value(x):

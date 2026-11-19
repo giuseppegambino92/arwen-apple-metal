@@ -87,11 +87,13 @@ struct __arwen_ctx_t {
     device metal::atomic_uint* status; // device-side abort word (CUDA __trap), checked by the host after a sync
     threadgroup uchar* dsmem;   // extern __shared__ (dynamic size)
     threadgroup uchar* ssmem;   // static __shared__ declared inside __device__ functions
+    int z;                      // 0, known only at run time (L.pad): see transpile.edit_private_const_index
 };
 inline __arwen_ctx_t __arwen_make_ctx(constant __arwen_launch_t& L, uint3 tid, uint3 bid, uint3 bdim, uint3 gdim,
                                       uint lane, device uchar* g, device metal::atomic_uint* status,
                                       threadgroup uchar* dsmem, threadgroup uchar* ssmem) {
     __arwen_ctx_t c;
+    c.z = (int)L.pad;
     c.lane = lane;
     c.g = g;
     c.status = status;

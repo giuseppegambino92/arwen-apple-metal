@@ -73,6 +73,37 @@ EXPLICIT = {
     "tests.test_rrtmgp::test_rte_tile_scales_with_the_kernel_frame_not_a_fixed_thread_count": "cuda_introspection",
     # counts *.cubin files written to CUPY_CACHE_DIR
     "tests.test_preparation_prewarm::test_preparation_prewarm_caches_root_initialize_kernels": "ptx",
+    # pow(qNaN, sNaN): plm_pow returns the first NaN as x86's x + y does; the
+    # expected words come from the Mac's arm64 FPU, which returns the sNaN
+    "tests.test_portable_libm64_gpu::test_portable_libm64_matches_host_gpu": "macos_reference",
+    # CUDA local-frame size of the Thompson generation column at KMAX 128/256
+    # (attribute 3, 0 on Metal); the 128/256 builds crash Apple's compiler (SIGSEGV
+    # in an AGX MachineFunctionPass) -- a documented limitation
+    "tests.test_thompson_generation_gpu::test_generation_frame_reservation_covers_the_production_driver": "cuda_introspection",
+    # dycore parity pins: CUDA's measured distance from the compiled WRF 4.7.1
+    # oracle, or its output words (diff_opt1: "measured on the RTX 5070 Ti
+    # (sm_120)").  Measured 2026-11-19: Metal is closer to WRF or equal on every
+    # field -- small step vertical 110 closer / 44 equal / 0 farther of 154,
+    # RK tendency 18,719 vs 20,960 differing words, advance_w default 75,823 vs
+    # the sm_120 pin 111,728
+    **{f"tests.test_smallstep_vertical_wrf471_parity::{t}": "cuda_hash_pin" for t in (
+        "test_calc_coef_w_matches_compiled_wrf471_measured_words",
+        "test_advance_w_matches_compiled_wrf471_measured_words",
+        "test_calc_p_rho_matches_compiled_wrf471_measured_words",
+        "test_native_vertical_output_words_equal_frozen_receipt",
+        "test_implicit_w_damper_corrected_words_match_compiled_wrf471")},
+    "tests.test_bigstep_rk_wrf471_parity::test_rk_tendency_records_every_compiled_wrf471_output": "cuda_hash_pin",
+    **{f"tests.test_diff_opt1_wrf471::{t}": "cuda_hash_pin" for t in (
+        "test_legacy_metric_payload_continues_onto_288_pins",
+        "test_metric_diffusion_matches_merged_oracle_fix_baseline",
+        "test_merged_coordinate_moved_words_are_only_the_tensor_donor_fix")},
+    **{f"tests.test_smallstep_horizontal_wrf471_parity::{t}": "cuda_hash_pin" for t in (
+        "test_advance_uv_against_compiled_wrf471", "test_advance_mu_t_against_compiled_wrf471")},
+    "tests.test_diffusion_default_words::test_diffusion_every_wrf_word": "cuda_hash_pin",
+    # the Fortran oracle ran on inputs prepared by ArWen on CUDA ("the prepared
+    # inputs WOOF actually used", run_gpu_columns.py): its exner is CUDA's powf;
+    # Metal computes glibc's powf, 274 of 4800 exner words differ from CUDA's
+    "tests.test_nssl2_column_oracle::test_production_step_matches_wrf": "native_libm",
     # RTX 5090: AttributeError: 'cupy.cuda.function.Module' object has no attribute 'module'
     "tests.test_ssib_wrf461_parity::test_table_views_accept_both_cuda_module_interfaces": "arwen_drift",
 }
