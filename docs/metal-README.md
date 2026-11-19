@@ -1,5 +1,7 @@
 # ArWen on Apple Silicon
 
+**English** · [Italiano](README.it.md)
+
 ### A WRF-class regional weather model running natively on a Mac GPU
 
 This repository is **[ArWen](https://github.com/recastsystems/arwen)** — Recast
@@ -14,6 +16,16 @@ between.
 To our knowledge this is the first time a full WRF-ARW-class forecast — nested
 domains, Thompson microphysics, MYNN boundary layer, RRTMG radiation, Noah land
 surface, Tiedtke convection — runs natively on a Mac GPU.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/metal-assets/t2_6h_dark.png">
+  <img alt="2 m temperature after a 6 h forecast over Sicily at 2 km: RTX 5090 with CUDA, Apple M3 Max with Metal, and their difference (RMSE 0.086 K, correlation 0.9996)" src="docs/metal-assets/t2_6h_light.png">
+</picture>
+
+*The same 6 h forecast computed by stock ArWen on an NVIDIA RTX 5090 and by
+this backend on a MacBook Pro's M3 Max.  The difference map shows what is left:
+scattered round-off grown by six hours of a chaotic model, mostly over land
+where convection and the surface scheme amplify it.*
 
 ```sh
 gpuwm go /path/to/wrf_run_dir --backend metal --history-compression none
@@ -39,12 +51,14 @@ gpuwm go /path/to/wrf_run_dir --backend metal --history-compression none
 1. [Results](#results)
 2. [How it works](#how-it-works)
 3. [Verification](#verification)
-4. [Coverage](#coverage)
-5. [Getting started](#getting-started)
-6. [Configuration](#configuration)
-7. [Known limitations](#known-limitations)
-8. [Repository map](#repository-map)
-9. [Credits and license](#credits-and-license)
+4. [What the port found](#what-the-port-found)
+5. [Coverage](#coverage)
+6. [Getting started](#getting-started)
+7. [Configuration](#configuration)
+8. [Known limitations](#known-limitations)
+9. [What is left, and what can be solved](#what-is-left-and-what-can-be-solved)
+10. [Repository map](#repository-map)
+11. [Credits and license](#credits-and-license)
 
 ---
 
@@ -182,10 +196,57 @@ the CUDA run did not cover.  Grouped by their messages:
 | array-layer / CUDA-API functions not provided yet (`matmul`, `memcpyPeerAsync`, …) | 23 |
 | memory and allocation accounting that differs from CUDA's | 12 |
 
-Two checks caught real defects that compiled cleanly: overlapping backward
-`goto` regions jumping to the wrong label (SSiB), and kernels launched with
-more threadgroup memory than the device has (they now fail loudly, as on
-CUDA).
+## What the port found
+
+Running a large CUDA code base on a second, very different GPU is also a test
+of the code base.  Besides the Metal backend, this work produced findings for
+ArWen and for anyone porting CUDA to Apple GPUs.
+
+**In ArWen 3.0.3** (all reproduced on the RTX 5090, not Metal effects):
+
+* **155 GPU tests fail on any backend** — the tests and the code have drifted
+  apart (configurations missing attributes the code now reads, changed
+  keyword arguments, outdated expected values).  Each is listed in
+  `tests/metal_not_applicable.py` as `arwen_drift`.
+* **Nested ensembles with map-factor feedback** (`mapped=True`): the batched
+  path does not feed the map factors back the way the scalar path does
+  (surface `copy_fcnm`); 24 tests fail identically on CUDA.
+* **Kain-Fritsch default numerics**: KF's word-count tests fail on CUDA as
+  well (`rthcuten` 1189 words off on the RTX 5090, 1255 on Metal); only the
+  glibc-exact path is word-exact.
+* **A CUDA speed-up**: the float-float fast paths built here for the glibc
+  `logf`/`expf`/`powf` copies also work on NVIDIA GPUs.  They are offered
+  upstream as an opt-in change, verified on the RTX 5090 over all 2³² inputs
+  and on a complete 1 h forecast (identical `wrfout` SHA-256):
+  [recastsystems/arwen#8](https://github.com/recastsystems/arwen/pull/8).
+
+**Defects that compiled cleanly and were caught by the checks** (all fixed):
+
+* overlapping backward `goto` regions jumping to the wrong label (SSiB's
+  translated Fortran);
+* kernels launched with more threadgroup memory than the device has (they now
+  fail loudly, as on CUDA);
+* `cupy.take(..., out=)` returning a new array instead of writing `out`: the
+  RRTMGP surface emissivity of every ensemble member but the first then came
+  from stale memory.  Found by hashing every kernel's buffers before and after
+  each dispatch in the packed and in the one-by-one runs and stopping at the
+  first difference;
+* libclang, run inside a free-threaded Python 3.14 process, corrupting Python
+  objects at random (now it translates in a child process);
+* a deadlock between Metal's completion handler and the dispatcher in the
+  native runtime.
+
+**Numerics, measured:**
+
+* Apple's GPU `logf` agrees with glibc where Apple's CPU libm does not
+  (`logf(8841.5107)`: glibc and Metal `0x41116539`, macOS libm `0x4111653a`) —
+  so a CPU reference computed on a Mac can be the wrong reference.
+* CUDA's output words depend on where `ptxas` chooses to contract `a*b+c`
+  into an FMA; Metal computes without contraction and is often *closer* to
+  the WRF Fortran oracle than CUDA is.
+* Apple's and NVIDIA's hardware `powf` differ in the last bit; in ArWen's
+  default numerics that moves the Exner function `pi_phy` 1 ULP from WRF in
+  1826 of 5880 words on Metal, 304 on CUDA.  The glibc-exact path removes it.
 
 ## Coverage
 
@@ -204,7 +265,7 @@ toolchain (`xcodebuild -downloadComponent MetalToolchain`), Python ≥ 3.11.
 Rust (`cargo`) is needed only for the ArWen tools that are written in Rust.
 
 ```sh
-git clone <this repository> arwen && cd arwen
+git clone https://github.com/giuseppegambino92/arwen-apple-metal.git arwen && cd arwen
 uv venv && source .venv/bin/activate
 uv pip install -e '.[metal]'
 gpuwm go /path/to/wrf_run_dir --backend metal --history-compression none \
@@ -286,9 +347,28 @@ python tests/metal/translator_features_check.py      # and the other tests/metal
 * **No 64-bit compare-and-swap.**  Apple GPUs have none; the Grell-Freitas
   "lanes" variant that needs it stops at compile time with that reason
   (64-bit `atomicAdd` is emulated exactly with two 32-bit atomics).
-* **Nested ensembles with map-factor feedback** (`mapped=True`) differ from
-  the scalar path in ArWen 3.0.3 itself: the batch does not feed back the map
-  factors the scalar path copies.  The RTX 5090 fails the same 24 tests.
+
+## What is left, and what can be solved
+
+Almost everything that is left is engineering, not a wall.
+
+| what | tests | solvable? |
+|---|---|---|
+| array-layer / CUDA-API functions not written yet (`matmul`, `memcpyPeerAsync`, cooperative launches, …) | 23 | **yes** — each is a self-contained function of the CuPy-compatible layer |
+| memory and allocation accounting differing from CUDA's | 12 | **yes** — the layer reports unified-memory sizes; CUDA's pool rounding can be mirrored |
+| Apple's shader compiler crashing or giving up on the largest kernels | 25 | **yes, with work** — split the kernels, lower register pressure, or wait for Apple's fix (the failures are reproducible and reportable) |
+| numerical differences against CUDA-measured pins, other assertions | 90 | **mostly** — each needs its own look: last-bit libm differences can be closed by routing to the verified glibc copies (exact, slower); some are real bugs still to find |
+
+What cannot be done, by design:
+
+* **Bit-identical to CUDA.**  CUDA's words encode `ptxas`'s private FMA
+  contraction decisions and NVIDIA's libm; Metal can reproduce WRF's words
+  (as the KF and Thompson oracles show), not NVIDIA's compiler's.
+* **PTX, cubin, nvJitLink** — there is no PTX on Apple GPUs (212 tests).
+* **64-bit compare-and-swap in hardware** — absent on Apple GPUs; an emulation
+  with locks is possible but slow, and only one optional variant needs it.
+* **RTX 5090 speed** — a laptop GPU emulating FP64 in software stays about an
+  order of magnitude slower than a 575 W desktop card with native FP64.
 
 ## Repository map
 
@@ -301,6 +381,8 @@ python tests/metal/translator_features_check.py      # and the other tests/metal
 | `gpuwm/metal/xp/`, `shim.py` | CuPy-compatible array layer on unified memory |
 | `gpuwm/metal/fastlibm.py` | verified routing of the glibc libm copies |
 | `tests/metal/`, `tools/metal/` | exactness checks, coverage gates, comparison tools |
+| `tests/metal_not_applicable.py` | the 513 tests skipped on Metal, each with its class and reason (`tools/metal/build_applicability_registry.py` builds it) |
+| `docs/metal-evidence/` | 1 h bitwise regression receipts |
 | `docs/metal-backend.md` | design notes and every measurement, in order |
 
 ## Credits and license
