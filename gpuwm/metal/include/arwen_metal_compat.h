@@ -626,21 +626,36 @@ inline bool isnan(float x) { return metal::isnan(x); }
 // Arithmetic and comparisons on type-dependent operands (template bodies,
 // transpile.edit_float_ops): the gradual-underflow helper when the operation
 // is float, the operator itself otherwise (ints, pointers, __f64, vectors).
-template <typename A, typename B> using __arwen_tg_f32 =
-    metal::is_same<metal::remove_cv_t<metal::remove_reference_t<decltype(metal::declval<A>() + metal::declval<B>())>>, float>;
+template <typename...> using __arwen_void_t = void;
+template <typename A, typename B, typename = void> struct __arwen_tg_f32 { static constexpr constant bool value = false; };
+template <typename A, typename B>
+struct __arwen_tg_f32<A, B, __arwen_void_t<decltype(metal::declval<A>() + metal::declval<B>())>> {
+    static constexpr constant bool value = metal::is_same_v<
+        metal::remove_cv_t<metal::remove_reference_t<decltype(metal::declval<A>() + metal::declval<B>())>>, float>; };
+// pointers into different address spaces (a generic CUDA pointer instantiated
+// once with device and once with constant memory) never alias: they compare unequal
+// and unordered, so the overlap test of a memmove takes either direction safely
+template <typename A, typename B, typename = void> struct __arwen_cmp_ok { static constexpr constant bool value = false; };
+template <typename A, typename B>
+struct __arwen_cmp_ok<A, B, __arwen_void_t<decltype(metal::declval<A>() == metal::declval<B>())>> {
+    static constexpr constant bool value = true; };
 #define ARWEN_TG_BIN(name, op, helper)                                                          \
     template <typename A, typename B> inline auto name(A a, B b) {                              \
         if constexpr (__arwen_tg_f32<A, B>::value) return helper((float)a, (float)b); else return a op b; }
+#define ARWEN_TG_PCMP(name, op, helper, apart)                                                  \
+    template <typename A, typename B> inline auto name(A a, B b) {                              \
+        if constexpr (__arwen_tg_f32<A, B>::value) return helper((float)a, (float)b);           \
+        else if constexpr (__arwen_cmp_ok<A, B>::value) return a op b; else return apart; }
 ARWEN_TG_BIN(__arwen_tg_add, +, __arwen_fadd)
 ARWEN_TG_BIN(__arwen_tg_sub, -, __arwen_fsubtract)
 ARWEN_TG_BIN(__arwen_tg_mul, *, __arwen_fmul)
 ARWEN_TG_BIN(__arwen_tg_div, /, __arwen_fdiv)
-ARWEN_TG_BIN(__arwen_tg_lt, <, __arwen_flt)
-ARWEN_TG_BIN(__arwen_tg_le, <=, __arwen_fle)
-ARWEN_TG_BIN(__arwen_tg_gt, >, __arwen_fgt)
-ARWEN_TG_BIN(__arwen_tg_ge, >=, __arwen_fge)
-ARWEN_TG_BIN(__arwen_tg_eq, ==, __arwen_feq)
-ARWEN_TG_BIN(__arwen_tg_ne, !=, __arwen_fne)
+ARWEN_TG_PCMP(__arwen_tg_lt, <, __arwen_flt, false)
+ARWEN_TG_PCMP(__arwen_tg_le, <=, __arwen_fle, false)
+ARWEN_TG_PCMP(__arwen_tg_gt, >, __arwen_fgt, false)
+ARWEN_TG_PCMP(__arwen_tg_ge, >=, __arwen_fge, false)
+ARWEN_TG_PCMP(__arwen_tg_eq, ==, __arwen_feq, false)
+ARWEN_TG_PCMP(__arwen_tg_ne, !=, __arwen_fne, true)
 #define ARWEN_TG_CMP(name, op, helper)                                                          \
     template <typename P, typename B> inline auto name(P p, B b) {                              \
         if constexpr (metal::is_same_v<metal::remove_cv_t<metal::remove_reference_t<decltype(*p)>>, float> \
