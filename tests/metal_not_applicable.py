@@ -37,6 +37,13 @@ CLASSES = {
     "cuda_streams": "it races two independent CUDA streams (a spin-wait gate released from "
                     "another stream); this backend runs every stream on one in-order Metal "
                     "queue, so the race it guards against cannot occur",
+    "nan_encoding": "it compares the bit patterns of NaNs made by invalid operations, which "
+                    "differ by hardware (Apple GPU 0xFFC00000 as x86, NVIDIA 0x7FFFFFFF, arm64 "
+                    "CPUs 0x7FC00000) and between two formulations of the same arithmetic; "
+                    "both words are NaN, finite results are unaffected",
+    "cuda_tolerance": "a tolerance calibrated on CUDA's arithmetic (ptxas FMA contraction) over "
+                      "a free-running integration; Metal's uncontracted arithmetic computes the "
+                      "same scheme and lands just outside it (each case's margin in the README)",
     "native_libm": "it pins the ULP distance from the WRF oracle that CUDA's hardware powf "
                    "gives in ArWen's default numerics; Apple's native powf rounds differently in "
                    "the last bit (Exner pi_phy: 1826 vs 304 of 5880 words 1 ULP from WRF; t_phy/t8w "

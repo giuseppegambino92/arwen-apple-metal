@@ -606,9 +606,45 @@ ARWEN_F2(fmod, __arwen_f2_slow(metal::precise::fmod(x, y), x, y, 1))
 ARWEN_F2(copysign, as_type<float>((as_type<uint>(x) & 0x7fffffffu) | (as_type<uint>(y) & 0x80000000u)))
 #endif
 ARWEN_F2(fdim, (metal::isnan(x) || metal::isnan(y)) ? x + y : (x > y ? x - y : 0.0f))
+#if ARWEN_FTZ
 inline float fmaf(float a, float b, float c) { return metal::fma(a, b, c); }
 inline float fma(float a, float b, float c) { return metal::fma(a, b, c); }
+#else
+// --ftz=false: the hardware FMA flushes subnormal operands and results
+inline float fmaf(float a, float b, float c) { return __arwen_ffma(a, b, c); }
+inline float fma(float a, float b, float c) { return __arwen_ffma(a, b, c); }
+#endif
 inline bool isnan(float x) { return metal::isnan(x); }
+
+#if !ARWEN_FTZ
+// Arithmetic and comparisons on type-dependent operands (template bodies,
+// transpile.edit_float_ops): the gradual-underflow helper when the operation
+// is float, the operator itself otherwise (ints, pointers, __f64, vectors).
+template <typename A, typename B> using __arwen_tg_f32 =
+    metal::is_same<metal::remove_cv_t<metal::remove_reference_t<decltype(metal::declval<A>() + metal::declval<B>())>>, float>;
+#define ARWEN_TG_BIN(name, op, helper)                                                          \
+    template <typename A, typename B> inline auto name(A a, B b) {                              \
+        if constexpr (__arwen_tg_f32<A, B>::value) return helper((float)a, (float)b); else return a op b; }
+ARWEN_TG_BIN(__arwen_tg_add, +, __arwen_fadd)
+ARWEN_TG_BIN(__arwen_tg_sub, -, __arwen_fsubtract)
+ARWEN_TG_BIN(__arwen_tg_mul, *, __arwen_fmul)
+ARWEN_TG_BIN(__arwen_tg_div, /, __arwen_fdiv)
+ARWEN_TG_BIN(__arwen_tg_lt, <, __arwen_flt)
+ARWEN_TG_BIN(__arwen_tg_le, <=, __arwen_fle)
+ARWEN_TG_BIN(__arwen_tg_gt, >, __arwen_fgt)
+ARWEN_TG_BIN(__arwen_tg_ge, >=, __arwen_fge)
+ARWEN_TG_BIN(__arwen_tg_eq, ==, __arwen_feq)
+ARWEN_TG_BIN(__arwen_tg_ne, !=, __arwen_fne)
+#define ARWEN_TG_CMP(name, op, helper)                                                          \
+    template <typename P, typename B> inline auto name(P p, B b) {                              \
+        if constexpr (metal::is_same_v<metal::remove_cv_t<metal::remove_reference_t<decltype(*p)>>, float> \
+                      && __arwen_tg_f32<float, B>::value) { *p = helper(*p, (float)b); return *p; }    \
+        else { *p op b; return *p; } }
+ARWEN_TG_CMP(__arwen_tg_iadd, +=, __arwen_fadd)
+ARWEN_TG_CMP(__arwen_tg_isub, -=, __arwen_fsubtract)
+ARWEN_TG_CMP(__arwen_tg_imul, *=, __arwen_fmul)
+ARWEN_TG_CMP(__arwen_tg_idiv, /=, __arwen_fdiv)
+#endif
 inline bool isinf(float x) { return metal::isinf(x); }
 inline bool isfinite(float x) { return metal::isfinite(x); }
 inline bool signbit(float x) { return metal::signbit(x); }
@@ -717,6 +753,8 @@ inline float log1pf(float x) {
 }
 inline float expm1(float x) { return expm1f(x); }
 inline float log1p(float x) { return log1pf(x); }
+
+template <typename T> using __arwen_type = T;     // spells a declarator-shaped type (``T (*)[N]``) as a type name
 
 // ------------------------------------------------------------------ address-space preserving pointer casts
 // A C-style pointer cast in MSL would drop to the thread address space; the

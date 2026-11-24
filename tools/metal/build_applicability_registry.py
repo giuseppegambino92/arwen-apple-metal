@@ -126,6 +126,28 @@ EXPLICIT = {
     "tests.test_kernel_aot::test_shipped_unit_packs_hold_every_current_loader_request": "ptx",
     "tests.test_kernel_aot::test_mskf_catalog_is_the_forecast_loader_request": "ptx",
     "tests.test_wsm5::test_unflushed_kernel_frame_reader_matches_the_real_driver": "cuda_introspection",
+    # optimized gas optics uses explicit __fmaf_rn; the reference writes a*b + c in
+    # a module compiled with contraction on: equal on CUDA through ptxas only
+    "tests.test_rrtmgp_optics::test_gas_optimized_matches_frozen_base_bits": "cuda_contraction",
+    "tests.test_rrtmgp_optics::test_seeded_radiation_gas_arrays_match_frozen_base": "cuda_contraction",
+    # two equivalent formulations of an invalid operation (psfc = 0, NaN input):
+    # NVIDIA stores its canonical NaN 0x7FFFFFFF from both, Apple an IEEE quiet NaN
+    # whose sign follows the operation (0xFFC00000 vs 0x7FC00000; both NaN)
+    "tests.test_ruc_lsm_fused::test_diagnostic_nan_words_match_numpy": "nan_encoding",
+    # invalid operations (0/0, inf/inf): Apple's GPU returns 0xFFC00000 as x86 does;
+    # the expected words are NumPy on the Mac's arm64 FPU (0x7FC00000)
+    "tests.test_rrtmg_legacy_device_glue::test_swdown_equals_numpy_on_ieee_edge_values": "macos_reference",
+    # the default arm pins CUDA's powf word 0x3f7c9c65; Metal computes glibc's
+    # 0x3f7c9c64 (the strict arm's word, also the correctly rounded one)
+    "tests.test_coupled_mp_exner_gpu::test_wsm6_adapter_uses_the_observed_rounded_exner_word": "native_libm",
+    # CUDA local-memory frame grown by -maxrregcount (0 on Metal)
+    "tests.test_noahmp_water_cuda::test_the_spill_gate_can_fail": "cuda_introspection",
+    # the probe x0*x1 + x2 returns -2^-46 (0xa8800000) only when the "fast" build
+    # contracts it into an FMA (ptxas); Metal never contracts
+    "tests.test_nextgen_numerics_cli_cuda::test_root_hydro_cli_selects_compiler_mode_before_stage_prepare": "cuda_contraction",
+    # glibc libm copies on both; the free-run tolerance was set on CUDA's contracted
+    # arithmetic: replay within it, free-run lh 0.0117 vs 0.01 W/m2
+    "tests.test_qnse_fast_numerics::test_fast_surface_primary_outputs_against_native": "cuda_tolerance",
     # RTX 5090: AttributeError: 'cupy.cuda.function.Module' object has no attribute 'module'
     "tests.test_ssib_wrf461_parity::test_table_views_accept_both_cuda_module_interfaces": "arwen_drift",
 }

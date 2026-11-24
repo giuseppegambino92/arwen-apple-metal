@@ -1694,6 +1694,7 @@ class _Module:
         self.edit_dependent_conditionals()
         self.edit_conditional_lvalues()
         self.edit_private_const_index()
+        self.edit_cr_libm()
         self.edit_expressions()
         self.edit_select_minmax()
         if not self.opts.ftz:
@@ -2607,6 +2608,29 @@ class _Module:
             out.append((fn.get_usr(), idx))
         return out
 
+    def edit_cr_libm(self):
+        """Calls of the built-in binary64 exp/log/log10/pow/sin/atan -> f64cr."""
+        if not _cr_libm_wanted(self.opts) or "wcr_exp" not in self.text:
+            return
+        for c in self.nodes:
+            if c.kind != K.CALL_EXPR or c.referenced is None or c.spelling not in CR_DOUBLE_LIBM:
+                continue
+            ref = c.referenced
+            f = ref.location.file
+            if f is None or not str(f.name).endswith("cuda_parse.h"):
+                continue
+            if _canon(ref.result_type).kind != T.DOUBLE or any(
+                    _canon(a.type).kind != T.DOUBLE for a in ref.get_arguments()):
+                continue
+            kids = list(c.get_children())
+            if not kids:
+                continue
+            callee = kids[0]
+            s, e = callee.extent.start.offset, callee.extent.end.offset
+            if self.rw.in_opaque(s, e) or e <= s:
+                continue
+            self.rw.replace(s, e, CR_DOUBLE_LIBM[c.spelling], opaque=True)
+
     def edit_private_const_index(self):
         for _, idx in getattr(self, "private_const_index", ()):
             s, e = idx.extent.start.offset, idx.extent.end.offset
@@ -2669,6 +2693,10 @@ class _Module:
              "<": "__arwen_flt", "<=": "__arwen_fle", ">": "__arwen_fgt", ">=": "__arwen_fge",
              "==": "__arwen_feq", "!=": "__arwen_fne"}
     _FCOMP = {"+=": "__arwen_fiadd", "-=": "__arwen_fisub", "*=": "__arwen_fimul", "/=": "__arwen_fidiv"}
+    _TGBIN = {"+": "__arwen_tg_add", "-": "__arwen_tg_sub", "*": "__arwen_tg_mul", "/": "__arwen_tg_div",
+              "<": "__arwen_tg_lt", "<=": "__arwen_tg_le", ">": "__arwen_tg_gt", ">=": "__arwen_tg_ge",
+              "==": "__arwen_tg_eq", "!=": "__arwen_tg_ne"}
+    _TGCOMP = {"+=": "__arwen_tg_iadd", "-=": "__arwen_tg_isub", "*=": "__arwen_tg_imul", "/=": "__arwen_tg_idiv"}
 
     def edit_float_ops(self):
         """CUDA --ftz=false: route float arithmetic and comparisons through the
@@ -2690,11 +2718,18 @@ class _Module:
                 op = ops[0]
                 if c.hash in self._select_done:
                     continue
+                dep = (self._dependent(lhs.type) or self._dependent(rhs.type)) and not (
+                    _canon(lhs.type).kind == T.POINTER or _canon(rhs.type).kind == T.POINTER)
                 if k == K.BINARY_OPERATOR and op.spelling in self._FBIN and is_f32(lhs.type) and is_f32(rhs.type):
                     fn = self._FBIN[op.spelling]
                 elif k == K.COMPOUND_ASSIGNMENT_OPERATOR and op.spelling in self._FCOMP and is_f32(lhs.type) \
                         and is_f32(rhs.type):
                     fn = self._FCOMP[op.spelling]
+                elif dep and k == K.BINARY_OPERATOR and op.spelling in self._TGBIN:
+                    # a template body: the operand type is known only at instantiation
+                    fn = self._TGBIN[op.spelling]
+                elif dep and k == K.COMPOUND_ASSIGNMENT_OPERATOR and op.spelling in self._TGCOMP:
+                    fn = self._TGCOMP[op.spelling]
                 else:
                     continue
                 s0, s1 = lhs.extent.start.offset, rhs.extent.end.offset
@@ -3213,6 +3248,15 @@ class _Module:
                 d.kind == K.DECL_REF_EXPR and d.referenced is not None and d.referenced.kind == K.VAR_DECL
                 and d.referenced.extent.start.offset > var.extent.end.offset for d in rhs.walk_preorder()):
             return self.msl_type(var.type, space=self._expr_space(rhs) or "device")
+        cast = rhs
+        while cast.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len([k for k in cast.get_children() if k.kind.is_expression()]) == 1:
+            cast = [k for k in cast.get_children() if k.kind.is_expression()][0]
+        if cast.kind == K.CSTYLE_CAST_EXPR and _canon(cast.type).kind == T.POINTER and not self._dependent(cast.type):
+            # ``p = (GFText*) q``: the cast's type in the operand's space (a decltype
+            # of the untranslated cast would spell a pointer without one)
+            ops = [k for k in cast.get_children() if k.kind.is_expression()]
+            ty = self.msl_type(cast.type, space=(self._expr_space(ops[-1]) if ops else None) or "device")
+            return f"__arwen_type<{ty}>" if "(*" in ty else ty      # a pointer to array: no declarator syntax
         t = self._decltype_text(rhs)
         inner = rhs
         while inner.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR):     # through the array-to-pointer decay
@@ -3542,6 +3586,10 @@ class _Module:
                    + (f"#define ARWEN_SYNCRED_OFF {self.syncred_off}\n" if self.syncred_off is not None else "")
                    + ("#define ARWEN_SF_INLINE_ALL 1\n" if os.environ.get("ARWEN_METAL_SF_INLINE") == "1" else "")
                    + "#include \"arwen_metal_compat.h\"\n")
+        # conversion operators to a pointer left without an address space (class
+        # template members the function pass does not visit): device memory
+        body = re.sub(r"\boperator\s+((?:const\s+)?(?:char|void|bool|int|float|unsigned\s+char|signed\s+char|uchar)\s*\*)\s*\(",
+                      r"operator device \1(", body)
         msl = prelude + body + init_kernel
         return Translation(msl, self.kernel_infos, {g.name: g for g in self.globals_mut.values()},
                            self.globals_size, self.mode, self.opts, flags)
@@ -3849,6 +3897,34 @@ def _nvrtc_wording(clang_message: str) -> str:
     if m:
         return f' (function "{m.group(1)}" has already been defined)'
     return ""
+
+
+#: double functions a WRF-exact build takes from ArWen's correctly rounded f64cr
+#: (gpuwm/core/kernels/f64cr.cuh) instead of the sf64 fdlibm transcriptions
+CR_DOUBLE_LIBM = {"exp": "wcr_exp", "log": "wcr_log", "log10": "wcr_log10", "pow": "wcr_pow",
+                  "sin": "wcr_sin", "atan": "wcr_atan"}
+
+
+def _cr_libm_wanted(opts) -> bool:
+    return any(d.split("=", 1)[0] == "GPUWM_WRF_EXACT" and d.split("=", 1)[-1] != "0" for d in opts.defines) \
+        or os.environ.get("ARWEN_METAL_CR_LIBM") == "1"
+
+
+def cr_double_libm_source(pp: str, opts) -> str:
+    """A WRF-exact build: prepend f64cr so its binary64 exp/log/log10/pow/sin/atan
+    can replace the fdlibm ones (Module.edit_cr_libm renames the double calls).
+
+    WRF links glibc, whose binary64 exp/log/pow are within 0.52 ulp (almost always
+    the correctly rounded word); the fdlibm transcriptions differ from it in ~9 %
+    of exp and pow results (tests/metal/f64_math_host_check.cpp) -- enough to move
+    WDM5's strict replay off WRF's words."""
+    if not _cr_libm_wanted(opts) or re.search(r"\bdouble\s+wcr_exp\s*\(", pp):
+        return pp
+    if not re.search(r"\b(?:exp|log|log10|pow|sin|atan)\s*\(", pp):
+        return pp
+    from pathlib import Path
+    hdr = Path(__file__).resolve().parents[1] / "core" / "kernels" / "f64cr.cuh"
+    return preprocess(hdr.read_text(), opts, "f64cr.cuh") + "\n" + pp
 
 
 def volatile_device_access(pp: str) -> str:
@@ -4199,6 +4275,7 @@ def _translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str
     if opts.unknown:
         raise TranslationError(f"unsupported NVRTC options: {opts.unknown}")
     pp = preprocess(source, opts, filename)
+    pp = cr_double_libm_source(pp, opts)
     pp = device_heap(pp)
     pp = volatile_device_access(pp)
     pp = flatten_inheritance(pp, filename)
