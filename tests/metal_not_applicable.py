@@ -19,8 +19,8 @@ CLASSES = {
     "cuda_introspection": "it reads CUDA compiler/driver internals (local-memory "
                           "frames, registers, NVRTC builtin behaviour) that Metal "
                           "does not expose",
-    "cuda_hash_pin": "it pins CUDA's output words (their SHA-256, the words themselves, or "
-                     "their measured distance from a WRF oracle), which encode ptxas's FMA "
+    "cuda_hash_pin": "it pins CUDA's output words or numbers measured on CUDA (SHA-256, the "
+                     "words, published figures, or a measured distance from a WRF oracle), which encode ptxas's FMA "
                      "contraction under --fmad=true; Metal computes without contraction and is "
                      "closer to the WRF oracle where one exists (dycore: never farther)",
     "macos_reference": "its CPU reference runs on the Mac itself, linking Apple's "
@@ -44,11 +44,9 @@ CLASSES = {
     "cuda_tolerance": "a tolerance calibrated on CUDA's arithmetic (ptxas FMA contraction) over "
                       "a free-running integration; Metal's uncontracted arithmetic computes the "
                       "same scheme and lands just outside it (each case's margin in the README)",
-    "native_libm": "it pins the ULP distance from the WRF oracle that CUDA's hardware powf "
-                   "gives in ArWen's default numerics; Apple's native powf rounds differently in "
-                   "the last bit (Exner pi_phy: 1826 vs 304 of 5880 words 1 ULP from WRF; t_phy/t8w "
-                   "up to 2-3 ULP). Native math stays the default for speed; GPUWM_WRF_EXACT=1 "
-                   "computes the glibc-exact power",
+    "native_libm": "it pins behaviour of CUDA's hardware powf -- its distance from glibc/WRF, "
+                   "its word, or the levels where it departs from glibc's; Metal's powf follows "
+                   "glibc's algorithm (0 of 1.89e6 differ where the rounding is certain)",
     "default_native_math": "a tolerance measured on CUDA for ArWen's default numerics, which "
                            "call the GPU's own float libm; with ARWEN_METAL_STRICT_GLIBC=1 "
                            "it runs here, and passes",

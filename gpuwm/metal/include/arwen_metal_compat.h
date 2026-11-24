@@ -659,6 +659,7 @@ inline long lroundf(float x) { return __arwen_f2l_sat(metal::round(x)); }
 inline long llroundf(float x) { return __arwen_f2l_sat(metal::round(x)); }
 
 #include "arwen_fastlibm_ff.h"
+#include "arwen_fastlibm_powf.h"
 
 // |x|^n for a small integer n, in float-float: exponentiation by squaring
 // (<= 12 products, each within ~2^-44 relative), a float-float reciprocal for
@@ -708,7 +709,11 @@ inline float __arwen_powf(float x, float y) {
         r = __arwen_powf_int(ax, (int)y);
         if (as_type<uint>(r) == ARWEN_FASTLIBM_UNSURE_BITS) r = metal::precise::pow(ax, y);
     } else {
-        r = metal::precise::pow(ax, y);
+        // glibc's powf algorithm in float-float: glibc's word whenever the rounding
+        // is certain (0 of 1.89e6 sure results differ from glibc for random x, y);
+        // Apple's precise::pow otherwise (special, overflowing or undecided cases)
+        r = __arwen_fast_glibc_powf(ax, y);
+        if (as_type<uint>(r) == ARWEN_FASTLIBM_UNSURE_BITS) r = metal::precise::pow(ax, y);
     }
     return (x < 0.0f && yodd) ? -r : r;
 }

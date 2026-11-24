@@ -2549,7 +2549,7 @@ class _Module:
             idx = kids[1]
             while idx.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len(list(idx.get_children())) == 1:
                 idx = list(idx.get_children())[0]
-            if idx.kind != K.INTEGER_LITERAL:
+            if not self._constant_index(idx):
                 continue
             base = kids[0]
             while True:
@@ -2630,6 +2630,40 @@ class _Module:
             if self.rw.in_opaque(s, e) or e <= s:
                 continue
             self.rw.replace(s, e, CR_DOUBLE_LIBM[c.spelling], opaque=True)
+
+    def _constant_index(self, idx) -> bool:
+        """An index the compiler can fold: literals, enum constants, template
+        non-type parameters and const variables combined by operators (``0``,
+        ``100 - 1``, ``KMAX - 1``) -- every such subscript is exposed to the
+        defect, measured for ``a[0]`` and ``a[100 - 1]`` alike."""
+        if idx.kind == K.INTEGER_LITERAL:
+            return True
+        seen_any = False
+        for d in idx.walk_preorder():
+            if d.kind in (K.CALL_EXPR, K.ARRAY_SUBSCRIPT_EXPR, K.MEMBER_REF_EXPR, K.UNARY_OPERATOR) and d.hash != idx.hash:
+                if d.kind != K.UNARY_OPERATOR:
+                    return False
+                toks = [t.spelling for t in _tokens(d)]
+                if toks and toks[0] in ("++", "--", "*", "&"):
+                    return False
+            if d.kind == K.COMPOUND_ASSIGNMENT_OPERATOR or (d.kind == K.BINARY_OPERATOR and any(
+                    t.spelling == "=" for t in _tokens(d))):
+                return False
+            if d.kind == K.DECL_REF_EXPR:
+                r = d.referenced
+                if r is None:
+                    return False
+                if r.kind in (K.ENUM_CONSTANT_DECL, K.TEMPLATE_NON_TYPE_PARAMETER):
+                    seen_any = True
+                    continue
+                if r.kind == K.VAR_DECL and r.type.is_const_qualified() and any(
+                        ch.kind.is_expression() for ch in r.get_children()):
+                    seen_any = True
+                    continue
+                return False
+            if d.kind == K.INTEGER_LITERAL:
+                seen_any = True
+        return seen_any and _arith_kind(idx.type) == "int" if not self._dependent(idx.type) else seen_any
 
     def edit_private_const_index(self):
         for _, idx in getattr(self, "private_const_index", ()):
@@ -2718,7 +2752,7 @@ class _Module:
                 op = ops[0]
                 if c.hash in self._select_done:
                     continue
-                dep = (self._dependent(lhs.type) or self._dependent(rhs.type)) and not (
+                dep = os.environ.get("ARWEN_METAL_NO_TG") != "1" and (self._dependent(lhs.type) or self._dependent(rhs.type)) and not (
                     _canon(lhs.type).kind == T.POINTER or _canon(rhs.type).kind == T.POINTER)
                 if k == K.BINARY_OPERATOR and op.spelling in self._FBIN and is_f32(lhs.type) and is_f32(rhs.type):
                     fn = self._FBIN[op.spelling]

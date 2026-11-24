@@ -148,6 +148,17 @@ EXPLICIT = {
     # glibc libm copies on both; the free-run tolerance was set on CUDA's contracted
     # arithmetic: replay within it, free-run lh 0.0117 vs 0.01 W/m2
     "tests.test_qnse_fast_numerics::test_fast_surface_primary_outputs_against_native": "cuda_tolerance",
+    # the frozen thompson.cu keeps CUDA's powf; these assert the exact levels where
+    # it departs from glibc's. Metal's powf follows glibc, so the departures vanish
+    "tests.test_thompson_aerosol_state_gpu::test_effective_radius_reduces_to_the_frozen_mp8_kernel_at_nt_c": "native_libm",
+    "tests.test_thompson_aerosol_sed_gpu::test_bridge_two_ports_agree_where_aerosol_is_neutral_and_split_where_it_is_not": "native_libm",
+    # numbers published from a CUDA run of a 2-D mp28 case, to four digits;
+    # Metal: nwfa 4.252e6 (4.268e6), RAINNC 2.130 / 3.361 (2.126 / 3.357), peak 1.068 (1.058)
+    "tests.test_physics_md_aerosol_claims::test_the_published_aerosol_sensitivity_is_a_live_measurement": "cuda_hash_pin",
+    # host reference: the fast_sbm host authority links the Mac's libm
+    "tests.test_fast_sbm_production_cuda::test_packaged_cuda_entry_matches_host": "macos_reference",
+    # the bound (qr 3 ulp, nr 8) measured the frozen pass's CUDA powf against the copy's glibc powf
+    "tests.test_thompson_wrf39_rain_fallout_gpu::test_fork_rain_fallout_is_the_frozen_pass_except_the_surface_test": "native_libm",
     # RTX 5090: AttributeError: 'cupy.cuda.function.Module' object has no attribute 'module'
     "tests.test_ssib_wrf461_parity::test_table_views_accept_both_cuda_module_interfaces": "arwen_drift",
 }
