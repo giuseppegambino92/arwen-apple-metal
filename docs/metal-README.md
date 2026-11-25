@@ -19,7 +19,7 @@ surface, Tiedtke convection — runs natively on a Mac GPU.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/metal-assets/t2_6h_dark.png">
-  <img alt="2 m temperature after a 6 h forecast over Sicily at 2 km: RTX 5090 with CUDA, Apple M3 Max with Metal, and their difference (RMSE 0.086 K, correlation 0.9996)" src="docs/metal-assets/t2_6h_light.png">
+  <img alt="2 m temperature after a 6 h forecast over Sicily at 2 km: RTX 5090 with CUDA, Apple M3 Max with Metal, and their difference (RMSE 0.080 K, correlation 0.9996)" src="docs/metal-assets/t2_6h_light.png">
 </picture>
 
 *The same 6 h forecast computed by stock ArWen on an NVIDIA RTX 5090 and by
@@ -37,12 +37,12 @@ gpuwm go /path/to/wrf_run_dir --backend metal --history-compression none
 |---|---|
 | what runs | ArWen's own CUDA kernels, translated to Metal at first use — no hand-written port, no NVIDIA hardware, no emulator |
 | forecast | operational two-domain WRF configuration (6 km / 2 km, 45 levels): 1 h and 6 h runs complete |
-| against an RTX 5090 | word-identical at 00:00; after 6 h, 2 m temperature RMSE 0.09 K and surface pressure correlation 1.0000 |
+| against an RTX 5090 | word-identical at 00:00; after 6 h, 2 m temperature RMSE 0.08 K and surface pressure correlation 1.0000 |
 | reproducibility | 142 775 319 output words identical from run to run, re-checked after every change |
 | exactness checks | binary64 emulation 0 ulp; FP32 gradual underflow, translator constructs and `goto` elimination 0 differing words; glibc libm fast paths verified on all 2³² inputs |
 | coverage | all 342 CUDA translation units and 46 / 46 production loaders build |
-| ArWen's GPU test suite | 13 458 tests: 150 failing (1.1 %), 513 skipped as not applicable on a Mac with a stated reason, the rest passing |
-| speed | 1 simulated hour in 81–240 s on an M3 Max laptop (RTX 5090: ~11 s) |
+| ArWen's GPU test suite | 13 752 tests: 12 failing (0.09 %, two schemes Apple's compiler cannot build yet), 604 skipped as not applicable on a Mac with a stated reason, the rest passing |
+| speed | 1 simulated hour in 99–213 s, 6 hours in 672 s on an M3 Max laptop (RTX 5090: ~11 s per hour) |
 
 ---
 
@@ -84,17 +84,18 @@ fields are word-identical; after that, Metal − CUDA:
 
 | field | RMSE 1 h d01 | RMSE 1 h d02 | RMSE 6 h d01 | RMSE 6 h d02 | corr 6 h d02 |
 |---|---|---|---|---|---|
-| 2 m temperature (K) | 0.039 | 0.055 | 0.045 | 0.086 | 0.9996 |
-| 10 m wind speed (m/s) | 0.016 | 0.014 | 0.038 | 0.076 | 0.9994 |
-| surface pressure (Pa) | 0.30 | 0.076 | 0.46 | 1.26 | 1.0000 |
-| accumulated rain (mm) | 7.6e-5 | 2.4e-5 | 0.017 | 0.057 | 0.979 |
+| 2 m temperature (K) | 0.039 | 0.053 | 0.041 | 0.080 | 0.9996 |
+| 10 m wind speed (m/s) | 0.016 | 0.015 | 0.040 | 0.089 | 0.9992 |
+| surface pressure (Pa) | 0.25 | 0.076 | 0.46 | 1.28 | 1.0000 |
+| accumulated rain (mm) | 7.0e-5 | 3.4e-5 | 0.017 | 0.064 | 0.973 |
 
 **It is deterministic** — repeated runs of the same build produce the same
 142 775 319 output words, bit for bit.
 
-**Speed** — one simulated hour takes 81–240 s of wall time on the M3 Max
-depending on what else the machine is doing (best measured: median step 0.23 s
-on d02, 0.13 s on d01); six hours took 885 s.  The RTX 5090 does an hour in
+**Speed** — one simulated hour takes 99–213 s of wall time on the M3 Max
+depending on what else the machine is doing and on whether the compiled
+kernels are already cached (median step 0.23–0.32 s on d02, 0.14–0.17 s on d01 across the release runs);
+six hours took 672 s.  The RTX 5090 does an hour in
 about 10.6 s: a 575 W desktop card with 1.8 TB/s and native FP64, against a
 laptop GPU that has to emulate FP64 in software (below).
 
@@ -135,6 +136,12 @@ The hard problems and how they were solved (details and measurements in
   for bitwise WRF agreement; they evaluate in binary64, which is expensive
   here.  They are routed to float-float fast paths whose agreement with the
   glibc copy is verified over **all 2³² inputs** before a route is enabled.
+* **The GPU's own `powf`.**  Where ArWen's default numerics call the hardware
+  `powf`, Metal runs glibc's algorithm in float-float instead: glibc's word
+  whenever the rounding is certain (0 of 1.89 million random `x`, `y` differ),
+  Apple's `pow` only for the undecided rest; integer exponents are correctly
+  rounded.  Apple's `precise::pow` was measurably biased: it moved the
+  Skamarock-Klemp gravity-wave benchmark's θ′ maximum by 8 %, out of its gate.
 * **CUDA → MSL.**  Address spaces are inferred from data flow (device,
   thread, threadgroup, constant); device functions are monomorphised per
   address space; `goto` (translated Fortran) is eliminated exactly; inheritance
@@ -144,7 +151,11 @@ The hard problems and how they were solved (details and measurements in
   express is a `TranslationError` — never a silent change.
 * **Apple's GPU back-end compiler.**  For a handful of very large kernels the
   `-O3` back-end compile takes tens of minutes; the runtime then uses `-Os`
-  AIR (verified to compute the same words) and remembers the kernel.
+  AIR (verified to compute the same words) and remembers the kernel.  It also
+  **miscompiles** one pattern — a constant-index read of a private array of
+  63 or more elements after a loop that reads the array returns 0 — which the
+  translator works around (below, and
+  [`docs/metal-apple-feedback-private-array.md`](docs/metal-apple-feedback-private-array.md)).
 * **Host overhead.**  A GPU-only ordering chain, eager commits, a buffer pool
   and cached argument packing cut the host's share of an hour's run from most
   of it to a small fraction.
@@ -167,34 +178,40 @@ Each piece has a check with a declared tolerance and a measured result:
 | `goto` elimination vs native clang (`tests/metal/goto_semantics_check.py`) | 8 shapes incl. SSiB NEWTON and a jump into a sibling branch (Noah-MP), 0 differing words |
 | Kain-Fritsch (KF-CuP) columns vs WRF's Fortran oracle, `GPUWM_WRF_EXACT=1` | 0 differing words, 5 configurations |
 | glibc libm fast paths (`tools/metal/verify_fastlibm.py`) | all 2³² inputs per routed function, 0 mismatches |
-| ArWen's own GPU test suite on Metal (13 458 tests) | 150 failing (1.1 %); 513 skipped as not applicable on a Mac, each with its reason; every other test passing or skipped by ArWen's own conditions (2026-11-19) |
+| ArWen's own GPU test suite on Metal (13 752 tests) | 12 failing (Grell-Freitas ×11, Goddard radiation ×1); 604 skipped as not applicable on a Mac, each with its reason; every other test passing or skipped by ArWen's own conditions (full run, then every failing file again one process per file, 2026-11-25) |
 
-The 513 skips are listed one by one in `tests/metal_not_applicable.py` and
+The 604 skips are listed one by one in `tests/metal_not_applicable.py` and
 applied by `tests/conftest.py` only when `GPUWM_BACKEND=metal`; pytest prints
-the reason of each.  A test is listed only with evidence for its class:
+the reason of each, and `ARWEN_METAL_APPLY_REGISTRY=0` runs them anyway.  A
+test is listed only with evidence for its class:
 
 | class | tests | why it does not apply on a Mac |
 |---|---|---|
-| `ptx` | 212 | PTX / NVRTC-direct compiles, nvJitLink, cubin — Metal has no PTX |
-| `arwen_drift` | 155 | fails on any backend in ArWen 3.0.3 (same failure on an RTX 5090, or an error in the test's own fixture) |
-| `cuda_hash_pin` | 57 | SHA-256 pins of CUDA's output words, which encode `ptxas` FMA contraction (Metal is often closer to the WRF oracle) |
-| `macos_reference` | 33 | the CPU reference runs on the Mac with Apple's libm or NumPy arm64 (Metal matches glibc there) |
+| `ptx` | 219 | PTX / NVRTC-direct compiles, nvJitLink, cubin — Metal has no PTX |
+| `arwen_drift` | 156 | fails on any backend in ArWen 3.0.3 (same failure on an RTX 5090, or an error in the test's own fixture) |
+| `cuda_hash_pin` | 93 | CUDA's output words or numbers measured on CUDA (SHA-256, the words, published figures, a measured distance from a WRF oracle), which encode `ptxas` FMA contraction; Metal is closer to the WRF oracle where one exists (dycore: never farther) |
+| `macos_reference` | 37 | the CPU reference runs on the Mac with Apple's libm or NumPy arm64 (Metal matches glibc there) |
+| `cuda_introspection` | 29 | CUDA local-memory frames, registers, NVRTC builtin behaviour and diagnostics |
 | `cuda_host_only` | 19 | data, tools or environment present only on the Linux/CUDA machine |
+| `cuda_contraction` | 15 | negative controls of `ptxas` FMA contraction: the effect they pin does not exist without contraction |
 | `kf_default_tolerance` | 15 | KF-CuP default-numerics word counts, which the RTX 5090 fails as well; with `ARWEN_METAL_STRICT_GLIBC=1` they run here, and pass word-exact |
-| `cuda_introspection` | 14 | CUDA local-memory frames, registers, NVRTC builtin behaviour |
-| `native_libm` | 8 | ULP distance from WRF pinned for CUDA's hardware `powf`; Apple's `powf` rounds differently in the last bit (Exner `pi_phy`: 1826 vs 304 of 5880 words 1 ULP from WRF) |
+| `native_libm` | 14 | behaviour of CUDA's hardware `powf` (its distance from WRF, its word); Metal's `powf` follows glibc's algorithm and reproduces WRF where CUDA departs (Exner `pi_phy`: 0 words vs CUDA's 304 of 5 880) |
+| `cuda_streams` | 3 | races between independent CUDA streams; Metal runs every stream on one in-order queue |
+| `nan_encoding` | 2 | bit patterns of NaNs from invalid operations (NVIDIA `0x7FFFFFFF`, Apple `0xFFC00000`); both are NaN |
+| `cuda_tolerance` | 1 | a free-running tolerance calibrated on CUDA's contracted arithmetic (QNSE latent heat: 0.0117 vs 0.01) |
+| `default_native_math` | 1 | a tolerance measured on CUDA for the GPU's own float libm; passes under `ARWEN_METAL_STRICT_GLIBC=1` |
 
-The 150 tests that still fail stay in the suite.  Each failing file was also
-run on the RTX 5090, one process per file: 105 of these tests pass there, so
-they are Metal-side; 11 fail there for a different reason; 34 are in files
-the CUDA run did not cover.  Grouped by their messages:
+The 12 tests that still fail stay in the suite.  They are two known limits,
+both in what Apple's shader compiler accepts:
 
-| what | tests |
-|---|---|
-| numerical differences against CUDA-measured pins or tolerances, and other assertions to investigate | 90 |
-| Apple's shader compiler crashing or giving up on the largest kernels | 25 |
-| array-layer / CUDA-API functions not provided yet (`matmul`, `memcpyPeerAsync`, …) | 23 |
-| memory and allocation accounting that differs from CUDA's | 12 |
+| what | tests | cause |
+|---|---|---|
+| Grell-Freitas convection (`cu_physics=3`) and every test that runs it (MPAS column physics, multislab, held-PBL relocation, SATMEDMF coupling) | 11 | its kernels copy through pointers whose address space is known only at run time (`gf_memmove` called with thread-private and device arguments): MSL has no generic address space.  One variant also needs a 64-bit compare-and-swap, which Apple GPUs do not have |
+| Goddard radiation at 192 levels | 1 | Apple's compiler service crashes on `goddard_bands_columns` at that depth (`XPC_ERROR_CONNECTION_INTERRUPTED`, after retries) |
+
+Six more test files cannot be collected in ArWen 3.0.3 on any machine: they
+read files the release does not ship (`tools/da_cycle_prepared.py`,
+`evidence/p3-fortran-oracle-20260828/`, `gpuwm.go_cli._go_wrfinput_main`).
 
 ## What the port found
 
@@ -220,6 +237,19 @@ ArWen and for anyone porting CUDA to Apple GPUs.
   and on a complete 1 h forecast (identical `wrfout` SHA-256):
   [recastsystems/arwen#8](https://github.com/recastsystems/arwen/pull/8).
 
+**In Apple's GPU compiler** (reproduced in 40 lines of plain Swift and Metal,
+[`tools/metal/apple_private_array_repro.swift`](tools/metal/apple_private_array_repro.swift),
+written up for Apple in
+[`docs/metal-apple-feedback-private-array.md`](docs/metal-apple-feedback-private-array.md)):
+
+* **A constant-index read of a private array returns 0.**  Fill `float
+  rho[N]` in a loop, read it in a second loop, then read `rho[0]`: for
+  N ≥ 63 the result is 0.0, at every optimisation level and with every
+  floating-point flag; `rho[100 - 1]` and `rho[KM - 1]` are hit too, a
+  run-time index is not.  It surfaced as zero surface precipitation from the
+  NSSL two-moment microphysics.  The translator gives every foldable subscript
+  of a large private array a run-time zero.
+
 **Defects that compiled cleanly and were caught by the checks** (all fixed):
 
 * overlapping backward `goto` regions jumping to the wrong label (SSiB's
@@ -244,9 +274,15 @@ ArWen and for anyone porting CUDA to Apple GPUs.
 * CUDA's output words depend on where `ptxas` chooses to contract `a*b+c`
   into an FMA; Metal computes without contraction and is often *closer* to
   the WRF Fortran oracle than CUDA is.
-* Apple's and NVIDIA's hardware `powf` differ in the last bit; in ArWen's
-  default numerics that moves the Exner function `pi_phy` 1 ULP from WRF in
-  1826 of 5880 words on Metal, 304 on CUDA.  The glibc-exact path removes it.
+* NVIDIA's hardware `powf` differs from glibc in the last bit; in ArWen's
+  default numerics that leaves the Exner function `pi_phy` 1 ULP from WRF in
+  304 of 5880 words on CUDA.  Metal, running glibc's `powf` algorithm, has 0
+  (and 0 in `t_phy` and `t8w`, where CUDA has 255 and 261).  Apple's own
+  `pow` was worse than both (1826 words).
+* The Skamarock-Klemp inertia-gravity-wave benchmark, a linear 0.01 K packet,
+  is sensitive to the bias of `powf` in the pressure equation of state: its
+  θ′ maximum was 3.63e-3 K with Apple's `pow` (gate 3.5e-3), 3.36e-3 K with
+  glibc's algorithm.
 
 ## Coverage
 
@@ -344,9 +380,16 @@ python tests/metal/translator_features_check.py      # and the other tests/metal
   device clock).
 * **CUDA-only machinery** — PTX/cubin images, nvJitLink, CUDA local-memory
   frame sizes, multi-GPU — does not apply.
-* **No 64-bit compare-and-swap.**  Apple GPUs have none; the Grell-Freitas
-  "lanes" variant that needs it stops at compile time with that reason
-  (64-bit `atomicAdd` is emulated exactly with two 32-bit atomics).
+* **Grell-Freitas convection (`cu_physics=3`) does not build yet.**  Its
+  kernels pass thread-private and device pointers to the same helper
+  (`gf_memmove`); MSL has no generic address space, so the call has no
+  matching overload.  Its "lanes" variant also needs a 64-bit
+  compare-and-swap, which Apple GPUs do not have (64-bit `atomicAdd` is
+  emulated exactly with two 32-bit atomics).  The operational configuration
+  above uses Tiedtke and is unaffected.
+* **Apple's compiler crashes on the deepest stacks** — Goddard radiation at
+  192 levels and Thompson's generation driver at 128/256 levels
+  (`XPC_ERROR_CONNECTION_INTERRUPTED`).  The 45-level forecast is unaffected.
 
 ## What is left, and what can be solved
 
@@ -354,17 +397,16 @@ Almost everything that is left is engineering, not a wall.
 
 | what | tests | solvable? |
 |---|---|---|
-| array-layer / CUDA-API functions not written yet (`matmul`, `memcpyPeerAsync`, cooperative launches, …) | 23 | **yes** — each is a self-contained function of the CuPy-compatible layer |
-| memory and allocation accounting differing from CUDA's | 12 | **yes** — the layer reports unified-memory sizes; CUDA's pool rounding can be mirrored |
-| Apple's shader compiler crashing or giving up on the largest kernels | 25 | **yes, with work** — split the kernels, lower register pressure, or wait for Apple's fix (the failures are reproducible and reportable) |
-| numerical differences against CUDA-measured pins, other assertions | 90 | **mostly** — each needs its own look: last-bit libm differences can be closed by routing to the verified glibc copies (exact, slower); some are real bugs still to find |
+| Grell-Freitas: one pointer helper used with two address spaces | 11 | **yes, with work** — the translator can emit one copy of the helper per address-space combination it is called with; only the optional "lanes" variant needs 64-bit CAS, which an emulation with locks can provide (slowly) |
+| Apple's compiler crashing on the deepest stacks (Goddard 192 levels; Thompson 128/256 levels, registered as frame tests) | 1 | **yes, with work** — split the kernels or lower their private-array pressure; the crashes are reproducible and reportable to Apple |
+| six ArWen 3.0.3 test files that reference files the release does not ship | — | on ArWen's side: the files are missing on every machine |
 
 What cannot be done, by design:
 
 * **Bit-identical to CUDA.**  CUDA's words encode `ptxas`'s private FMA
   contraction decisions and NVIDIA's libm; Metal can reproduce WRF's words
   (as the KF and Thompson oracles show), not NVIDIA's compiler's.
-* **PTX, cubin, nvJitLink** — there is no PTX on Apple GPUs (212 tests).
+* **PTX, cubin, nvJitLink** — there is no PTX on Apple GPUs (219 tests).
 * **64-bit compare-and-swap in hardware** — absent on Apple GPUs; an emulation
   with locks is possible but slow, and only one optional variant needs it.
 * **RTX 5090 speed** — a laptop GPU emulating FP64 in software stays about an
@@ -381,8 +423,8 @@ What cannot be done, by design:
 | `gpuwm/metal/xp/`, `shim.py` | CuPy-compatible array layer on unified memory |
 | `gpuwm/metal/fastlibm.py` | verified routing of the glibc libm copies |
 | `tests/metal/`, `tools/metal/` | exactness checks, coverage gates, comparison tools |
-| `tests/metal_not_applicable.py` | the 513 tests skipped on Metal, each with its class and reason (`tools/metal/build_applicability_registry.py` builds it) |
-| `docs/metal-evidence/` | 1 h bitwise regression receipts |
+| `tests/metal_not_applicable.py` | the 604 tests skipped on Metal, each with its class and reason (`tools/metal/build_applicability_registry.py` builds it) |
+| `docs/metal-evidence/` | bitwise regression receipts and the comparisons with the RTX 5090 |
 | `docs/metal-backend.md` | design notes and every measurement, in order |
 
 ## Credits and license

@@ -20,7 +20,7 @@ di un Mac.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/metal-assets/t2_6h_dark.png">
-  <img alt="Temperatura a 2 m dopo 6 ore di previsione sulla Sicilia a 2 km: RTX 5090 con CUDA, Apple M3 Max con Metal, e la loro differenza (RMSE 0,086 K, correlazione 0,9996)" src="docs/metal-assets/t2_6h_light.png">
+  <img alt="Temperatura a 2 m dopo 6 ore di previsione sulla Sicilia a 2 km: RTX 5090 con CUDA, Apple M3 Max con Metal, e la loro differenza (RMSE 0,080 K, correlazione 0,9996)" src="docs/metal-assets/t2_6h_light.png">
 </picture>
 
 *La stessa previsione a 6 ore calcolata da ArWen originale su una NVIDIA RTX
@@ -39,12 +39,12 @@ gpuwm go /percorso/della/run_wrf --backend metal --history-compression none
 |---|---|
 | cosa gira | i kernel CUDA di ArWen, tradotti in Metal al primo uso — nessun port scritto a mano, nessun hardware NVIDIA, nessun emulatore |
 | previsione | configurazione WRF operativa a due domini (6 km / 2 km, 45 livelli): run da 1 h e da 6 h completate |
-| contro una RTX 5090 | identica parola per parola alle 00:00; dopo 6 h, RMSE della temperatura a 2 m 0,09 K e correlazione della pressione al suolo 1,0000 |
+| contro una RTX 5090 | identica parola per parola alle 00:00; dopo 6 h, RMSE della temperatura a 2 m 0,08 K e correlazione della pressione al suolo 1,0000 |
 | riproducibilità | 142 775 319 parole di output identiche da una run all'altra, ricontrollate dopo ogni modifica |
 | controlli di esattezza | emulazione binary64 a 0 ulp; underflow graduale FP32, costrutti del traduttore ed eliminazione dei `goto` a 0 parole diverse; percorsi veloci della libm glibc verificati su tutti i 2³² input |
 | copertura | compilano tutte le 342 unità di traduzione CUDA e 46 / 46 loader di produzione |
-| suite di test GPU di ArWen | 13 458 test: 150 falliti (1,1 %), 513 saltati perché non applicabili su un Mac, con la motivazione dichiarata, tutti gli altri passano |
-| velocità | 1 ora simulata in 81–240 s su un portatile M3 Max (RTX 5090: ~11 s) |
+| suite di test GPU di ArWen | 13 752 test: 12 falliti (0,09 %, due schemi che il compilatore Apple non riesce ancora a compilare), 604 saltati perché non applicabili su un Mac, con la motivazione dichiarata, tutti gli altri passano |
+| velocità | 1 ora simulata in 99–213 s, 6 ore in 672 s su un portatile M3 Max (RTX 5090: ~11 s all'ora) |
 
 ---
 
@@ -86,17 +86,18 @@ con la stessa sequenza di passi adattivi della run CUDA.
 
 | campo | RMSE 1 h d01 | RMSE 1 h d02 | RMSE 6 h d01 | RMSE 6 h d02 | corr 6 h d02 |
 |---|---|---|---|---|---|
-| temperatura a 2 m (K) | 0,039 | 0,055 | 0,045 | 0,086 | 0,9996 |
-| velocità del vento a 10 m (m/s) | 0,016 | 0,014 | 0,038 | 0,076 | 0,9994 |
-| pressione al suolo (Pa) | 0,30 | 0,076 | 0,46 | 1,26 | 1,0000 |
-| pioggia accumulata (mm) | 7,6e-5 | 2,4e-5 | 0,017 | 0,057 | 0,979 |
+| temperatura a 2 m (K) | 0,039 | 0,053 | 0,041 | 0,080 | 0,9996 |
+| velocità del vento a 10 m (m/s) | 0,016 | 0,015 | 0,040 | 0,089 | 0,9992 |
+| pressione al suolo (Pa) | 0,25 | 0,076 | 0,46 | 1,28 | 1,0000 |
+| pioggia accumulata (mm) | 7,0e-5 | 3,4e-5 | 0,017 | 0,064 | 0,973 |
 
 **È deterministico** — run ripetute della stessa build producono le stesse
 142 775 319 parole di output, bit per bit.
 
-**Velocità** — un'ora simulata richiede 81–240 s di tempo reale sull'M3 Max, a
-seconda di cos'altro sta facendo la macchina (miglior misura: passo mediano
-0,23 s su d02, 0,13 s su d01); sei ore hanno richiesto 885 s.  La RTX 5090 fa
+**Velocità** — un'ora simulata richiede 99–213 s di tempo reale sull'M3 Max, a
+seconda di cos'altro sta facendo la macchina e di quanti kernel compilati sono
+già in cache (passo mediano 0,23–0,32 s su d02, 0,14–0,17 s su d01 nelle run della release); sei ore hanno
+richiesto 672 s.  La RTX 5090 fa
 un'ora in circa 10,6 s: una scheda desktop da 575 W con 1,8 TB/s e FP64
 nativo, contro una GPU da portatile che deve emulare FP64 in software (sotto).
 
@@ -140,6 +141,14 @@ I problemi difficili e come sono stati risolti (dettagli e misure in
   costoso qui.  Sono instradate su percorsi veloci float-float il cui accordo
   con la copia glibc è verificato su **tutti i 2³² input** prima di attivare
   l'instradamento.
+* **La `powf` della GPU.**  Dove la numerica predefinita di ArWen chiama la
+  `powf` hardware, Metal esegue invece l'algoritmo di glibc in float-float:
+  la parola di glibc ogni volta che l'arrotondamento è certo (0 differenze su
+  1,89 milioni di `x`, `y` casuali), la `pow` di Apple solo per il resto
+  indeciso; gli esponenti interi sono arrotondati correttamente.  La
+  `precise::pow` di Apple aveva un errore sistematico misurabile: spostava il
+  massimo di θ′ del benchmark di onde di gravità Skamarock-Klemp dell'8 %,
+  fuori dalla sua soglia.
 * **CUDA → MSL.**  Gli spazi di indirizzamento sono dedotti dal flusso dei dati
   (device, thread, threadgroup, constant); le funzioni device sono
   monomorfizzate per spazio di indirizzamento; i `goto` (Fortran tradotto)
@@ -150,7 +159,11 @@ I problemi difficili e come sono stati risolti (dettagli e misure in
   è un `TranslationError` — mai un cambiamento silenzioso.
 * **Il compilatore back-end GPU di Apple.**  Per alcuni kernel molto grandi la
   compilazione `-O3` richiede decine di minuti; il runtime usa allora AIR
-  `-Os` (verificato: calcola le stesse parole) e si ricorda il kernel.
+  `-Os` (verificato: calcola le stesse parole) e si ricorda il kernel.  Inoltre
+  **compila male** un pattern — la lettura con indice costante di un array
+  privato di 63 o più elementi, dopo un ciclo che lo legge, restituisce 0 —
+  che il traduttore aggira (sotto, e
+  [`docs/metal-apple-feedback-private-array.md`](docs/metal-apple-feedback-private-array.md)).
 * **Costo lato host.**  Una catena di ordinamento solo GPU, commit anticipati,
   un pool di buffer e il packing degli argomenti in cache hanno ridotto la
   quota dell'host in un'ora di run da quasi tutto a una piccola frazione.
@@ -174,36 +187,40 @@ misurato:
 | eliminazione dei `goto` contro clang nativo (`tests/metal/goto_semantics_check.py`) | 8 forme, tra cui il NEWTON di SSiB e un salto in un ramo fratello (Noah-MP), 0 parole diverse |
 | colonne Kain-Fritsch (KF-CuP) contro l'oracolo Fortran di WRF, `GPUWM_WRF_EXACT=1` | 0 parole diverse, 5 configurazioni |
 | percorsi veloci della libm glibc (`tools/metal/verify_fastlibm.py`) | tutti i 2³² input per funzione instradata, 0 discordanze |
-| suite di test GPU di ArWen su Metal (13 458 test) | 150 falliti (1,1 %); 513 saltati perché non applicabili su un Mac, ognuno con la sua motivazione; tutti gli altri passano o sono saltati dalle condizioni di ArWen stesso (19-11-2026) |
+| suite di test GPU di ArWen su Metal (13 752 test) | 12 falliti (Grell-Freitas ×11, radiazione Goddard ×1); 604 saltati perché non applicabili su un Mac, ognuno con la sua motivazione; tutti gli altri passano o sono saltati dalle condizioni di ArWen stesso (run completa, poi ogni file con fallimenti di nuovo, un processo per file, 25-11-2026) |
 
-I 513 skip sono elencati uno per uno in `tests/metal_not_applicable.py` e
+I 604 skip sono elencati uno per uno in `tests/metal_not_applicable.py` e
 applicati da `tests/conftest.py` solo con `GPUWM_BACKEND=metal`; pytest stampa
-la motivazione di ciascuno.  Un test entra nell'elenco solo con un'evidenza
-per la sua classe:
+la motivazione di ciascuno, e `ARWEN_METAL_APPLY_REGISTRY=0` li esegue
+comunque.  Un test entra nell'elenco solo con un'evidenza per la sua classe:
 
 | classe | test | perché non si applica su un Mac |
 |---|---|---|
-| `ptx` | 212 | compilazioni PTX / NVRTC dirette, nvJitLink, cubin — Metal non ha PTX |
-| `arwen_drift` | 155 | falliscono su qualunque backend in ArWen 3.0.3 (stesso fallimento su una RTX 5090, o errore nella fixture del test stesso) |
-| `cuda_hash_pin` | 57 | SHA-256 fissati delle parole di output di CUDA, che incorporano la contrazione FMA di `ptxas` (Metal è spesso più vicino all'oracolo WRF) |
-| `macos_reference` | 33 | il riferimento CPU gira sul Mac con la libm di Apple o NumPy arm64 (Metal lì concorda con glibc) |
+| `ptx` | 219 | compilazioni PTX / NVRTC dirette, nvJitLink, cubin — Metal non ha PTX |
+| `arwen_drift` | 156 | falliscono su qualunque backend in ArWen 3.0.3 (stesso fallimento su una RTX 5090, o errore nella fixture del test stesso) |
+| `cuda_hash_pin` | 93 | parole di output di CUDA o numeri misurati su CUDA (SHA-256, le parole, cifre pubblicate, una distanza misurata da un oracolo WRF), che incorporano la contrazione FMA di `ptxas`; dove esiste un oracolo WRF Metal è più vicino (dycore: mai più lontano) |
+| `macos_reference` | 37 | il riferimento CPU gira sul Mac con la libm di Apple o NumPy arm64 (Metal lì concorda con glibc) |
+| `cuda_introspection` | 29 | frame di memoria locale CUDA, registri, comportamento e diagnostica di NVRTC |
 | `cuda_host_only` | 19 | dati, strumenti o ambiente presenti solo sulla macchina Linux/CUDA |
+| `cuda_contraction` | 15 | controlli negativi della contrazione FMA di `ptxas`: senza contrazione l'effetto che fissano non esiste |
 | `kf_default_tolerance` | 15 | conteggi di parole KF-CuP con la numerica predefinita, che fallisce anche la RTX 5090; con `ARWEN_METAL_STRICT_GLIBC=1` qui girano e passano parola per parola |
-| `cuda_introspection` | 14 | frame di memoria locale CUDA, registri, comportamento delle funzioni built-in di NVRTC |
-| `native_libm` | 8 | distanza in ULP da WRF fissata per la `powf` hardware di CUDA; la `powf` di Apple arrotonda diversamente l'ultimo bit (Exner `pi_phy`: 1826 contro 304 parole su 5880 a 1 ULP da WRF) |
+| `native_libm` | 14 | comportamento della `powf` hardware di CUDA (la sua distanza da WRF, la sua parola); la `powf` di Metal segue l'algoritmo di glibc e riproduce WRF dove CUDA se ne discosta (Exner `pi_phy`: 0 parole contro le 304 su 5 880 di CUDA) |
+| `cuda_streams` | 3 | corse tra stream CUDA indipendenti; Metal esegue ogni stream su un'unica coda ordinata |
+| `nan_encoding` | 2 | configurazioni di bit dei NaN prodotti da operazioni non valide (NVIDIA `0x7FFFFFFF`, Apple `0xFFC00000`); entrambe sono NaN |
+| `cuda_tolerance` | 1 | una tolleranza di integrazione libera calibrata sull'aritmetica contratta di CUDA (calore latente QNSE: 0,0117 contro 0,01) |
+| `default_native_math` | 1 | una tolleranza misurata su CUDA per la libm float della GPU; passa con `ARWEN_METAL_STRICT_GLIBC=1` |
 
-I 150 test che falliscono ancora restano nella suite.  Ogni file con
-fallimenti è stato eseguito anche sulla RTX 5090, un processo per file: 105 di
-questi test lì passano, quindi sono problemi lato Metal; 11 lì falliscono per
-un motivo diverso; 34 sono in file non coperti dalla run CUDA.  Raggruppati
-per messaggio:
+I 12 test che falliscono ancora restano nella suite.  Sono due limiti noti,
+entrambi in ciò che il compilatore shader di Apple accetta:
 
-| cosa | test |
-|---|---|
-| differenze numeriche rispetto a valori o tolleranze misurati su CUDA, e altre asserzioni da indagare | 90 |
-| il compilatore shader di Apple che va in crash o rinuncia sui kernel più grandi | 25 |
-| funzioni dello strato array / API CUDA non ancora presenti (`matmul`, `memcpyPeerAsync`, …) | 23 |
-| contabilità di memoria e allocazioni diversa da quella di CUDA | 12 |
+| cosa | test | causa |
+|---|---|---|
+| convezione Grell-Freitas (`cu_physics=3`) e ogni test che la esegue (fisica a colonna MPAS, multislab, rilocazione con PBL trattenuto, accoppiamento SATMEDMF) | 11 | i suoi kernel copiano attraverso puntatori il cui spazio di indirizzamento è noto solo a run time (`gf_memmove` chiamata con argomenti privati del thread e di device): MSL non ha uno spazio di indirizzamento generico.  Una variante richiede anche un compare-and-swap a 64 bit, che le GPU Apple non hanno |
+| radiazione Goddard a 192 livelli | 1 | il servizio di compilazione Apple va in crash su `goddard_bands_columns` a quella profondità (`XPC_ERROR_CONNECTION_INTERRUPTED`, dopo vari tentativi) |
+
+Altri sei file di test non si possono raccogliere in ArWen 3.0.3 su nessuna
+macchina: leggono file che la release non contiene (`tools/da_cycle_prepared.py`,
+`evidence/p3-fortran-oracle-20260828/`, `gpuwm.go_cli._go_wrfinput_main`).
 
 ## Cosa ha scoperto il port
 
@@ -229,6 +246,20 @@ risultati utili ad ArWen e a chiunque porti codice CUDA sulle GPU Apple.
   RTX 5090 su tutti i 2³² input e su una previsione completa di 1 h (SHA-256
   del `wrfout` identico):
   [recastsystems/arwen#8](https://github.com/recastsystems/arwen/pull/8).
+
+**Nel compilatore GPU di Apple** (riprodotto in 40 righe di Swift e Metal
+puri, [`tools/metal/apple_private_array_repro.swift`](tools/metal/apple_private_array_repro.swift),
+descritto per Apple in
+[`docs/metal-apple-feedback-private-array.md`](docs/metal-apple-feedback-private-array.md)):
+
+* **Una lettura con indice costante di un array privato restituisce 0.**
+  Si riempie `float rho[N]` in un ciclo, lo si legge in un secondo ciclo, poi
+  si legge `rho[0]`: per N ≥ 63 il risultato è 0.0, a ogni livello di
+  ottimizzazione e con ogni flag di virgola mobile; anche `rho[100 - 1]` e
+  `rho[KM - 1]` sono colpiti, un indice a run time no.  È emerso come
+  precipitazione al suolo nulla nella microfisica a due momenti NSSL.  Il
+  traduttore dà a ogni indice riducibile a costante di un array privato
+  grande uno zero a run time.
 
 **Difetti che compilavano senza errori e sono stati presi dai controlli**
 (tutti corretti):
@@ -257,10 +288,15 @@ risultati utili ad ArWen e a chiunque porti codice CUDA sulle GPU Apple.
 * Le parole di output di CUDA dipendono da dove `ptxas` sceglie di contrarre
   `a*b+c` in una FMA; Metal calcola senza contrazione ed è spesso *più vicino*
   all'oracolo Fortran di WRF di quanto lo sia CUDA.
-* La `powf` hardware di Apple e quella di NVIDIA differiscono nell'ultimo bit;
-  con la numerica predefinita di ArWen questo sposta la funzione di Exner
-  `pi_phy` di 1 ULP da WRF in 1826 parole su 5880 su Metal, 304 su CUDA.  Il
-  percorso esatto glibc lo elimina.
+* La `powf` hardware di NVIDIA differisce da glibc nell'ultimo bit; con la
+  numerica predefinita di ArWen lascia la funzione di Exner `pi_phy` a 1 ULP
+  da WRF in 304 parole su 5880 su CUDA.  Metal, che esegue l'algoritmo `powf`
+  di glibc, ne ha 0 (e 0 in `t_phy` e `t8w`, dove CUDA ne ha 255 e 261).  La
+  `pow` di Apple faceva peggio di entrambe (1826 parole).
+* Il benchmark di onde di gravità-inerziali di Skamarock-Klemp, un pacchetto
+  lineare di 0,01 K, è sensibile all'errore sistematico della `powf`
+  nell'equazione di stato della pressione: il massimo di θ′ era 3,63e-3 K con
+  la `pow` di Apple (soglia 3,5e-3), 3,36e-3 K con l'algoritmo di glibc.
 
 ## Copertura
 
@@ -364,10 +400,17 @@ python tests/metal/translator_features_check.py      # e gli altri controlli in 
   non ha un orologio device).
 * **I meccanismi solo CUDA** — immagini PTX/cubin, nvJitLink, dimensioni dei
   frame di memoria locale CUDA, multi-GPU — non si applicano.
-* **Niente compare-and-swap a 64 bit.**  Le GPU Apple non lo hanno; la
-  variante "lanes" di Grell-Freitas che lo richiede si ferma in compilazione
-  con questa motivazione (l'`atomicAdd` a 64 bit è emulato esattamente con due
-  atomiche a 32 bit).
+* **La convezione Grell-Freitas (`cu_physics=3`) non si compila ancora.**  I
+  suoi kernel passano puntatori privati del thread e di device alla stessa
+  funzione (`gf_memmove`); MSL non ha uno spazio di indirizzamento generico,
+  quindi la chiamata non trova un overload.  La variante "lanes" richiede
+  anche un compare-and-swap a 64 bit, che le GPU Apple non hanno (l'`atomicAdd`
+  a 64 bit è emulato esattamente con due atomiche a 32 bit).  La
+  configurazione operativa qui sopra usa Tiedtke e non ne è toccata.
+* **Il compilatore Apple va in crash sugli stack più profondi** — radiazione
+  Goddard a 192 livelli e driver di generazione Thompson a 128/256 livelli
+  (`XPC_ERROR_CONNECTION_INTERRUPTED`).  La previsione a 45 livelli non ne è
+  toccata.
 
 ## Cosa resta, e cosa si può risolvere
 
@@ -375,10 +418,9 @@ Quasi tutto ciò che resta è lavoro di ingegneria, non un muro.
 
 | cosa | test | risolvibile? |
 |---|---|---|
-| funzioni dello strato array / API CUDA non ancora scritte (`matmul`, `memcpyPeerAsync`, lanci cooperativi, …) | 23 | **sì** — ognuna è una funzione autonoma dello strato compatibile CuPy |
-| contabilità di memoria e allocazioni diversa da quella di CUDA | 12 | **sì** — lo strato riporta dimensioni di memoria unificata; l'arrotondamento del pool di CUDA si può replicare |
-| il compilatore shader di Apple che va in crash o rinuncia sui kernel più grandi | 25 | **sì, con lavoro** — dividere i kernel, ridurre la pressione sui registri, o attendere una correzione di Apple (i fallimenti sono riproducibili e segnalabili) |
-| differenze numeriche rispetto a valori misurati su CUDA, altre asserzioni | 90 | **in gran parte** — ognuna va guardata singolarmente: le differenze di ultimo bit della libm si chiudono instradando sulle copie glibc verificate (esatte, più lente); alcune sono bug reali ancora da trovare |
+| Grell-Freitas: una funzione su puntatori usata con due spazi di indirizzamento | 11 | **sì, con lavoro** — il traduttore può emettere una copia della funzione per ogni combinazione di spazi con cui è chiamata; solo la variante opzionale "lanes" richiede il CAS a 64 bit, che un'emulazione con lock può fornire (lentamente) |
+| il compilatore Apple in crash sugli stack più profondi (Goddard 192 livelli; Thompson 128/256 livelli, registrati come test di frame) | 1 | **sì, con lavoro** — dividere i kernel o ridurre la pressione degli array privati; i crash sono riproducibili e segnalabili ad Apple |
+| sei file di test di ArWen 3.0.3 che citano file non contenuti nella release | — | lato ArWen: i file mancano su ogni macchina |
 
 Cosa non si può fare, per costruzione:
 
@@ -386,7 +428,7 @@ Cosa non si può fare, per costruzione:
   private di contrazione FMA di `ptxas` e la libm di NVIDIA; Metal può
   riprodurre le parole di WRF (come mostrano gli oracoli KF e Thompson), non
   quelle del compilatore NVIDIA.
-* **PTX, cubin, nvJitLink** — sulle GPU Apple non esiste PTX (212 test).
+* **PTX, cubin, nvJitLink** — sulle GPU Apple non esiste PTX (219 test).
 * **Compare-and-swap a 64 bit in hardware** — assente sulle GPU Apple;
   un'emulazione con lock è possibile ma lenta, e la richiede una sola
   variante opzionale.
@@ -405,8 +447,8 @@ Cosa non si può fare, per costruzione:
 | `gpuwm/metal/xp/`, `shim.py` | strato array compatibile CuPy su memoria unificata |
 | `gpuwm/metal/fastlibm.py` | instradamento verificato delle copie della libm glibc |
 | `tests/metal/`, `tools/metal/` | controlli di esattezza, gate di copertura, strumenti di confronto |
-| `tests/metal_not_applicable.py` | i 513 test saltati su Metal, ognuno con classe e motivazione (lo genera `tools/metal/build_applicability_registry.py`) |
-| `docs/metal-evidence/` | ricevute delle regressioni bit per bit a 1 h |
+| `tests/metal_not_applicable.py` | i 604 test saltati su Metal, ognuno con classe e motivazione (lo genera `tools/metal/build_applicability_registry.py`) |
+| `docs/metal-evidence/` | ricevute delle regressioni bit per bit e i confronti con la RTX 5090 |
 | `docs/metal-backend.md` | note di progetto e ogni misura, in ordine (in inglese) |
 
 ## Crediti e licenza
