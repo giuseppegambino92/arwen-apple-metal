@@ -3881,7 +3881,8 @@ def promote_escaping_locals(text: str, filename: str) -> str:
             if idx is not None and idx < len(ps):
                 pt = _canon(ps[idx].type)
                 hit = pt.kind == T.RECORD and bool(pointer_fields(pt.get_declaration()))
-        elif up.kind == K.BINARY_OPERATOR:
+        elif up.kind == K.BINARY_OPERATOR and c.kind == K.UNARY_OPERATOR:
+            # (``m.p = a`` with a local array a: edit_fields makes that member a thread pointer)
             kids = [k for k in up.get_children() if k.kind.is_expression()]
             if len(kids) == 2 and kids[1].extent.start.offset <= c.extent.start.offset:
                 lhs = strip_down(kids[0])

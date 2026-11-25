@@ -139,6 +139,9 @@ EXPLICIT = {
     "tests.test_kernel_aot::test_shipped_unit_packs_hold_every_current_loader_request": "ptx",
     "tests.test_kernel_aot::test_mskf_catalog_is_the_forecast_loader_request": "ptx",
     "tests.test_wsm5::test_unflushed_kernel_frame_reader_matches_the_real_driver": "cuda_introspection",
+    # CUDA local-frame bytes of the Goddard exports per depth (0 on Metal); at 192 levels
+    # Apple's compiler service crashes first (README: Goddard above 128 levels)
+    "tests.test_shared_port_memory::test_current_goddard_exports_fit_the_provisional_depth_envelope": "cuda_introspection",
     # optimized gas optics uses explicit __fmaf_rn; the reference writes a*b + c in
     # a module compiled with contraction on: equal on CUDA through ptxas only
     "tests.test_rrtmgp_optics::test_gas_optimized_matches_frozen_base_bits": "cuda_contraction",
