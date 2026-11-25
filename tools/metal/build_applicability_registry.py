@@ -95,6 +95,17 @@ EXPLICIT = {
         "test_native_vertical_output_words_equal_frozen_receipt",
         "test_implicit_w_damper_corrected_words_match_compiled_wrf471")},
     "tests.test_bigstep_rk_wrf471_parity::test_rk_tendency_records_every_compiled_wrf471_output": "cuda_hash_pin",
+    # advection: the device receipt pins the RTX 5090's distance from compiled
+    # WRF 4.7.1 (and the legacy fork) with an equality.  Measured 2026-11-25,
+    # Metal vs CUDA differing words / max |diff| over 6 cases: closer on every
+    # advect_scalar/u/v/w row (e.g. real_interior advect_scalar 26,977 / 0.168
+    # vs 28,108 / 0.219); advect_scalar_pd within 0.5 % of CUDA either way
+    **{f"tests.test_advect_wrf471_parity::{t}": "cuda_hash_pin" for t in (
+        "test_advect_cuda_routine_holds_every_measured_wrf_word",
+        "test_advect_cuda_pd_optional_channels_hold_every_defined_word")},
+    **{f"tests.test_advect_wrf_legacy_parity::{t}": "cuda_hash_pin" for t in (
+        "test_cuda_routine_holds_every_measured_fork_word",
+        "test_cuda_pd_optional_channels_hold_every_defined_word")},
     **{f"tests.test_diff_opt1_wrf471::{t}": "cuda_hash_pin" for t in (
         "test_legacy_metric_payload_continues_onto_288_pins",
         "test_metric_diffusion_matches_merged_oracle_fix_baseline",
@@ -147,6 +158,25 @@ EXPLICIT = {
     # the probe x0*x1 + x2 returns -2^-46 (0xa8800000) only when the "fast" build
     # contracts it into an FMA (ptxas); Metal never contracts
     "tests.test_nextgen_numerics_cli_cuda::test_root_hydro_cli_selects_compiler_mode_before_stage_prepare": "cuda_contraction",
+    # NVRTC compiles inside compile_using_nvrtc; Metal translates and compiles at
+    # Module.load (the token carries the source), so a unit that cannot compile on
+    # its own raises later, with clang's wording, not inside the call the test wraps
+    **{f"tests.test_noahmp_kernel_sources::{t}": "cuda_introspection" for t in (
+        "test_a_composed_unit_still_fails_on_its_own",
+        "test_prepending_the_libm_to_a_self_contained_unit_is_an_error")},
+    # P3's contraction probe: only ptxas contracts; Metal never does, so both builds agree
+    "tests.test_p3_cuda_gpu::test_contraction_is_off_and_the_probe_can_tell": "cuda_contraction",
+    # Shin-Hong: the NVRTC build fingerprint keys its ULP rows and run-state hash;
+    # the default build pins CUDA's 700 flush-to-zero dtheta lanes, Metal keeps
+    # gradual underflow and differs from WRF in 0 of 41,755 words
+    "tests.test_shinhong_wrf461_parity::test_the_kernel_compiler_identifies_itself_to_four_parts": "cuda_introspection",
+    "tests.test_shinhong_wrf461_parity::test_shinhong_cuda_column_holds_its_measured_distance_from_wrf": "cuda_hash_pin",
+    "tests.test_shinhong_runtime::test_off_path_bl1_micro_run_state_hash_is_pinned": "cuda_hash_pin",
+    "tests.test_shinhong_column_oracle::test_the_kernel_is_wrf_word_for_word_on_every_arithmetic_lane": "cuda_hash_pin",
+    # backend-independent: preflight's Shin-Hong roster has 16 fields in 3.0.3, the test's literal 13
+    "tests.test_shinhong_runtime::test_preflight_roster_and_cold_start_match_the_authorities": "arwen_drift",
+    # fails on the RTX 5090 too (CO251 words); on Metal TBPVS/CDT51 words
+    "tests.test_gfdleta_full_init_cuda::test_full_initialization": "arwen_drift",
     # glibc libm copies on both; the free-run tolerance was set on CUDA's contracted
     # arithmetic: replay within it, free-run lh 0.0117 vs 0.01 W/m2
     "tests.test_qnse_fast_numerics::test_fast_surface_primary_outputs_against_native": "cuda_tolerance",

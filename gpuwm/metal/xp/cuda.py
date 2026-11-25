@@ -497,7 +497,12 @@ def _token(source, options, name_expressions=None):
                 tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
                 tmp.write_text(json.dumps({"source": source, "options": opts}))
                 os.replace(tmp, path)
-    return _TOKEN + json.dumps({"program": digest, "name_expressions": list(name_expressions or ())}).encode()
+    # the extern "C" kernels it defines, as a cubin's symbol table names them
+    import re
+    kernels = sorted(set(re.findall(r'extern\s+"C"\s+__global__\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?'
+                                    r'void\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?(\w+)\s*\(', canon)))
+    return _TOKEN + json.dumps({"program": digest, "name_expressions": list(name_expressions or ()),
+                                "kernels": kernels}).encode()
 
 
 def _token_source(d):
@@ -628,8 +633,11 @@ class _Pool:
 
     def used_bytes(self):
         if self._default:
+            # page-locked host memory (alloc_pinned_memory, cudaHostAlloc) is a
+            # shared Metal buffer too, but not device-pool memory, as on CUDA
+            pinned = {id(b._dm) for b in list(_PINNED)}
             return int(sum((int(m.nbytes) + 511) // 512 * 512 for m in _rt_module.live_memories()
-                           if m not in _rt_module.MODULE_GLOBALS))
+                           if m not in _rt_module.MODULE_GLOBALS and id(m) not in pinned))
         return self._used
 
     def free_bytes(self):
@@ -976,6 +984,14 @@ def _cufft_module():
             else:
                 r = _np.fft.ifftn(x, axes=axes) * float(_np.prod(self.shape))
             out._v[...] = r.reshape(out._v.shape).astype(out._v.dtype, copy=False)
+
+        # ``with plan:`` makes cupy.fft use the plan; the array layer's transforms
+        # compute the same unnormalised result with or without one
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
 
         def fft(self, a, out, direction):
             if _rt_module.CAPTURE is not None:
