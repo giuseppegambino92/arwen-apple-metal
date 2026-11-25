@@ -774,7 +774,8 @@ class _Module:
                 elif ref is not None and ref.kind == K.VAR_DECL and self._main(ref) and self._is_mutable_global(ref):
                     builtin_users.add(fusr)
             elif c.kind == K.CALL_EXPR:
-                if c.spelling in WARP_FUNCS and c.referenced is not None and not self._main(c.referenced):
+                if (c.spelling in WARP_FUNCS and c.referenced is not None and not self._main(c.referenced)) \
+                        or self._is_cas64(c):
                     warp_users.add(fusr)
                     if c.spelling in SYNC_REDUCTIONS:
                         # one threadgroup word for the block-wide vote, in the static shared area
@@ -1069,7 +1070,8 @@ class _Module:
                 if d.kind == K.UNARY_OPERATOR and _tokens(d) and _tokens(d)[0].spelling == "&":
                     ch = list(d.get_children())
                     r = ch[0].referenced if ch and ch[0].kind == K.DECL_REF_EXPR else None
-                    if r is not None and r.kind == K.VAR_DECL and not self._program_scope(r):
+                    if r is not None and r.kind == K.VAR_DECL and not self._program_scope(r) \
+                            and K.CUDASHARED_ATTR not in self._attrs(r):
                         return True
                     if r is not None and r.kind == K.PARM_DECL and r.hash in thread_ref_params:
                         return True
@@ -1103,6 +1105,10 @@ class _Module:
             x = e
             while x.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len(list(x.get_children())) == 1:
                 x = list(x.get_children())[0]
+            if x.kind == K.UNARY_OPERATOR and _tokens(x) and _tokens(x)[0].spelling == "&":
+                # the address of a __shared__ variable (``Ws w{..., &slot, ...}``)
+                ch = [k for k in x.get_children() if k.kind.is_expression()]
+                x = ch[0] if ch else x
             r = x.referenced if x.kind == K.DECL_REF_EXPR else None
             if r is not None and r.kind == K.VAR_DECL and K.CUDASHARED_ATTR in self._attrs(r) \
                     and f.hash not in thread_fields:
@@ -1186,7 +1192,13 @@ class _Module:
                      else "constant" if c.hash in constant_fields else "device")
             self.field_space[c.hash] = space
             if _canon(c.type.get_pointee()).kind == T.POINTER:
-                self.rw.replace(c.extent.start.offset, name_tok.extent.start.offset, self.msl_type(c.type, space=space) + " ")
+                if space == "threadgroup":
+                    # the address of a __shared__ pointer variable (``Ws w{..., &slot}``): the
+                    # slot is in threadgroup memory, the pointer it holds is a device one
+                    ty = self.msl_type(c.type.get_pointee(), space="device") + " threadgroup*"
+                else:
+                    ty = self.msl_type(c.type, space=space)
+                self.rw.replace(c.extent.start.offset, name_tok.extent.start.offset, ty + " ")
             elif c.extent.start.offset not in seen_starts:
                 # ``const T *a, *b;``: an address-space specifier distributes over the declarators
                 seen_starts.add(c.extent.start.offset)
@@ -2747,6 +2759,7 @@ class _Module:
     _TGBIN = {"+": "__arwen_tg_add", "-": "__arwen_tg_sub", "*": "__arwen_tg_mul", "/": "__arwen_tg_div",
               "<": "__arwen_tg_lt", "<=": "__arwen_tg_le", ">": "__arwen_tg_gt", ">=": "__arwen_tg_ge",
               "==": "__arwen_tg_eq", "!=": "__arwen_tg_ne"}
+    _PCMP = ("<", "<=", ">", ">=", "==", "!=")
     _TGCOMP = {"+=": "__arwen_tg_iadd", "-=": "__arwen_tg_isub", "*=": "__arwen_tg_imul", "/=": "__arwen_tg_idiv"}
 
     def edit_float_ops(self):
@@ -2778,6 +2791,14 @@ class _Module:
                     fn = self._FCOMP[op.spelling]
                 elif dep and k == K.BINARY_OPERATOR and op.spelling in self._TGBIN:
                     # a template body: the operand type is known only at instantiation
+                    fn = self._TGBIN[op.spelling]
+                elif k == K.BINARY_OPERATOR and op.spelling in self._PCMP \
+                        and _canon(lhs.type).kind == T.POINTER and _canon(rhs.type).kind == T.POINTER \
+                        and not self.is_kernel(self.fn_of[c.hash]):
+                    # pointer parameters of device functions take their address space
+                    # from the call (gpuwm's generic pointers): two of them may point
+                    # into different spaces, which MSL cannot compare -- they never
+                    # alias, so they compare unequal and unordered (memmove overlap tests)
                     fn = self._TGBIN[op.spelling]
                 elif dep and k == K.COMPOUND_ASSIGNMENT_OPERATOR and op.spelling in self._TGCOMP:
                     fn = self._TGCOMP[op.spelling]
@@ -3032,6 +3053,16 @@ class _Module:
         others = [x for x in self._args_by_callee.get((usr, i), []) if not self._is_null(x)]
         return "thread" if others and all(thread_addr(x) for x in others) else "device"
 
+    def _is_cas64(self, c) -> bool:
+        """A CUDA atomicCAS on a 64-bit word: emulated under a lock, which takes the
+        launch context (arwen_metal_compat.h)."""
+        ref = c.referenced
+        if c.kind != K.CALL_EXPR or c.spelling != "atomicCAS" or ref is None or self._main(ref):
+            return False
+        ps = [k for k in ref.get_children() if k.kind == K.PARM_DECL]
+        return bool(ps) and _canon(ps[0].type).kind == T.POINTER \
+            and _canon(ps[0].type).get_pointee().get_size() == 8
+
     def edit_call(self, c):
         kids = list(c.get_children())
         if kids and kids[0].kind == K.MEMBER_REF_EXPR:
@@ -3041,7 +3072,7 @@ class _Module:
                     self.rw.insert(a.extent.end.offset, "template ")
                     break
         ref = c.referenced
-        if ref is not None and c.spelling in WARP_FUNCS and not self._main(ref):
+        if ref is not None and ((c.spelling in WARP_FUNCS and not self._main(ref)) or self._is_cas64(c)):
             lp = self._call_lparen(c)
             if lp is None:
                 raise TranslationError(f"call to {c.spelling}: argument list not found")
@@ -3175,6 +3206,13 @@ class _Module:
                 return
             if fn is None or not self.is_kernel(fn):
                 raise TranslationError(f"__shared__ variable {c.spelling} outside a kernel body")
+            if _canon(c.type).kind == T.POINTER:
+                # a __shared__ pointer variable: the variable in threadgroup memory, what it
+                # points to in device memory (``device char* threadgroup slot``)
+                name_tok = next(t for t in toks if t.spelling == c.spelling and t.extent.start.offset >= c.location.offset)
+                self.rw.replace(c.extent.start.offset, name_tok.extent.start.offset,
+                                self.msl_type(c.type, space="device") + " threadgroup ")
+                return
             for t in toks:
                 if t.spelling == "__shared__":
                     self.tok_replace(t, "threadgroup")
@@ -3723,6 +3761,241 @@ def _derived_ctor_calls_init(text, rw, m, bases):
 
 
 _VIEW_HINT = re.compile(r"template\s*<\s*(?:class|typename)\s+(\w+)[^>]*>\s*struct\s+\w+\s*\{[^{}]*?\b\1\s*\*")
+
+
+#: per-thread frames of promote_escaping_locals: how many threads of one launch
+#: they cover (a persistent GFL launch on Metal holds 30 x 128)
+TFRAME_THREADS = int(os.environ.get("ARWEN_METAL_TFRAME_THREADS", "8192"))
+_ESCAPE_HINT = re.compile(r"[(,=]\s*(?:\(\s*[\w\s]+\*\s*\)\s*)?&\s*[A-Za-z_]\w*\s*[,)\[]")
+
+
+def promote_escaping_locals(text: str, filename: str) -> str:
+    """Locals whose address a struct keeps in a device pointer member.
+
+    CUDA pointers are generic; an MSL pointer member has one address space, and a
+    struct built over device memory (a lane pointer, an array descriptor) gets
+    ``device``.  When the same struct is also given the address of a thread-local
+    variable -- ``f(GIP(&n))`` (a temporary passed to a call), ``d.data = &a[0]``
+    -- that variable moves to device memory: a per-thread frame in a module array,
+    one region per function (no recursion: each function is active at most once
+    per thread), indexed by the thread's linear index in the launch.  Its uses read
+    ``(*name__tf)``; the arithmetic on it is unchanged."""
+    if not _ESCAPE_HINT.search(text):
+        return text
+    tu, errors = parse(text, filename)
+    if errors:
+        return text
+    tu._arwen_text, tu._arwen_filename = text, filename
+    nodes, parent = [], {}
+    stack = [(tu.cursor, None)]
+    while stack:
+        c, par = stack.pop()
+        if par is not None and (c.location.file is None or c.location.file.name != filename):
+            continue
+        if par is not None:
+            nodes.append(c)
+            parent[c.hash] = par
+        for ch in reversed(list(c.get_children())):
+            stack.append((ch, c))
+
+    def strip_up(c):
+        """The nearest ancestor that is not a cast, a parenthesis or an implicit node."""
+        p = parent.get(c.hash)
+        while p is not None and p.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR, K.CSTYLE_CAST_EXPR,
+                                           K.CXX_STATIC_CAST_EXPR, K.CXX_REINTERPRET_CAST_EXPR):
+            p = parent.get(p.hash)
+        return p
+
+    def strip_down(e):
+        while e.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len([k for k in e.get_children() if k.kind.is_expression()]) == 1:
+            e = [k for k in e.get_children() if k.kind.is_expression()][0]
+        return e
+
+    templates = {c.spelling: c for c in nodes if c.kind == K.CLASS_TEMPLATE}
+
+    def pointer_fields(rec):
+        if rec is None:
+            return []
+        kids = list(rec.get_children())
+        if not kids and rec.spelling in templates:
+            kids = list(templates[rec.spelling].get_children())   # a specialisation: its template
+        return [f for f in kids if f.kind == K.FIELD_DECL
+                and (_canon(f.type).kind == T.POINTER or f.type.spelling.rstrip().endswith("*"))]
+
+    def local_var(e):
+        """The local variable whose address ``&e`` takes (``&x``, ``&x[i]``)."""
+        e = strip_down(e)
+        if e.kind == K.ARRAY_SUBSCRIPT_EXPR:
+            ch = [k for k in e.get_children() if k.kind.is_expression()]
+            e = strip_down(ch[0]) if ch else e
+        r = e.referenced if e.kind == K.DECL_REF_EXPR else None
+        if r is None or r.kind != K.VAR_DECL:
+            return None
+        st = parent.get(r.hash)
+        if st is None or st.kind != K.DECL_STMT or K.CUDASHARED_ATTR in [k.kind for k in r.get_children()]:
+            return None
+        if any(t.spelling in ("static", "__shared__") for t in _tokens(st)):
+            return None
+        if _canon(r.type).kind in (T.LVALUEREFERENCE, T.RVALUEREFERENCE) or r.type.get_size() <= 0:
+            return None
+        return r
+
+    def function_of(c):
+        p = parent.get(c.hash)
+        while p is not None and p.kind not in (K.FUNCTION_DECL, K.CXX_METHOD, K.CONSTRUCTOR, K.FUNCTION_TEMPLATE):
+            p = parent.get(p.hash)
+        return p
+
+    promote = {}
+    for c in nodes:
+        if c.kind == K.UNARY_OPERATOR and _tokens(c) and _tokens(c)[0].spelling == "&":
+            ch = [k for k in c.get_children() if k.kind.is_expression()]
+            x = local_var(ch[0]) if ch else None
+        elif c.kind == K.DECL_REF_EXPR and c.referenced is not None and c.referenced.kind == K.VAR_DECL \
+                and _canon(c.referenced.type).kind == T.CONSTANTARRAY \
+                and parent.get(c.hash) is not None and parent[c.hash].kind == K.UNEXPOSED_EXPR:
+            # a local array decaying to a pointer: f(GFP(a)), f(a) with f(GFP)
+            x = local_var(c)
+        else:
+            continue
+        if x is None:
+            continue
+        up = strip_up(c)
+        if up is None:
+            continue
+        hit = False
+        if up.kind == K.CALL_EXPR and up.referenced is not None and up.referenced.kind == K.CONSTRUCTOR \
+                and pointer_fields(up.referenced.semantic_parent):
+            # a struct temporary handed to a call: f(GIP(&n))
+            outer = strip_up(up)
+            while outer is not None and outer.kind == K.CXX_FUNCTIONAL_CAST_EXPR:
+                outer = strip_up(outer)
+            hit = outer is not None and outer.kind == K.CALL_EXPR and (
+                outer.referenced is None or outer.referenced.kind != K.CONSTRUCTOR)
+        elif up.kind == K.CALL_EXPR and up.referenced is not None and up.referenced.kind != K.CONSTRUCTOR:
+            # converted implicitly to a struct parameter: f(&n) with f(GIP n)
+            args = [k for k in up.get_children() if k.kind.is_expression()][1:]
+            ps = [k for k in up.referenced.get_children() if k.kind == K.PARM_DECL]
+            idx = next((i for i, a in enumerate(args) if a.extent.start.offset <= c.extent.start.offset
+                        and c.extent.end.offset <= a.extent.end.offset), None)
+            if idx is not None and idx < len(ps):
+                pt = _canon(ps[idx].type)
+                hit = pt.kind == T.RECORD and bool(pointer_fields(pt.get_declaration()))
+        elif up.kind == K.BINARY_OPERATOR:
+            kids = [k for k in up.get_children() if k.kind.is_expression()]
+            if len(kids) == 2 and kids[1].extent.start.offset <= c.extent.start.offset:
+                lhs = strip_down(kids[0])
+                ops = [t.spelling for t in _tokens(up)
+                       if kids[0].extent.end.offset <= t.extent.start.offset < kids[1].extent.start.offset]
+                hit = ops == ["="] and lhs.kind == K.MEMBER_REF_EXPR and lhs.referenced is not None \
+                    and lhs.referenced.kind == K.FIELD_DECL and _canon(lhs.referenced.type).kind == T.POINTER
+        if hit:
+            fn = function_of(x)
+            if fn is None:
+                continue
+            promote[x.hash] = (x, fn)
+    if not promote:
+        return text
+
+    # no recursion through a function that holds a frame
+    calls = defaultdict(set)
+    for c in nodes:
+        if c.kind == K.CALL_EXPR and c.referenced is not None:
+            f = function_of(c)
+            if f is not None:
+                calls[f.get_usr()].add(c.referenced.get_usr())
+    framed = {fn.get_usr() for _, fn in promote.values()}
+    for u in framed:
+        seen, todo = set(), list(calls.get(u, ()))
+        while todo:
+            v = todo.pop()
+            if v == u:
+                raise TranslationError("a local whose address a device struct keeps lives in a per-thread "
+                                       "frame; its function is recursive")
+            if v not in seen:
+                seen.add(v)
+                todo.extend(calls.get(v, ()))
+
+    # one region per function, 16-byte slots
+    offsets, per = {}, 0
+    for h, (x, fn) in sorted(promote.items(), key=lambda kv: (kv[1][1].extent.start.offset, kv[1][0].extent.start.offset)):
+        offsets[h] = per
+        per += (x.type.get_size() + 15) // 16 * 16
+    cap = per * TFRAME_THREADS
+    rw = Rewriter(text)
+
+    def span_text(a, b):
+        """text[a:b] with the promoted variables it reads already rewritten."""
+        refs = sorted((d.extent.start.offset, d.extent.end.offset, d.spelling) for d in nodes
+                      if d.kind == K.DECL_REF_EXPR and d.referenced is not None and d.referenced.hash in promote
+                      and a <= d.extent.start.offset and d.extent.end.offset <= b)
+        out, at = [], a
+        for s0, s1, nm in refs:
+            out += [text[at:s0], f"(*{nm}__tf)"]
+            at = s1
+        return "".join(out) + text[at:b]
+
+    def expr_text(e):
+        return span_text(e.extent.start.offset, e.extent.end.offset)
+
+    def promoted_decl(x, ty, name_tok):
+        h = x.hash
+        after = [t.spelling for t in _tokens(x) if t.extent.start.offset > name_tok.extent.start.offset]
+        # an array's bound is an expression child too: an initialiser follows '=' or a brace
+        has_init = "=" in after or (after and after[-1] == "}")
+        init = [k for k in x.get_children() if k.kind.is_expression()] if has_init else []
+        tf = f"{x.spelling}__tf"
+        if _canon(x.type).kind == T.CONSTANTARRAY:
+            dims = "".join(f"[{d}]" for d in re.findall(r"\[(\d+)\]", _canon(x.type).spelling))
+            decl = f"{ty} (*{tf}){dims} = ({ty} (*){dims})__arwen_tframe({offsets[h]}ull);"
+            if init:
+                il = strip_down(init[-1])
+                if il.kind != K.INIT_LIST_EXPR or "][" in dims:
+                    raise TranslationError(f"{x.spelling}: promoted array with an initialiser")
+                vals = [expr_text(k) for k in il.get_children() if k.kind.is_expression()]
+                vals = vals + ["0"] * (int(dims[1:-1]) - len(vals))
+                decl += "".join(f" (*{tf})[{i}] = {v};" for i, v in enumerate(vals))
+            return decl
+        decl = f"{ty}* {tf} = ({ty}*)__arwen_tframe({offsets[h]}ull);"
+        if init:
+            decl += f" *{tf} = {expr_text(init[-1])};"
+        return decl
+
+    replaced = []
+    for st in {parent[x.hash].hash: parent[x.hash] for x, _ in promote.values()}.values():
+        decls = [k for k in st.get_children() if k.kind == K.VAR_DECL]
+        names = [next(t for t in _tokens(d) if t.spelling == d.spelling and t.extent.start.offset >= d.location.offset)
+                 for d in decls]
+        m = re.fullmatch(r"(.*?)([\s*&]*)", text[st.extent.start.offset:names[0].extent.start.offset], re.S)
+        base = m.group(1).strip()
+        ty = re.sub(r"^const\s+", "", base)
+        parts, prev_end = [], None
+        for d, nt in zip(decls, names):
+            prefix = m.group(2) if prev_end is None else text[prev_end:nt.extent.start.offset].lstrip(" \t\n,")
+            end = d.extent.end.offset
+            if d.hash in promote:
+                if prefix.strip() or not re.fullmatch(r"[\w:<>,\s]+", ty):
+                    raise TranslationError(f"{d.spelling}: promoted local of type {base + prefix!r}")
+                parts.append(promoted_decl(d, ty, nt))
+            else:
+                parts.append(f"{base} {prefix}{d.spelling}{span_text(nt.extent.end.offset, end)};")
+            prev_end = end
+        replaced.append((st.extent.start.offset, st.extent.end.offset))
+        rw.replace(st.extent.start.offset, st.extent.end.offset, " ".join(parts))
+    for c in nodes:
+        if c.kind == K.DECL_REF_EXPR and c.referenced is not None and c.referenced.hash in promote \
+                and not any(a <= c.extent.start.offset < b for a, b in replaced):
+            rw.replace(c.extent.start.offset, c.extent.end.offset, f"(*{c.spelling}__tf)")
+    words = (cap + 7) // 8
+    head = (f"__device__ unsigned long long __arwen_tframe_arena[{words}ull];\n"
+            "__device__ __forceinline__ unsigned char* __arwen_tframe(unsigned long long off) {\n"
+            "    unsigned long long b = ((unsigned long long)blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;\n"
+            "    unsigned long long t = (b * blockDim.z + threadIdx.z) * blockDim.y * blockDim.x\n"
+            "                         + (unsigned long long)threadIdx.y * blockDim.x + threadIdx.x;\n"
+            f"    if ((t + 1ull) * {per}ull > {cap}ull) {{ __trap(); t = 0; }}\n"
+            f"    return (unsigned char*)__arwen_tframe_arena + t * {per}ull + off;\n"
+            "}\n")
+    return head + rw.apply()
 
 
 def parametrize_views(text: str, filename: str) -> str:
@@ -4332,6 +4605,7 @@ def _translate(source: str, options=(), *, f64_mode: str = "sf64", filename: str
     pp = flatten_inheritance(pp, filename)
     pp = hoist_block_prototypes(pp, filename)
     pp = hoist_branch_labels(pp, filename)
+    pp = promote_escaping_locals(pp, filename)
     pp = parametrize_views(pp, filename)
     from . import fastlibm
     pp = fastlibm.apply(pp, opts, source=source, options=options, cupy_raw_module=cupy_raw_module)

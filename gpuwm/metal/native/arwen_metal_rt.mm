@@ -206,8 +206,8 @@ struct Runtime {
         order_event = [dev newEvent];
         null_buf = [dev newBufferWithLength:256 options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
         [residency addAllocation:null_buf];
-        status_buf = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
-        memset([status_buf contents], 0, 16);
+        status_buf = [dev newBufferWithLength:64 options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+        memset([status_buf contents], 0, 64);   // word 0: abort word; word 4: the 64-bit atomicCAS lock
         [residency addAllocation:status_buf];
         [residency commit];
         deferred = [NSMutableArray new];

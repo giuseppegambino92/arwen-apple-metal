@@ -345,13 +345,61 @@ ARWEN_ATOMIC_INT(threadgroup, uint, atomic_uint)
         return (T)(((ulong)old_hi << 32) | old_lo);                                                       \
     }
 // 64-bit compare-and-swap does not exist on Apple GPUs (families 7-9 have no 64-bit
-// CAS, only min/max), and no 32-bit emulation is safe for readers of the word:
-// fail at compile time with the reason instead of an overload error.
+// CAS, only min/max).  The translator passes the launch context to a 64-bit atomicCAS
+// (transpile._is_cas64) and the operation runs under one lock word, the runtime
+// status buffer's word 4: exact among atomicCAS calls, which it serialises.  The
+// critical section sits inside the retry loop, so lanes of a SIMD group that lose
+// the lock never wait on a lane of their own group that holds it.  A reader that
+// does not take the lock sees the old or the new word in threadgroup memory (one
+// 64-bit store); in device memory the new word is stored as two 32-bit halves.
+template <typename T> inline T __arwen_cas64_rw(threadgroup T* p, T cmp, T v) {
+    T old = *(threadgroup volatile T*)p;
+    if (old == cmp) *(threadgroup volatile T*)p = v;
+    return old;
+}
+template <typename T> inline T __arwen_cas64_rw(device T* p, T cmp, T v) {
+    device metal::atomic_uint* q = reinterpret_cast<device metal::atomic_uint*>(p);
+    uint2 w = uint2(metal::atomic_load_explicit(q, metal::memory_order_relaxed),
+                    metal::atomic_load_explicit(q + 1, metal::memory_order_relaxed));
+    T old = as_type<T>(w);
+    if (old == cmp) {
+        uint2 n = as_type<uint2>(v);
+        metal::atomic_store_explicit(q, n.x, metal::memory_order_relaxed);
+        metal::atomic_store_explicit(q + 1, n.y, metal::memory_order_relaxed);
+    }
+    return old;
+}
+template <typename T> inline T __arwen_cas64_rw(thread T* p, T cmp, T v) {
+    T old = *p;
+    if (old == cmp) *p = v;
+    return old;
+}
+template <typename P, typename T>
+inline T atomicCAS(thread const __arwen_ctx_t& c, P p, T cmp, T v) {
+    static_assert(sizeof(T) == 8, "atomicCAS with a context is the 64-bit emulation");
+    device metal::atomic_uint* lock = c.status + 4;
+    T old = cmp;
+    for (bool done = false; !done;) {
+        uint unlocked = 0u;
+        if (metal::atomic_compare_exchange_weak_explicit(lock, &unlocked, 1u, metal::memory_order_relaxed,
+                                                         metal::memory_order_relaxed)) {
+            metal::atomic_thread_fence(metal::mem_flags::mem_device | metal::mem_flags::mem_threadgroup,
+                                       metal::memory_order_seq_cst, metal::thread_scope_device);
+            old = __arwen_cas64_rw(p, cmp, v);
+            metal::atomic_thread_fence(metal::mem_flags::mem_device | metal::mem_flags::mem_threadgroup,
+                                       metal::memory_order_seq_cst, metal::thread_scope_device);
+            metal::atomic_store_explicit(lock, 0u, metal::memory_order_relaxed);
+            done = true;
+        }
+    }
+    return old;
+}
+// a 64-bit atomicCAS the translator could not type (no context): stop with the reason
 template <typename T> struct __arwen_no_cas64 { static constant bool value = false; };
 template <typename P, typename T>
 inline T atomicCAS(P p, T cmp, T v) {
     static_assert(__arwen_no_cas64<T>::value,
-                  "64-bit atomicCAS: Apple GPUs have no 64-bit compare-and-swap (see docs/metal-README.md)");
+                  "64-bit atomicCAS reached without the launch context (see transpile._is_cas64)");
     return v;
 }
 ARWEN_ATOMIC_ADD64(device, ulong)
