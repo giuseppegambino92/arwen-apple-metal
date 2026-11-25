@@ -1620,3 +1620,13 @@ written from papers, not bitwise to WRF. It contains no uncleared CESM table.
 The species mapping, source collection, units, limitations and output digest
 are recorded in gpuwm/data/cumulus_aerosol/public-source.json and
 docs/public-cumulus-aerosol.md.
+
+Apple Metal backend.  This distribution modifies ArWen 3.0.3 by adding a
+backend for Apple GPUs: gpuwm/metal/ (a CUDA-to-Metal Shading Language
+translator, a native Metal runtime and a CuPy-compatible array layer),
+tests/metal/, tools/metal/, docs/metal-backend.md, docs/metal-evidence/ and
+README.md / README.it.md (ArWen's README is kept unchanged as README-ArWen.md),
+with small
+guards in ArWen modules where CUDA driver or Linux-only facilities are used
+(each file's history records the change).  The CUDA sources stay ArWen's;
+the Metal kernels are generated from them when they are first used.

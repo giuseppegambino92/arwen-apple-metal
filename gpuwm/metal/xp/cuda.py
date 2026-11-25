@@ -855,7 +855,7 @@ _FUNC_ATTRS = ("max_threads_per_block", "shared_size_bytes", "const_size_bytes",
 def _func_get_attribute(attribute, ptr):
     """cuFuncGetAttribute over a Metal pipeline.  Metal reserves no per-thread
     local frame the way CUDA does, so LOCAL_SIZE_BYTES (like num_regs) reads 0:
-    CUDA frame-size budgets are vacuous on this backend (docs/metal-README.md)."""
+    CUDA frame-size budgets are vacuous on this backend (README.md)."""
     from ._custom import Function, _BY_PTR
     k = _BY_PTR.get(int(ptr))
     if k is None:
