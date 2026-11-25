@@ -425,3 +425,41 @@ With it the HRRR-fork Thompson column runs on Metal and reproduces the fork's
 Fortran oracle **word for word in every output cell**
 (`tests/test_thompson_fork_column_gpu.py::test_every_output_cell_is_the_forks_word`,
 4 cases).
+
+## Grell-Freitas (`cu_physics=3`, WRF 4.8 GFL 873b414) on Metal (2026-11-25)
+
+ArWen runs GFL lane-interleaved (`gpuwm/core/gfl_lanes.py`): one persistent
+launch, a block of 128 lanes per slab of the scratch.  Three constructs had no
+MSL form:
+
+* **Generic pointers.**  The transcription passes the addresses of thread-local
+  scalars and arrays (`&ims`, `zuh2`, `&fscav[0]`: 92 locals) where a lane
+  pointer or an array descriptor -- structs whose pointer member is a device
+  pointer -- is expected.  `transpile.promote_escaping_locals` moves exactly
+  those locals to device memory: one region per function in a per-thread frame
+  (1 856 bytes here), indexed by the thread's linear index in the launch, in a
+  module array sized for `ARWEN_METAL_TFRAME_THREADS` threads (default 8 192;
+  a larger launch stops with the abort word, never silently).  No function
+  that holds a frame may be recursive (checked).  Their uses read
+  `(*name__tf)`; the arithmetic is unchanged.
+* **`gf_memmove`'s overlap test** compares a destination and a source that may
+  be in different address spaces (a device word and a string literal in
+  constant memory): such pointers never alias, so they compare unequal and
+  unordered (`__arwen_tg_*`, one comparability trait per operator).
+* **64-bit `atomicCAS`** publishes a block's spill allocation (a `__shared__`
+  pointer).  Apple GPUs have no 64-bit compare-and-swap; the translator gives
+  the call the launch context and the operation runs under one lock word (word
+  4 of the runtime's status buffer), with the critical section inside the retry
+  loop so no lane waits on its own SIMD group.  `tests/metal/cas64_gpu_check.py`:
+  64 x 128 threads, 8 rounds of CAS-loop increments that carry across the
+  32-bit halves on a device counter and a threadgroup counter: exact; one
+  publisher per block; every lane reads the published word.  `__shared__`
+  pointer variables are now threadgroup objects pointing to device memory
+  (`device T* threadgroup p`), as CUDA's are.
+
+Result: `tests/test_gfl_873b414_gpu.py` replays WRF 4.8's native columns word
+for word; MPAS GF variants, multislab hazards, held-PBL relocation and the
+SATMEDMF-GF coupling pass (171 passed in the GF-related files).  Two
+`gf_active_column` tests and `held_pbl_stream[3]` fail with the same messages
+on the RTX 5090.  Regression: units 309/342, loaders 46/46 (+exact), every
+exactness check 0 differing, 1 h r23 = r20 on all 142 775 319 words.
