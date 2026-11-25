@@ -526,14 +526,31 @@ class _Module:
                 return None, None
             return self.fusr(ref), ref
         name = call.spelling
-        if not name:
-            kids = list(call.get_children())
-            if kids:
-                toks = [t.spelling for t in _tokens(kids[0])]
-                if "<" in toks:
+        explicit_targs = False
+        kids = list(call.get_children())
+        if kids:
+            toks = [t.spelling for t in _tokens(kids[0])]
+            explicit_targs = "<" in toks
+            if not name:
+                if explicit_targs:
                     toks = toks[:toks.index("<")]
                 name = kids[0].spelling or (toks[-1] if toks else "")
         usr = self.fn_by_name.get(name)
+        if usr is None and len(self.fn_names.get(name, ())) > 1:
+            # an unresolved call inside a template: keep the candidates it can name
+            # (``f<A, B>(...)`` names a function template) and call with its arguments
+            nargs = len([k for k in kids[1:] if k.kind.is_expression()])
+            fit = []
+            for u in sorted(self.fn_names[name]):
+                d0 = self.functions[u][0]
+                if explicit_targs and d0.kind != K.FUNCTION_TEMPLATE:
+                    continue
+                ps = self._params(d0)
+                required = sum(1 for q in ps if not any(ch.kind.is_expression() for ch in q.get_children()))
+                if required <= nargs <= len(ps):
+                    fit.append(u)
+            if len(fit) == 1:
+                usr = fit[0]
         if usr is None and len(self.fn_names.get(name, ())) > 1:
             # same-named functions (e.g. two scheme variants' methods): usable when their
             # parameters have the same shape, since only that shape drives the rewrite
@@ -2752,7 +2769,7 @@ class _Module:
                 op = ops[0]
                 if c.hash in self._select_done:
                     continue
-                dep = os.environ.get("ARWEN_METAL_NO_TG") != "1" and (self._dependent(lhs.type) or self._dependent(rhs.type)) and not (
+                dep = (self._dependent(lhs.type) or self._dependent(rhs.type)) and not (
                     _canon(lhs.type).kind == T.POINTER or _canon(rhs.type).kind == T.POINTER)
                 if k == K.BINARY_OPERATOR and op.spelling in self._FBIN and is_f32(lhs.type) and is_f32(rhs.type):
                     fn = self._FBIN[op.spelling]

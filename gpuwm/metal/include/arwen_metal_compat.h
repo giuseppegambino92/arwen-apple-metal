@@ -79,7 +79,11 @@ inline void __arwen_compiler_barrier() {}
 struct __arwen_launch_t {
     uint gx, gy, gz, bx, by, bz, split, pad;
 };
-struct __arwen_ctx_t {
+// in a namespace of its own: as the first argument of every ctx-taking call it
+// would otherwise make argument-dependent lookup add the global namespace, and an
+// unqualified call inside a namespace would see a same-named global function too
+namespace __arwen_ctx_ns {
+struct ctx_t {
     uint3 tid, bid, bdim, gdim;
     uint lane;
     bool inactive;
@@ -89,6 +93,8 @@ struct __arwen_ctx_t {
     threadgroup uchar* ssmem;   // static __shared__ declared inside __device__ functions
     int z;                      // 0, known only at run time (L.pad): see transpile.edit_private_const_index
 };
+}
+using __arwen_ctx_t = __arwen_ctx_ns::ctx_t;
 inline __arwen_ctx_t __arwen_make_ctx(constant __arwen_launch_t& L, uint3 tid, uint3 bid, uint3 bdim, uint3 gdim,
                                       uint lane, device uchar* g, device metal::atomic_uint* status,
                                       threadgroup uchar* dsmem, threadgroup uchar* ssmem) {

@@ -43,8 +43,10 @@ RULES = [
                     r"RunConfig\.__init__\(\) got an unexpected keyword argument|"
                     r"<locals>\.\w+\(\) got an unexpected keyword argument"),
 ]
-#: measured: ArWen's default numerics use the GPU's own powf; Metal's is farther
-#: from glibc than CUDA's (pi_phy: 1826 vs 304 words differing from WRF)
+#: measured: ArWen's default numerics use the GPU's own powf and these tests pin
+#: CUDA's distance from WRF with an equality.  Metal's powf runs glibc's algorithm:
+#: 0 words differ from WRF (pi_phy 0 vs CUDA's 304 of 5880, t_phy 0 vs 255, t8w 0 vs
+#: 261; the snow-number test asserts a nonzero CUDA powf error and Metal's is 0)
 NATIVE_LIBM_TESTS = {
     "tests.test_bigstep_prep_wrf471_parity::test_bigstep_phy_prep_compiled_wrf471_exposed_outputs",
     # ratchets at the error of CUDA's hardware powf(smob, b) (non-integer exponent)

@@ -85,6 +85,89 @@ def ensure_startup_hook():
         pass
 
 
+#: what ArWen's loader appends in default numerics to rebind the glibc-exact copies
+#: of these units to the GPU's own float math (gpuwm/core/kernels/_extra_header_text)
+_KF_FAST = ("#define gfk_exp expf\n#define gfk_log logf\n#define gfk_pow powf\n"
+            "#define __fadd_rn(a,b) ((a)+(b))\n#define __fsub_rn(a,b) ((a)-(b))\n"
+            "#define __fmul_rn(a,b) ((a)*(b))\n#define __fdiv_rn(a,b) ((a)/(b))\n")
+_POW_EXP_LOG_FAST = "#define gfk_pow powf\n#define gfk_exp expf\n#define gfk_log logf\n"
+_POW_EXP_LOG_UNITS = ("ssib", "nssl2", "nssl2_shape_nucond", "nssl2_shape_gs", "nssl2_shape_driver",
+                      "nssl2_shape_diagnostics")
+
+
+def strict_glibc() -> bool:
+    """ARWEN_METAL_STRICT_GLIBC=1: default forecasts keep the glibc-exact libm
+    copies and rounded operators in the units whose default image rebinds them to
+    the GPU's own float math (KF-CuP, SSiB, NSSL2, the Smagorinsky 2-D exp), for
+    bit-for-bit validation against WRF's oracles.  Off by default (native math is
+    about 2.4x faster in KF on Apple GPUs)."""
+    return os.environ.get("ARWEN_METAL_STRICT_GLIBC", "0") == "1"
+
+
+def install_strict_glibc():
+    """Wrap ArWen's loader from outside, so gpuwm/core/kernels/__init__.py stays
+    byte-identical to ArWen's (its source is sealed by ArWen's own proofs)."""
+    from gpuwm.core import kernels as K
+    if getattr(K._extra_header_text, "_arwen_metal_strict", False):
+        return
+    original = K._extra_header_text
+
+    def _extra_header_text(name, kernel_dir=K._KDIR):
+        if not strict_glibc():
+            return original(name, kernel_dir)
+        if name == "smag2d":
+            saved = K._smag2d_default_gfk_exp
+            K._smag2d_default_gfk_exp = lambda text: text
+            try:
+                return original(name, kernel_dir)
+            finally:
+                K._smag2d_default_gfk_exp = saved
+        text = original(name, kernel_dir)
+        if name == "kfcup":
+            text = text.replace(_KF_FAST, "", 1)
+        elif name in _POW_EXP_LOG_UNITS:
+            text = text.replace(_POW_EXP_LOG_FAST, "", 1)
+        return text
+    _extra_header_text._arwen_metal_strict = True
+    _extra_header_text.__wrapped__ = original
+    K._extra_header_text = _extra_header_text
+
+
+class _AfterImport:
+    """meta-path hook: run ``then()`` once module ``name`` has executed."""
+    def __init__(self, name, then):
+        self.name, self.then = name, then
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != self.name:
+            return None
+        import importlib.machinery
+        sys.meta_path.remove(self)
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or spec.loader is None:
+            return spec
+        loader, then = spec.loader, self.then
+
+        class _Loader:
+            def create_module(self, spec):
+                return loader.create_module(spec)
+
+            def exec_module(self, module):
+                loader.exec_module(module)
+                then()
+        spec.loader = _Loader()
+        return spec
+
+
+def _arm_strict_glibc():
+    if not strict_glibc():
+        return
+    if "gpuwm.core.kernels" in sys.modules:
+        install_strict_glibc()
+    else:
+        sys.meta_path.insert(0, _AfterImport("gpuwm.core.kernels", install_strict_glibc))
+
+
 def install():
     if getattr(sys.modules.get("cupy"), "_gpuwm_metal", False):
         return sys.modules["cupy"]
@@ -147,6 +230,7 @@ def install():
             parent, _, child = name.rpartition(".")
             if parent in sys.modules and child not in vars(sys.modules[parent]):
                 setattr(sys.modules[parent], child, sys.modules[name])
+    _arm_strict_glibc()
     return xp
 
 

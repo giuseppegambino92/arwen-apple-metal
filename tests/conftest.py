@@ -865,6 +865,8 @@ def _gate_on_metal_applicability(items):
     the precise reason).  No effect on CUDA or ROCm."""
     if os.environ.get("GPUWM_BACKEND", "").lower() != "metal":
         return
+    if os.environ.get("ARWEN_METAL_APPLY_REGISTRY", "1") == "0":
+        return                       # measuring run: every test executes (tools/metal/build_applicability_registry.py)
     from metal_not_applicable import reason_for
     for item in items:
         reason = reason_for(item.nodeid)

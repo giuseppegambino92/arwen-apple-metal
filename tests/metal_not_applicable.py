@@ -46,7 +46,8 @@ CLASSES = {
                       "same scheme and lands just outside it (each case's margin in the README)",
     "native_libm": "it pins behaviour of CUDA's hardware powf -- its distance from glibc/WRF, "
                    "its word, or the levels where it departs from glibc's; Metal's powf follows "
-                   "glibc's algorithm (0 of 1.89e6 differ where the rounding is certain)",
+                   "glibc's algorithm (0 of 1.89e6 differ where the rounding is certain), so it "
+                   "reproduces WRF where CUDA departs (Exner pi_phy: 0 words vs CUDA's 304 of 5880)",
     "default_native_math": "a tolerance measured on CUDA for ArWen's default numerics, which "
                            "call the GPU's own float libm; with ARWEN_METAL_STRICT_GLIBC=1 "
                            "it runs here, and passes",

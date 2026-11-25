@@ -557,25 +557,6 @@ def _preamble(kernel_dir: Path = _KDIR) -> str:
     return "\n".join(lines) + "\n"
 
 
-def metal_strict_glibc() -> bool:
-    """ARWEN_METAL_STRICT_GLIBC=1 on the Metal backend: default forecasts keep
-    the glibc-exact libm copies (gfk_*) and the rounded operators in the units
-    whose default image rebinds them to the GPU's own float math (KF-CuP, SSiB,
-    NSSL2, the Smagorinsky 2-D exp), for bit-for-bit validation against WRF's
-    oracles.  Off by default: those units then use Metal's native float math,
-    which on Metal differs from CUDA's in the last bit (Kain-Fritsch amplifies
-    it past the tolerance measured for CUDA) and is about 2.4x faster than the
-    copies on Apple GPUs.  No effect on CUDA."""
-    import os
-    if os.environ.get("ARWEN_METAL_STRICT_GLIBC", "0") != "1":
-        return False
-    try:
-        import cupy
-    except ImportError:
-        return False
-    return bool(getattr(cupy, "_gpuwm_metal", False))
-
-
 def _sas_strict_numerics() -> bool:
     from gpuwm.numerics import mode
     from gpuwm.wrf_exact import ENABLED
@@ -698,16 +679,16 @@ def _extra_header_text(name: str, kernel_dir: Path = _KDIR) -> str:
         text += "#define GPUWM_WIND480_FAST 1\n#define glibc_sinf sinf\n#define glibc_cosf cosf\n#define glibc_asinf asinf\n"
     if not ENABLED and name in ("wind_mav", "wind_legacy"):
         text += "#define GPUWM_WIND_FAST 1\n#define glibc_sinf sinf\n#define glibc_cosf cosf\n#define glibc_asinf asinf\n#define glibc_acosf acosf\n#define gfk_exp expf\n#define plm_exp exp\n#define uw_acos acos\n"
-    if not ENABLED and name == "kfcup" and not metal_strict_glibc():
+    if not ENABLED and name == "kfcup":
         # Default forecasts use REAL32 CUDA arithmetic, including constant
         # divisor folding and contraction. Only strict native replay needs
         # the explicitly rounded operators and software elementary functions.
         text += ("#define gfk_exp expf\n#define gfk_log logf\n#define gfk_pow powf\n"
                  "#define __fadd_rn(a,b) ((a)+(b))\n#define __fsub_rn(a,b) ((a)-(b))\n"
                  "#define __fmul_rn(a,b) ((a)*(b))\n#define __fdiv_rn(a,b) ((a)/(b))\n")
-    if not ENABLED and name == "smag2d" and not metal_strict_glibc():
+    if not ENABLED and name == "smag2d":
         text = _smag2d_default_gfk_exp(text)
-    if not ENABLED and not metal_strict_glibc() and name in ("ssib", "nssl2", "nssl2_shape_nucond", "nssl2_shape_gs", "nssl2_shape_driver", "nssl2_shape_diagnostics"):
+    if not ENABLED and name in ("ssib", "nssl2", "nssl2_shape_nucond", "nssl2_shape_gs", "nssl2_shape_driver", "nssl2_shape_diagnostics"):
         text += "#define gfk_pow powf\n#define gfk_exp expf\n#define gfk_log logf\n"
     # The NSSL shape units keep their __fdiv_rn spellings in every mode, as
     # nssl2.cu does: a fast alias to "/" let NVRTC turn constant divisors

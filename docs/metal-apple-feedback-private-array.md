@@ -26,8 +26,14 @@ and with or without `-fno-fast-math`, `-ffp-contract=off`,
 other constant-index reads of the same array once one run-time-index access
 exists.
 
-**Workaround used by the ArWen Metal backend:** every integer-literal
-subscript on a private array of 33 or more elements, on a local pointer, and on
+The same read with a constant *expression* is affected as well: with N = 100,
+`rho[100 - 1]` and `rho[KM - 1]` (`#define KM 100`) return 0.0 instead of
+`air[99] = 0.4`, while `rho[nz - 1]` (run-time `nz`) returns 0.4.
+
+**Workaround used by the ArWen Metal backend:** every subscript the compiler can
+fold to a constant (integer literals, and expressions of literals, enumerators,
+template parameters and initialised `const` integers: `a[0]`, `a[100 - 1]`,
+`a[K - 1]`) on a private array of 33 or more elements, on a local pointer, and on
 a pointer/array parameter of a device function gets a run-time zero
 (`gpuwm/metal/transpile.py`, `edit_private_const_index`).  Found through the
 NSSL two-moment microphysics: its rain-sedimentation kernel exported zero
